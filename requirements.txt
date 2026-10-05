@@ -1,7 +1,5 @@
 slack-bolt>=1.18.0
 flask>=3.0.0
-google-generativeai>=0.8.0
 python-dotenv>=1.0.0
 gunicorn>=21.2.0
-# Optional future data layer; app.py does not connect to Databricks yet.
 databricks-sql-connector>=3.0.0

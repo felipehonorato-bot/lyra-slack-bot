@@ -1,4 +1,4 @@
-"""Lyra Slack bot: Flask + Slack Bolt + Gemini + safe Databricks queries."""
+"""Lyra Slack bot: Flask + Slack Bolt + Gemini REST API + safe Databricks queries."""
 from __future__ import annotations
 
 import json
@@ -6,6 +6,8 @@ import logging
 import os
 import re
 import threading
+import urllib.request
+import urllib.error
 from collections import defaultdict, deque
 from typing import Any
 
@@ -21,8 +23,6 @@ load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("lyra-slack-bot")
 
-# Development sentinels allow `python app.py` and /health to be exercised before
-# secrets are configured. Real Slack traffic must use the environment variables.
 slack_app = App(
     token=os.getenv("SLACK_BOT_TOKEN") or "dev-token",
     signing_secret=os.getenv("SLACK_SIGNING_SECRET") or "dev-signing-secret",
@@ -30,7 +30,6 @@ slack_app = App(
 )
 slack_handler = SlackRequestHandler(slack_app)
 flask_app = Flask(__name__)
-# `app` is the conventional WSGI name used by the Procfile and deployment hosts.
 app = flask_app
 PORT = int(os.getenv("PORT", "3000"))
 
@@ -39,8 +38,9 @@ _CONTEXT_LOCK = threading.Lock()
 _IN_FLIGHT: set[str] = set()
 _IN_FLIGHT_LOCK = threading.Lock()
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+(?:\|[^>]+)?>")
-_MODEL: Any | None = None
-_MODEL_LOCK = threading.Lock()
+
+GEMINI_MODEL = "gemini-flash-latest"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 AVAILABLE_INTENTS = {
     "report_diario": "volume diário por EPS e fila",
@@ -56,36 +56,35 @@ AVAILABLE_INTENTS = {
 }
 
 
-def _get_model() -> Any | None:
-    global _MODEL
-    with _MODEL_LOCK:
-        if _MODEL is not None:
-            return _MODEL
-        key = os.getenv("GEMINI_API_KEY")
-        if not key:
-            return None
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=key)
-            _MODEL = genai.GenerativeModel("gemini-flash-latest")
-        except Exception:
-            logger.exception("Could not initialize Gemini")
-        return _MODEL
-
-
 def _generate(prompt: str) -> str | None:
-    model = _get_model()
-    if model is None:
+    """Call Gemini via REST API. No SDK dependency."""
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        logger.error("GEMINI_API_KEY not set")
         return None
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048},
+    }).encode("utf-8")
+    url = f"{GEMINI_URL}?key={key}"
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     try:
-        result = model.generate_content(
-            prompt,
-            generation_config={"temperature": 0.7, "max_output_tokens": 2048},
-        )
-        text = getattr(result, "text", "")
-        return text.strip() or None
-    except Exception:
-        logger.exception("Gemini request failed")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    text = parts[0].get("text", "").strip()
+                    return text or None
+        logger.error(f"Gemini returned no candidates: {json.dumps(data)[:500]}")
+        return None
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        logger.error(f"Gemini HTTP {e.code}: {body[:500]}")
+        return None
+    except Exception as e:
+        logger.error(f"Gemini request failed: {e}")
         return None
 
 
@@ -191,8 +190,6 @@ def _process(event: dict[str, Any], say) -> None:
         intent = classification["intent"]
         if intent in {"geral", "reincidencia"}:
             result_text = "SEM_CONSULTA: não há uma query habilitada para este pedido."
-        elif _get_model() is None:
-            result_text = "ERRO_CONTROLADO: integração Gemini não configurada"
         else:
             result_text = _result_text(query_intent(intent, classification["parameters"]))
         answer = _generate(_response_prompt(question, result_text, classification["plan"], recent))
@@ -229,7 +226,6 @@ def handle_app_mention(event, say, client, ack):
 
 @slack_app.event("message")
 def handle_message(event, say, client, ack):
-    # Slack delivers message.im as a message event with channel_type=im.
     if event.get("channel_type") == "im" and not event.get("bot_id") and not event.get("subtype"):
         _dispatch(event, say, client, ack)
     else:
