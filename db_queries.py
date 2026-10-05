@@ -1,16 +1,14 @@
-"""Allow-listed, read-only Databricks query layer for Lyra."""
+"""Allow-listed, read-only Databricks query layer for Lyra — uses REST API."""
 from __future__ import annotations
-import concurrent.futures
 import datetime as dt
+import json
 import os
 import re
+import urllib.request
+import urllib.error
 from typing import Any
-try:
-    from databricks import sql as databricks_sql
-except ImportError:
-    databricks_sql = None
 
-QUERY_TIMEOUT_SECONDS = 30
+QUERY_TIMEOUT_SECONDS = 45
 MAX_ROWS = 20
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -26,6 +24,7 @@ QUERY_TEMPLATES: dict[str, str] = {
 SLA_FALLBACK_TEMPLATE = """SELECT ticket_group, ticket_last_eps, COUNT(DISTINCT support_ticket_id) AS total_casos, ROUND(AVG(CAST(sla_first_comment AS DOUBLE)) * 100, 1) AS pct_sla_cumprido FROM saex.gold.cx_support WHERE dt >= '{start_date}'{end_date_clause} AND sla_first_comment IS NOT NULL{filters} GROUP BY ticket_group, ticket_last_eps ORDER BY pct_sla_cumprido ASC LIMIT {limit}"""
 INTENT_ALIASES = {key: key for key in QUERY_TEMPLATES}
 
+
 def _safe_date(value: Any) -> str:
     if isinstance(value, str) and _DATE_RE.fullmatch(value):
         try:
@@ -35,6 +34,7 @@ def _safe_date(value: Any) -> str:
             pass
     return (dt.date.today() - dt.timedelta(days=7)).isoformat()
 
+
 def _safe_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -42,6 +42,7 @@ def _safe_text(value: Any) -> str | None:
     if not text or len(text) > 200:
         return None
     return text.replace("'", "''")
+
 
 def _end_date_clause(parameters: dict[str, Any], field: str = "dt") -> str:
     end = parameters.get("end_date")
@@ -52,6 +53,7 @@ def _end_date_clause(parameters: dict[str, Any], field: str = "dt") -> str:
         except ValueError:
             pass
     return ""
+
 
 def _filters(parameters: dict[str, Any], intent: str = "") -> str:
     clauses = []
@@ -67,6 +69,7 @@ def _filters(parameters: dict[str, Any], intent: str = "") -> str:
         clauses.append(f" AND ticket_last_agent_email = '{analyst}'")
     return "".join(clauses)
 
+
 def build_query(intent: str, parameters: dict[str, Any] | None = None, limit: int = MAX_ROWS) -> str:
     parameters = parameters or {}
     key = INTENT_ALIASES.get(intent)
@@ -74,50 +77,84 @@ def build_query(intent: str, parameters: dict[str, Any] | None = None, limit: in
         raise ValueError(f"Intent não habilitada para consulta: {intent}")
     limit = max(1, min(int(limit), MAX_ROWS))
     field = "date_utc3" if key == "volume_vs_planejado" else "dt"
-    return QUERY_TEMPLATES[key].format(start_date=_safe_date(parameters.get("start_date")), end_date_clause=_end_date_clause(parameters, field), filters=_filters(parameters, key), limit=limit).strip()
+    return QUERY_TEMPLATES[key].format(
+        start_date=_safe_date(parameters.get("start_date")),
+        end_date_clause=_end_date_clause(parameters, field),
+        filters=_filters(parameters, key),
+        limit=limit,
+    ).strip()
+
 
 def _run_once(query: str) -> dict[str, Any]:
-    if databricks_sql is None:
-        return {"ok": False, "error": "dependência databricks-sql-connector não instalada"}
-    required = ("DATABRICKS_HOST", "DATABRICKS_HTTP_PATH", "DATABRICKS_TOKEN")
-    missing = [name for name in required if not os.getenv(name)]
-    if missing:
-        return {"ok": False, "error": "configuração Databricks ausente: " + ", ".join(missing)}
-    connection = cursor = None
-    try:
-        connection = databricks_sql.connect(server_hostname=os.environ["DATABRICKS_HOST"], http_path=os.environ["DATABRICKS_HTTP_PATH"], access_token=os.environ["DATABRICKS_TOKEN"])
-        cursor = connection.cursor()
-        cursor.execute(query)
-        columns = [item[0] for item in (cursor.description or [])]
-        rows = [dict(zip(columns, row)) for row in cursor.fetchmany(MAX_ROWS)]
-        return {"ok": True, "columns": columns, "rows": rows, "row_count": len(rows)}
-    except Exception as exc:
-        return {"ok": False, "error": f"falha na consulta Databricks: {type(exc).__name__}"}
-    finally:
-        for resource in (cursor, connection):
-            try:
-                if resource is not None:
-                    resource.close()
-            except Exception:
-                pass
+    """Execute query via Databricks REST API (no SDK needed)."""
+    host = os.getenv("DATABRICKS_HOST")
+    warehouse_id = os.getenv("DATABRICKS_WAREHOUSE_ID", "0831a845aa83b2e3")
+    token = os.getenv("DATABRICKS_TOKEN")
 
-def execute_query(query: str, timeout_seconds: int = QUERY_TIMEOUT_SECONDS) -> dict[str, Any]:
+    if not host or not token:
+        return {"ok": False, "error": "configuração Databricks ausente (host/token)"}
+
+    url = f"https://{host}/api/2.0/sql/statements/"
+    payload = json.dumps({
+        "statement": query,
+        "warehouse_id": warehouse_id,
+        "wait_timeout": f"{QUERY_TIMEOUT_SECONDS}s",
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=QUERY_TIMEOUT_SECONDS + 10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        state = data.get("status", {}).get("state", "")
+        if state != "SUCCEEDED":
+            error_msg = data.get("status", {}).get("error", {}).get("message", f"state={state}")
+            return {"ok": False, "error": f"Databricks: {error_msg}"}
+
+        manifest = data.get("manifest", {})
+        columns_info = manifest.get("schema", {}).get("columns", [])
+        columns = [c["name"] for c in columns_info]
+        data_array = data.get("result", {}).get("data_array", [])
+        rows = [dict(zip(columns, row)) for row in data_array[:MAX_ROWS]]
+
+        return {"ok": True, "columns": columns, "rows": rows, "row_count": len(rows)}
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        try:
+            err = json.loads(body)
+            msg = err.get("message", body[:300])
+        except Exception:
+            msg = body[:300]
+        return {"ok": False, "error": f"Databricks HTTP {e.code}: {msg}"}
+    except Exception as exc:
+        return {"ok": False, "error": f"falha na consulta Databricks: {type(exc).__name__}: {str(exc)[:200]}"}
+
+
+def execute_query(query: str) -> dict[str, Any]:
     if not query.lstrip().upper().startswith("SELECT"):
         return {"ok": False, "error": "apenas consultas SELECT são permitidas"}
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(_run_once, query)
-    try:
-        return future.result(timeout=timeout_seconds)
-    except concurrent.futures.TimeoutError:
-        return {"ok": False, "error": f"consulta excedeu {timeout_seconds} segundos"}
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    return _run_once(query)
+
 
 def query_intent(intent: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
     result = execute_query(build_query(intent, parameters))
     if intent == "sla" and not result.get("ok"):
         params = parameters or {}
-        fallback = SLA_FALLBACK_TEMPLATE.format(start_date=_safe_date(params.get("start_date")), end_date_clause=_end_date_clause(params), filters=_filters(params, "sla"), limit=MAX_ROWS).strip()
+        fallback = SLA_FALLBACK_TEMPLATE.format(
+            start_date=_safe_date(params.get("start_date")),
+            end_date_clause=_end_date_clause(params),
+            filters=_filters(params, "sla"),
+            limit=MAX_ROWS,
+        ).strip()
         fallback_result = execute_query(fallback)
         if fallback_result.get("ok"):
             fallback_result["fallback_used"] = True
