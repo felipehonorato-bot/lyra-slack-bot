@@ -481,6 +481,50 @@ def health():
     return jsonify({"status": "ok", "service": "lyra-slack-bot"}), 200
 
 
+@flask_app.get("/debug/mop")
+def debug_mop():
+    """Debug endpoint to check Google Sheets connection — temporary."""
+    import base64 as b64
+    raw = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
+    result = {"env_set": bool(raw), "env_length": len(raw)}
+    
+    # Check if it's base64 or raw JSON
+    if raw:
+        try:
+            decoded = b64.b64decode(raw)
+            creds_json = json.loads(decoded)
+            result["format"] = "base64"
+        except Exception:
+            try:
+                creds_json = json.loads(raw)
+                result["format"] = "raw_json"
+            except Exception as e:
+                result["format"] = "INVALID"
+                result["error"] = str(e)
+                return jsonify(result), 200
+        
+        result["client_email"] = creds_json.get("client_email", "NOT FOUND")
+        result["has_private_key"] = bool(creds_json.get("private_key"))
+        
+        # Try to connect
+        try:
+            from google.oauth2.service_account import Credentials
+            import gspread
+            scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+            creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
+            gc = gspread.authorize(creds)
+            spreadsheet = gc.open_by_key("1cy23m4iN0D7vEiJbbAw9hRpUtaHgGuRew_fgAUz_l14")
+            result["sheets_ok"] = True
+            result["spreadsheet_title"] = spreadsheet.title
+            worksheets = spreadsheet.worksheets()
+            result["worksheets"] = [{"name": ws.title, "gid": ws.id} for ws in worksheets]
+        except Exception as e:
+            result["sheets_ok"] = False
+            result["sheets_error"] = f"{type(e).__name__}: {str(e)}"
+    
+    return jsonify(result), 200
+
+
 @flask_app.post("/slack/events")
 def slack_events():
     return slack_handler.handle(request)
