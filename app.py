@@ -22,9 +22,9 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("lyra-slack-bot")
 
 TOQAN_BASE_URL = "https://api.toqan.ai/api"
-TOQAN_TIMEOUT_SECONDS = 30
+TOQAN_TIMEOUT_SECONDS = 45
 POLL_INTERVAL_SECONDS = 5
-MAX_POLL_ATTEMPTS = 12
+MAX_POLL_ATTEMPTS = 36
 PROCESSING_REACTION = "eyes"
 DONE_REACTION = "white_check_mark"
 ERROR_MESSAGE = "Não consegui processar agora, tente novamente"
