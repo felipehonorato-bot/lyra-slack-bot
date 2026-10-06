@@ -213,12 +213,16 @@ class MOPSheetsError(RuntimeError):
 
 
 def _get_google_client():
-    """Create the Google client from the base64 service-account JSON, if set."""
-    credentials_b64 = os.getenv("GOOGLE_CREDENTIALS_JSON")
-    if not credentials_b64:
+    """Create the Google client from the service-account JSON (base64 or raw), if set."""
+    raw = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    if not raw:
         return None
     try:
-        credentials_json = json.loads(base64.b64decode(credentials_b64))
+        # Try base64 first, then raw JSON
+        try:
+            credentials_json = json.loads(base64.b64decode(raw))
+        except Exception:
+            credentials_json = json.loads(raw)
         from google.oauth2.service_account import Credentials
         import gspread
 
@@ -230,7 +234,7 @@ def _get_google_client():
         return gspread.authorize(credentials)
     except Exception as exc:
         logger.error("Could not configure Google Sheets client: %s", exc)
-        raise MOPGoogleCredentialsError from exc
+        raise MOPGoogleCredentialsError(str(exc)) from exc
 
 
 def _is_xlsx_attachment(file_info: dict[str, Any]) -> bool:
@@ -328,8 +332,8 @@ def _update_mop_sheet(workbook_bytes: bytes, google_client: Any = None) -> None:
     except MOPSheetsError:
         raise
     except Exception as exc:
-        logger.error("Google Sheets MOP update failed")
-        raise MOPSheetsError from exc
+        logger.error("Google Sheets MOP update failed: %s", exc)
+        raise MOPSheetsError(str(exc)) from exc
 
 
 def _mop_attachment(event: dict[str, Any]) -> dict[str, Any] | None:
