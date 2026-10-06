@@ -21,8 +21,8 @@ times out, Lyra replies:
 ## Files
 
 - `app.py`: Flask server, Slack Bolt Events API route, and Toqan relay.
-- `requirements.txt`: exactly the four runtime dependencies required by the
-  relay; there are no Gemini or Databricks SDK dependencies.
+- `requirements.txt`: runtime dependencies for the Slack relay, MOP Excel parsing,
+  and Google Sheets updates; there are no Gemini or Databricks SDK dependencies.
 - `.env.example`: deployment variable template.
 - `Procfile`: `web: python app.py`.
 
@@ -64,7 +64,8 @@ Only three variables are required for a deployed bot:
 | `SLACK_BOT_TOKEN` | Yes | Slack Bot User OAuth Token |
 | `SLACK_SIGNING_SECRET` | Yes | Slack app signing secret |
 | `TOQAN_API_KEY` | Yes | Toqan Agent API key |
-| `DAILY_REPORT_CHANNEL` | No | Slack channel for the daily 09:00 Brazil CSAT report; defaults to `C0BF6JVFG7N` |
+| `GOOGLE_CREDENTIALS_JSON` | For MOP uploads | Base64-encoded Google service-account JSON with access to the destination spreadsheet |
+| `DAILY_REPORT_CHANNEL` | No | Slack channel for the daily 11:00 Brazil CSAT report; defaults to `C0BF6JVFG7N` |
 | `PORT` | No | HTTP port; defaults to `3000` and is supplied by Railway |
 
 Never commit `.env` or real tokens. The app has no Gemini or Databricks
@@ -103,6 +104,17 @@ Slack Bolt's `SlackRequestHandler`.
 
 The Toqan agent performs the intent detection and data work. No Databricks
 warehouse, host, token, or HTTP path is configured in this Slack service.
+
+## MOP Excel uploads
+
+The daily report asks whether the MOP is updated. To replace the destination
+worksheet, mention **@Lyra** and attach an `.xlsx` file. Lyra reads the first
+worksheet, clears the configured Google Sheet worksheet, and writes the workbook
+rows starting at `A1`. The service account must have access to the spreadsheet.
+Non-Excel attachments continue through the normal Toqan flow.
+
+MOP upload failures are reported in the originating thread without exposing
+credentials or workbook contents.
 
 ## Security notes
 

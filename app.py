@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import re
+import base64
+import io
 import threading
 import time
 import urllib.error
@@ -32,6 +34,18 @@ DONE_REACTION = "white_check_mark"
 ERROR_MESSAGE = "Não consegui processar agora, tente novamente"
 TIMEOUT_ERROR_MESSAGE = "Não consegui processar a tempo. Tente refazer a pergunta de forma mais específica."
 EMPTY_ANSWER_MESSAGE = "Não consegui obter uma resposta agora."
+MOP_SUCCESS_MESSAGE = (
+    "MOP atualizado com sucesso! Planilha atualizada: "
+    "https://docs.google.com/spreadsheets/d/1cy23m4iN0D7vEiJbbAw9hRpUtaHgGuRew_fgAUz_l14/edit?gid=469945566#gid=469945566"
+)
+MOP_CREDENTIALS_ERROR_MESSAGE = (
+    "Não consigo atualizar o MOP agora — credenciais do Google não configuradas."
+)
+MOP_DOWNLOAD_ERROR_MESSAGE = "Não consegui baixar o arquivo. Tente enviar novamente."
+MOP_READ_ERROR_MESSAGE = "Não consegui ler o arquivo Excel. Verifique se o formato está correto."
+MOP_SHEETS_ERROR_MESSAGE = "Erro ao atualizar a planilha do MOP. Tente novamente."
+MOP_SPREADSHEET_ID = "1cy23m4iN0D7vEiJbbAw9hRpUtaHgGuRew_fgAUz_l14"
+MOP_WORKSHEET_GID = 469945566
 
 DAILY_REPORT_CHANNEL = os.getenv("DAILY_REPORT_CHANNEL", "C0BF6JVFG7N")
 DAILY_REPORT_HOUR = 11
@@ -43,6 +57,16 @@ DAILY_REPORT_PROMPT = (
     "consolidado. Considere o ajuste de fuso horário subtraindo 3 horas do "
     "csat_timestamp. Mostre também a diferença em relação à meta de 75%."
 )
+
+MOP_CHECK_MESSAGE = (
+    "Bom dia! ☀️ Report de CSAT enviado acima. \n\n"
+    "Outra coisa: temos MOP atualizado? Se sim, me envie o arquivo Excel "
+    "marcando a Lyra que eu atualizo a planilha. Se não tiver atualizado, "
+    "tudo bem — segue o dia! 📋"
+)
+MOP_CHECK_HOUR = 14
+MOP_CHECK_DAY = 1  # Monday=0, Tuesday=1, ..., Sunday=6
+
 BRAZIL_TIMEZONE = ZoneInfo("America/Sao_Paulo")
 
 # Slack Bolt can be imported and the health endpoint can run without credentials,
@@ -172,6 +196,163 @@ def _event_key(event: dict[str, Any]) -> str:
     return str(event.get("client_msg_id") or event.get("ts") or event.get("text") or "unknown")
 
 
+class MOPGoogleCredentialsError(RuntimeError):
+    """Raised when the Google service-account configuration is absent."""
+
+
+class MOPDownloadError(RuntimeError):
+    """Raised when an attached Slack file cannot be downloaded."""
+
+
+class MOPReadError(RuntimeError):
+    """Raised when the attached workbook cannot be read."""
+
+
+class MOPSheetsError(RuntimeError):
+    """Raised when the destination Google Sheet cannot be updated."""
+
+
+def _get_google_client():
+    """Create the Google client from the base64 service-account JSON, if set."""
+    credentials_b64 = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    if not credentials_b64:
+        return None
+    try:
+        credentials_json = json.loads(base64.b64decode(credentials_b64))
+        from google.oauth2.service_account import Credentials
+        import gspread
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        credentials = Credentials.from_service_account_info(credentials_json, scopes=scopes)
+        return gspread.authorize(credentials)
+    except Exception as exc:
+        logger.error("Could not configure Google Sheets client: %s", exc)
+        raise MOPGoogleCredentialsError from exc
+
+
+def _is_xlsx_attachment(file_info: dict[str, Any]) -> bool:
+    """Return True only for .xlsx attachments; other files use normal chat flow."""
+    name = str(file_info.get("name") or "")
+    return name.lower().endswith(".xlsx")
+
+
+def _download_slack_file(file_info: dict[str, Any], client: Any) -> bytes:
+    """Fetch a Slack file using files.info metadata and its private download URL."""
+    details = dict(file_info)
+    file_id = details.get("id")
+    if file_id and client is not None:
+        try:
+            response = client.files_info(file=file_id)
+            remote_file = response.get("file") if isinstance(response, dict) else None
+            if isinstance(remote_file, dict):
+                details.update(remote_file)
+        except Exception as exc:
+            logger.warning("Slack files.info failed for attached file: %s", exc)
+            raise MOPDownloadError from exc
+
+    file_url = details.get("url_private_download") or details.get("url_private")
+    if not file_url:
+        raise MOPDownloadError("Slack file has no private download URL")
+
+    headers = {}
+    slack_token = os.getenv("SLACK_BOT_TOKEN")
+    if slack_token:
+        headers["Authorization"] = f"Bearer {slack_token}"
+    request = urllib.request.Request(str(file_url), headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=TOQAN_TIMEOUT_SECONDS) as response:
+            content = response.read()
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+        logger.error("Slack file download failed")
+        raise MOPDownloadError from exc
+    if not content:
+        raise MOPDownloadError("Slack file download was empty")
+    return content
+
+
+def _workbook_rows(workbook_bytes: bytes) -> list[list[Any]]:
+    """Read the first worksheet and make cell values JSON-safe for Sheets."""
+    try:
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(io.BytesIO(workbook_bytes), data_only=False, read_only=True)
+        worksheet = workbook.active
+        rows: list[list[Any]] = []
+        for row in worksheet.iter_rows(values_only=True):
+            converted = []
+            for value in row:
+                if isinstance(value, (datetime,)):
+                    converted.append(value.isoformat(sep=" "))
+                elif value is None:
+                    converted.append("")
+                else:
+                    converted.append(value)
+            rows.append(converted)
+        workbook.close()
+        return rows
+    except Exception as exc:
+        logger.error("Excel workbook could not be read")
+        raise MOPReadError from exc
+
+
+def _worksheet_by_gid(spreadsheet: Any, worksheet_gid: int) -> Any:
+    """Find a worksheet by numeric gid, supporting gspread API variants."""
+    get_by_id = getattr(spreadsheet, "get_worksheet_by_id", None)
+    if callable(get_by_id):
+        worksheet = get_by_id(worksheet_gid)
+        if worksheet is not None:
+            return worksheet
+    for worksheet in spreadsheet.worksheets():
+        if int(worksheet.id) == worksheet_gid:
+            return worksheet
+    raise MOPSheetsError(f"Worksheet gid {worksheet_gid} was not found")
+
+
+def _update_mop_sheet(workbook_bytes: bytes, google_client: Any = None) -> None:
+    """Replace destination worksheet values with the first worksheet's Excel rows."""
+    if google_client is None:
+        google_client = _get_google_client()
+    if google_client is None:
+        raise MOPGoogleCredentialsError
+
+    rows = _workbook_rows(workbook_bytes)
+    try:
+        spreadsheet = google_client.open_by_key(MOP_SPREADSHEET_ID)
+        worksheet = _worksheet_by_gid(spreadsheet, MOP_WORKSHEET_GID)
+        worksheet.clear()
+        if rows:
+            worksheet.update(rows, "A1", raw=False)
+    except MOPSheetsError:
+        raise
+    except Exception as exc:
+        logger.error("Google Sheets MOP update failed")
+        raise MOPSheetsError from exc
+
+
+def _mop_attachment(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the first .xlsx file in an event, or None for ordinary messages."""
+    files = event.get("files") or []
+    if not isinstance(files, list):
+        return None
+    return next((file_info for file_info in files if isinstance(file_info, dict) and _is_xlsx_attachment(file_info)), None)
+
+
+def _process_mop_upload(event: dict[str, Any], client: Any) -> str | None:
+    """Process one xlsx mention; return None when the event is not an Excel upload."""
+    attachment = _mop_attachment(event)
+    if attachment is None:
+        return None
+    google_client = _get_google_client()
+    if google_client is None:
+        raise MOPGoogleCredentialsError
+    workbook_bytes = _download_slack_file(attachment, client)
+    _update_mop_sheet(workbook_bytes, google_client)
+    return MOP_SUCCESS_MESSAGE
+
+
 def _say(say: Callable[..., Any], answer: str, event: dict[str, Any], in_thread: bool) -> None:
     if in_thread:
         thread_ts = event.get("thread_ts") or event.get("ts")
@@ -180,8 +361,13 @@ def _say(say: Callable[..., Any], answer: str, event: dict[str, Any], in_thread:
         say(text=answer)
 
 
-def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bool) -> None:
-    """Relay one Slack event to Toqan and send the resulting answer."""
+def _process_event(
+    event: dict[str, Any],
+    say: Callable[..., Any],
+    in_thread: bool,
+    client: Any = None,
+) -> None:
+    """Process an Excel MOP upload or relay an ordinary event to Toqan."""
     event_key = _event_key(event)
     with _IN_FLIGHT_LOCK:
         if event_key in _IN_FLIGHT:
@@ -190,6 +376,11 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
 
     question = _strip_mentions(str(event.get("text") or ""))
     try:
+        mop_answer = _process_mop_upload(event, client)
+        if mop_answer is not None:
+            _say(say, mop_answer, event, in_thread=True)
+            return
+
         if not question:
             _say(say, "Oi! Sou a Lyra. Como posso ajudar?", event, in_thread)
             return
@@ -205,6 +396,18 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
         if not answer:
             answer = EMPTY_ANSWER_MESSAGE
         _say(say, answer, event, in_thread)
+    except MOPGoogleCredentialsError:
+        logger.warning("MOP upload skipped because Google credentials are not configured")
+        _say(say, MOP_CREDENTIALS_ERROR_MESSAGE, event, in_thread=True)
+    except MOPDownloadError:
+        logger.warning("MOP upload could not download the Slack file")
+        _say(say, MOP_DOWNLOAD_ERROR_MESSAGE, event, in_thread=True)
+    except MOPReadError:
+        logger.warning("MOP upload contained an unreadable Excel workbook")
+        _say(say, MOP_READ_ERROR_MESSAGE, event, in_thread=True)
+    except MOPSheetsError:
+        logger.warning("MOP upload could not update Google Sheets")
+        _say(say, MOP_SHEETS_ERROR_MESSAGE, event, in_thread=True)
     except ToqanAPIError as exc:
         logger.exception("Lyra could not process Slack event")
         if "polling timed out" in str(exc):
@@ -235,7 +438,7 @@ def _dispatch(event: dict[str, Any], say: Callable[..., Any], client: Any, ack: 
 
     def worker() -> None:
         try:
-            _process_event(event, say, in_thread)
+            _process_event(event, say, in_thread, client)
         finally:
             if channel and timestamp:
                 try:
@@ -280,7 +483,7 @@ def slack_events():
 
 
 def _next_run_time_brazil() -> float:
-    """Return seconds until the next 09:00 in America/Sao_Paulo."""
+    """Return seconds until the next 11:00 in America/Sao_Paulo."""
     now_utc = datetime.now(timezone.utc)
     now_brazil = now_utc.astimezone(BRAZIL_TIMEZONE)
     target_date = now_brazil.date()
@@ -295,7 +498,8 @@ def _next_run_time_brazil() -> float:
 
 
 def _run_daily_report() -> None:
-    """Run and publish the scheduled CSAT report."""
+    """Run and publish the scheduled CSAT report, then ask about MOP."""
+    # 1. Post CSAT report
     conversation_id, request_id = create_conversation(DAILY_REPORT_PROMPT)
     answer = get_answer(conversation_id, request_id)
     answer = _clean_answer(answer)
@@ -304,11 +508,43 @@ def _run_daily_report() -> None:
     slack_app.client.chat_postMessage(channel=DAILY_REPORT_CHANNEL, text=answer)
 
 
+
+def _next_mop_run_time() -> float:
+    """Seconds until next Tuesday 14:00 Brazil time."""
+    now_brazil = datetime.now(BRAZIL_TIMEZONE)
+    days_ahead = MOP_CHECK_DAY - now_brazil.weekday()
+    if days_ahead < 0 or (days_ahead == 0 and now_brazil.hour >= MOP_CHECK_HOUR):
+        days_ahead += 7
+    target = datetime(
+        now_brazil.year, now_brazil.month, now_brazil.day,
+        MOP_CHECK_HOUR, 0, 0, tzinfo=BRAZIL_TIMEZONE,
+    ) + timedelta(days=days_ahead)
+    return max(0.0, (target.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds())
+
+
+def _mop_check_loop() -> None:
+    """Sleep until each Tuesday 14:00 Brazil and post MOP check."""
+    while True:
+        wait_seconds = _next_mop_run_time()
+        logger.info("MOP check: sleeping %.0fs until next Tuesday 14:00 Brazil time", wait_seconds)
+        time.sleep(wait_seconds)
+        try:
+            slack_app.client.chat_postMessage(channel=DAILY_REPORT_CHANNEL, text=MOP_CHECK_MESSAGE)
+        except Exception:
+            logger.exception("MOP check post failed")
+
+
+def _start_mop_scheduler() -> None:
+    """Start daemon thread for weekly MOP check."""
+    thread = threading.Thread(target=_mop_check_loop, name="lyra-mop-check", daemon=True)
+    thread.start()
+
+
 def _daily_report_loop() -> None:
-    """Sleep until each 09:00 Brazil run and isolate failures per run."""
+    """Sleep until each 11:00 Brazil run and isolate failures per run."""
     while True:
         wait_seconds = _next_run_time_brazil()
-        logger.info("Daily report: sleeping %.0fs until next 09:00 Brazil time", wait_seconds)
+        logger.info("Daily report: sleeping %.0fs until next 11:00 Brazil time", wait_seconds)
         time.sleep(wait_seconds)
         try:
             _run_daily_report()
@@ -324,4 +560,5 @@ def _start_daily_report_scheduler() -> None:
 
 if __name__ == "__main__":
     _start_daily_report_scheduler()
+    _start_mop_scheduler()
     flask_app.run(host="0.0.0.0", port=PORT)
