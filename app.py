@@ -34,7 +34,7 @@ TIMEOUT_ERROR_MESSAGE = "Não consegui processar a tempo. Tente refazer a pergun
 EMPTY_ANSWER_MESSAGE = "Não consegui obter uma resposta agora."
 
 DAILY_REPORT_CHANNEL = os.getenv("DAILY_REPORT_CHANNEL", "C0BF6JVFG7N")
-DAILY_REPORT_HOUR = 9
+DAILY_REPORT_HOUR = 11
 DAILY_REPORT_PROMPT = (
     "Report diário de CSAT. Preciso do CSAT consolidado de todas as filas: "
     "CX Review, CX Review - AeC, CX Review - CSU, CX Suporte, CX Super Cliente - CSU, "
