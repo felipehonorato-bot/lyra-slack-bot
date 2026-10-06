@@ -11,8 +11,9 @@ for the answer, removes the eyes reaction, adds a check-mark reaction, and
 posts the answer in the mention's thread or back in the DM. Internal
 `<think>...</think>` sections are removed before posting.
 
-Toqan may run Databricks queries, so a response can take **30–60 seconds**.
-The app polls every five seconds for up to twelve attempts. If the API fails or
+Toqan may run Databricks queries, so a response can take several minutes.
+The app polls every ten seconds for up to fifteen minutes. At approximately
+three and seven minutes, Lyra posts a progress update in the thread. If the API fails or
 times out, Lyra replies:
 
 > Não consegui processar agora, tente novamente
@@ -63,6 +64,7 @@ Only three variables are required for a deployed bot:
 | `SLACK_BOT_TOKEN` | Yes | Slack Bot User OAuth Token |
 | `SLACK_SIGNING_SECRET` | Yes | Slack app signing secret |
 | `TOQAN_API_KEY` | Yes | Toqan Agent API key |
+| `DAILY_REPORT_CHANNEL` | No | Slack channel for the daily 09:00 Brazil CSAT report; defaults to `C0BF6JVFG7N` |
 | `PORT` | No | HTTP port; defaults to `3000` and is supplied by Railway |
 
 Never commit `.env` or real tokens. The app has no Gemini or Databricks
