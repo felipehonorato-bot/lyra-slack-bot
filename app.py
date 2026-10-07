@@ -287,29 +287,34 @@ def _download_slack_file(file_info: dict[str, Any], client: Any) -> bytes:
     return content
 
 
-def _workbook_rows(workbook_bytes: bytes) -> list[list[Any]]:
-    """Read the first worksheet and make cell values JSON-safe for Sheets."""
+def _workbook_rows(workbook_bytes: bytes) -> list[list[str]]:
+    """Read the first worksheet and convert all cell values to strings."""
     try:
         from openpyxl import load_workbook
+        from datetime import datetime, date, time as dtime
 
         workbook = load_workbook(io.BytesIO(workbook_bytes), data_only=False, read_only=True)
         worksheet = workbook.active
-        rows: list[list[Any]] = []
+        rows: list[list[str]] = []
         for row in worksheet.iter_rows(values_only=True):
             converted = []
             for value in row:
-                if isinstance(value, (datetime,)):
-                    converted.append(value.isoformat(sep=" "))
-                elif value is None:
+                if value is None:
                     converted.append("")
+                elif isinstance(value, dtime):
+                    converted.append(value.strftime("%H:%M:%S"))
+                elif isinstance(value, date):
+                    converted.append(value.isoformat())
+                elif isinstance(value, datetime):
+                    converted.append(value.isoformat(sep=" "))
                 else:
-                    converted.append(value)
+                    converted.append(str(value))
             rows.append(converted)
         workbook.close()
         return rows
     except Exception as exc:
-        logger.error("Excel workbook could not be read")
-        raise MOPReadError from exc
+        logger.error("Excel workbook could not be read: %s", exc)
+        raise MOPReadError(str(exc)) from exc
 
 
 def _worksheet_by_gid(spreadsheet: Any, worksheet_gid: int) -> Any:
