@@ -50,12 +50,17 @@ MOP_WORKSHEET_GID = 469945566
 DAILY_REPORT_CHANNEL = os.getenv("DAILY_REPORT_CHANNEL", "C0BF6JVFG7N")
 DAILY_REPORT_HOUR = 11
 DAILY_REPORT_PROMPT = (
-    "Report diário de CSAT. Preciso do CSAT consolidado de todas as filas: "
-    "CX Review, CX Review - AeC, CX Review - CSU, CX Suporte, CX Super Cliente - CSU, "
-    "CX Super Cliente - AeC, Agentforce CX. Apresente o CSAT do dia anterior e do mês "
-    "atual para cada fila, com total de avaliações, promotoras, detratoras e o CSAT "
-    "consolidado. Considere o ajuste de fuso horário subtraindo 3 horas do "
-    "csat_timestamp. Mostre também a diferença em relação à meta de 75%."
+    "Report diário de CSAT. Formato curto e direto, como uma mensagem de Slack.\n\n"
+    "Para cada fila (CX Review, CX Review - AeC, CX Review - CSU, CX Suporte, "
+    "CX Super Cliente - CSU, CX Super Cliente - AeC, Agentforce CX), mostre:\n"
+    "- CSAT do dia anterior (D-1) e CSAT do mês (MTD), com n e gap para a meta de 75%\n"
+    "- Ajuste de fuso: subtrair 3 horas do csat_timestamp\n\n"
+    "Formato: uma linha por fila, curta. Exemplo:\n"
+    "*CX Suporte* — D-1: 60,3% (n=63) | MTD: 61,3% (n=204, gap: -13,7 p.p.)\n\n"
+    "No final, um bullet curto com o principal alerta se houver.\n"
+    "Sem tabelas, sem code blocks, sem listas longas. Texto direto como uma pessoa escreveria.\n"
+    "Se algo estiver crítico (CSAT abaixo de 50% ou gap maior que -20 p.p.), sinalize com ⚠️.\n"
+    "Máximo 15 linhas."
 )
 
 MOP_CHECK_MESSAGE = (
@@ -165,8 +170,8 @@ def get_answer(
             return _clean_answer(answer)
 
         progress_message = {
-            18: "Still processing, this is a complex query — hang tight...",
-            42: "Still working on it, almost there...",
+            18: "Ainda processando — essa é uma consulta complexa, só um momento...",
+            42: "Quase lá, finalizando a consulta...",
         }.get(attempt)
         if progress_message and progress_callback:
             try:
@@ -326,9 +331,12 @@ def _update_mop_sheet(workbook_bytes: bytes, google_client: Any = None) -> None:
     try:
         spreadsheet = google_client.open_by_key(MOP_SPREADSHEET_ID)
         worksheet = _worksheet_by_gid(spreadsheet, MOP_WORKSHEET_GID)
+        # Clear existing data
         worksheet.clear()
         if rows:
-            worksheet.update(rows, "A1", raw=False)
+            # Use append_rows for better compatibility across gspread versions
+            worksheet.append_rows(rows, value_input_option="RAW")
+        logger.info("MOP sheet updated with %d rows", len(rows))
     except MOPSheetsError:
         raise
     except Exception as exc:
