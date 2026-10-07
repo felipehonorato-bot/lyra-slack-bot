@@ -50,17 +50,13 @@ MOP_WORKSHEET_GID = 469945566
 DAILY_REPORT_CHANNEL = os.getenv("DAILY_REPORT_CHANNEL", "C0BF6JVFG7N")
 DAILY_REPORT_HOUR = 11
 DAILY_REPORT_PROMPT = (
-    "Report diário de CSAT. Formato curto e direto, como uma mensagem de Slack.\n\n"
-    "Para cada fila (CX Review, CX Review - AeC, CX Review - CSU, CX Suporte, "
-    "CX Super Cliente - CSU, CX Super Cliente - AeC, Agentforce CX), mostre:\n"
-    "- CSAT do dia anterior (D-1) e CSAT do mês (MTD), com n e gap para a meta de 75%\n"
-    "- Ajuste de fuso: subtrair 3 horas do csat_timestamp\n\n"
-    "Formato: uma linha por fila, curta. Exemplo:\n"
-    "*CX Suporte* — D-1: 60,3% (n=63) | MTD: 61,3% (n=204, gap: -13,7 p.p.)\n\n"
-    "No final, um bullet curto com o principal alerta se houver.\n"
-    "Sem tabelas, sem code blocks, sem listas longas. Texto direto como uma pessoa escreveria.\n"
-    "Se algo estiver crítico (CSAT abaixo de 50% ou gap maior que -20 p.p.), sinalize com ⚠️.\n"
-    "Máximo 15 linhas."
+    "Report diário de CSAT — execute o Bloco 3 do seu prompt (report de indicadores). "
+    "Siga a estrutura completa: compromissos de ontem (se houver), CSAT por célula "
+    "(mês, D-2, D-1 com variação), motivo de maior impacto em p.p., reincidência em Q4 "
+    "e chamada para ação pedindo o plano da liderança na thread. "
+    "Use formatação Slack (mrkdwn): negrito com *um asterisco*, bullets com •, "
+    "separadores com • • •. Sem tabelas com |, sem **duplo asterisco**. "
+    "Escreva como uma pessoa, frases curtas e diretas."
 )
 
 MOP_CHECK_MESSAGE = (
@@ -243,9 +239,18 @@ def _get_google_client():
 
 
 def _is_xlsx_attachment(file_info: dict[str, Any]) -> bool:
-    """Return True only for .xlsx attachments; other files use normal chat flow."""
-    name = str(file_info.get("name") or "")
-    return name.lower().endswith(".xlsx")
+    """Return True for .xlsx attachments, checking name, mimetype and filetype."""
+    name = str(file_info.get("name") or "").lower()
+    mimetype = str(file_info.get("mimetype") or "").lower()
+    filetype = str(file_info.get("filetype") or "").lower()
+    if name.endswith(".xlsx"):
+        return True
+    if "spreadsheet" in mimetype or "excel" in mimetype:
+        return True
+    if filetype in ("xlsx", "xls", "excel"):
+        return True
+    logger.info("File not recognized as xlsx: name=%s mimetype=%s filetype=%s", name, mimetype, filetype)
+    return False
 
 
 def _download_slack_file(file_info: dict[str, Any], client: Any) -> bytes:
@@ -408,18 +413,26 @@ def _process_event(
         if not answer:
             answer = EMPTY_ANSWER_MESSAGE
         _say(say, answer, event, in_thread)
-    except MOPGoogleCredentialsError:
-        logger.warning("MOP upload skipped because Google credentials are not configured")
-        _say(say, MOP_CREDENTIALS_ERROR_MESSAGE, event, in_thread=True)
-    except MOPDownloadError:
-        logger.warning("MOP upload could not download the Slack file")
-        _say(say, MOP_DOWNLOAD_ERROR_MESSAGE, event, in_thread=True)
-    except MOPReadError:
-        logger.warning("MOP upload contained an unreadable Excel workbook")
-        _say(say, MOP_READ_ERROR_MESSAGE, event, in_thread=True)
-    except MOPSheetsError:
-        logger.warning("MOP upload could not update Google Sheets")
-        _say(say, MOP_SHEETS_ERROR_MESSAGE, event, in_thread=True)
+    except MOPGoogleCredentialsError as exc:
+        detail = str(exc) if str(exc) else ""
+        msg = f"Erro credenciais Google: {detail}" if detail else MOP_CREDENTIALS_ERROR_MESSAGE
+        logger.warning("MOP upload: Google credentials error: %s", detail)
+        _say(say, msg, event, in_thread=True)
+    except MOPDownloadError as exc:
+        detail = str(exc) if str(exc) else ""
+        msg = f"Erro ao baixar arquivo: {detail}" if detail else MOP_DOWNLOAD_ERROR_MESSAGE
+        logger.warning("MOP upload could not download Slack file: %s", detail)
+        _say(say, msg, event, in_thread=True)
+    except MOPReadError as exc:
+        detail = str(exc) if str(exc) else ""
+        msg = f"Erro ao ler Excel: {detail}" if detail else MOP_READ_ERROR_MESSAGE
+        logger.warning("MOP upload: Excel read error: %s", detail)
+        _say(say, msg, event, in_thread=True)
+    except MOPSheetsError as exc:
+        detail = str(exc) if str(exc) else ""
+        msg = f"Erro ao atualizar MOP: {detail}" if detail else MOP_SHEETS_ERROR_MESSAGE
+        logger.warning("MOP upload could not update Google Sheets: %s", detail)
+        _say(say, msg, event, in_thread=True)
     except ToqanAPIError as exc:
         logger.exception("Lyra could not process Slack event")
         if "polling timed out" in str(exc):
