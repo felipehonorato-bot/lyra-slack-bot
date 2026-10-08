@@ -28,7 +28,7 @@ logger = logging.getLogger("lyra-slack-bot")
 TOQAN_BASE_URL = "https://api.toqan.ai/api"
 TOQAN_TIMEOUT_SECONDS = 60
 POLL_INTERVAL_SECONDS = 10
-MAX_POLL_ATTEMPTS = 90
+MAX_POLL_ATTEMPTS = 180
 PROCESSING_REACTION = "eyes"
 DONE_REACTION = "white_check_mark"
 ERROR_MESSAGE = "Não consegui processar agora, tente novamente"
@@ -178,7 +178,9 @@ def get_answer(
 
         progress_message = {
             18: "Ainda processando — essa é uma consulta complexa, só um momento...",
-            42: "Quase lá, finalizando a consulta...",
+            42: "Ainda consultando o Databricks, quase lá...",
+            72: "Demorando mais que o normal — a consulta é pesada, aguarde...",
+            108: "Continuando a consulta, não desista — já estamos em 18 min...",
         }.get(attempt)
         if progress_message and progress_callback:
             try:
