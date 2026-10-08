@@ -36,7 +36,7 @@ TIMEOUT_ERROR_MESSAGE = "Não consegui processar a tempo. Tente refazer a pergun
 EMPTY_ANSWER_MESSAGE = "Não consegui obter uma resposta agora."
 MOP_SUCCESS_MESSAGE = (
     "MOP atualizado com sucesso! Planilha atualizada: "
-    "https://docs.google.com/spreadsheets/d/1cy23m4iN0D7vEiJbbAw9hRpUtaHgGuRew_fgAUz_l14/edit?gid=469945566#gid=469945566"
+    "https://docs.google.com/spreadsheets/d/1Up11UQ1j0h9t8KW276AxJPGfEsShs9AsUztF5PAmyyE/edit?gid=0#gid=0"
 )
 MOP_CREDENTIALS_ERROR_MESSAGE = (
     "Não consigo atualizar o MOP agora — credenciais do Google não configuradas."
@@ -44,12 +44,21 @@ MOP_CREDENTIALS_ERROR_MESSAGE = (
 MOP_DOWNLOAD_ERROR_MESSAGE = "Não consegui baixar o arquivo. Tente enviar novamente."
 MOP_READ_ERROR_MESSAGE = "Não consegui ler o arquivo Excel. Verifique se o formato está correto."
 MOP_SHEETS_ERROR_MESSAGE = "Erro ao atualizar a planilha do MOP. Tente novamente."
-MOP_SPREADSHEET_ID = "1cy23m4iN0D7vEiJbbAw9hRpUtaHgGuRew_fgAUz_l14"
-MOP_WORKSHEET_GID = 469945566
+MOP_SPREADSHEET_ID = "1Up11UQ1j0h9t8KW276AxJPGfEsShs9AsUztF5PAmyyE"
+MOP_WORKSHEET_GID = 0
+COMPROMISSOS_WORKSHEET_TITLE = "Compromissos"
+COMPROMISSOS_HEADERS = [
+    "Problema Identificado", "Ação Tomada", "Data Inicio", "Data Fim",
+    "Duração", "Resultado Pré", "Resultado Pós", "Sucesso",
+]
+COMPROMISSOS_THREAD_DELAY_SECONDS = 2 * 60 * 60
 
 DAILY_REPORT_CHANNEL = os.getenv("DAILY_REPORT_CHANNEL", "C0BF6JVFG7N")
 DAILY_REPORT_HOUR = 11
 DAILY_REPORT_PROMPT = (
+    "COMPROMISSOS: use o bloco de contexto abaixo como fonte de verdade. "
+    "Não peça plano novo para compromissos em andamento ou concluídos; cobre apenas sem resposta "
+    "e peça para novos ofensores: ação · responsável · prazo na thread até 14h. "
     "Report diário de CSAT — execute o Bloco 3 do seu prompt (report de indicadores). "
     "Siga a estrutura completa: compromissos de ontem (se houver), CSAT por célula "
     "(mês, D-2, D-1 com variação), motivo de maior impacto em p.p., reincidência em Q4 "
@@ -87,6 +96,8 @@ _MENTION_RE = re.compile(r"<@[A-Z0-9]+(?:\|[^>]+)?>")
 _THINK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
 _IN_FLIGHT: set[str] = set()
 _IN_FLIGHT_LOCK = threading.Lock()
+_REPORT_FOLLOWUP_THREADS: set[str] = set()
+_REPORT_FOLLOWUP_LOCK = threading.Lock()
 
 
 class ToqanAPIError(RuntimeError):
@@ -354,6 +365,327 @@ def _update_mop_sheet(workbook_bytes: bytes, google_client: Any = None) -> None:
         raise MOPSheetsError(str(exc)) from exc
 
 
+def _compromissos_worksheet(spreadsheet: Any, create: bool = True) -> Any:
+    """Return the commitments worksheet, creating it on first use."""
+    try:
+        return spreadsheet.worksheet(COMPROMISSOS_WORKSHEET_TITLE)
+    except Exception as exc:
+        # Keep the gspread import local so the app can still serve /health in a
+        # minimal local environment without Google dependencies configured.
+        try:
+            import gspread
+            worksheet_not_found = isinstance(exc, gspread.WorksheetNotFound)
+        except Exception:
+            worksheet_not_found = exc.__class__.__name__ == "WorksheetNotFound"
+        if not worksheet_not_found or not create:
+            raise
+        return spreadsheet.add_worksheet(COMPROMISSOS_WORKSHEET_TITLE, rows=1000, cols=8)
+
+
+def _today_brazil() -> datetime:
+    return datetime.now(BRAZIL_TIMEZONE)
+
+
+def _format_date(value: datetime) -> str:
+    return value.strftime("%d/%m/%Y")
+
+
+def _parse_commitment_date(value: Any, today: datetime | None = None) -> datetime | None:
+    """Parse the human deadline formats accepted in a Slack commitment."""
+    text = str(value or "").strip().lower()
+    if not text or text in {"a definir", "sem prazo", "não informado", "nao informado", "—", "-"}:
+        return None
+    today = today or _today_brazil()
+    if any(token in text for token in ("hoje", "today")):
+        return today
+    if "amanhã" in text or "amanha" in text or "tomorrow" in text:
+        return today + timedelta(days=1)
+    for pattern, fmt in ((r"\b(\d{1,2}/\d{1,2}/\d{4})\b", "%d/%m/%Y"),
+                         (r"\b(\d{1,2}-\d{1,2}-\d{4})\b", "%d-%m-%Y"),
+                         (r"\b(\d{4}-\d{1,2}-\d{1,2})\b", "%Y-%m-%d")):
+        match = re.search(pattern, text)
+        if match:
+            try:
+                return datetime.strptime(match.group(1), fmt).replace(tzinfo=BRAZIL_TIMEZONE)
+            except ValueError:
+                return None
+    short_date = re.search(r"\b(\d{1,2})/(\d{1,2})\b", text)
+    if short_date:
+        try:
+            return datetime(today.year, int(short_date.group(2)), int(short_date.group(1)), tzinfo=BRAZIL_TIMEZONE)
+        except ValueError:
+            return None
+    return None
+
+
+def _deadline_fields(deadline: Any, today: datetime | None = None) -> tuple[str, str]:
+    today = today or _today_brazil()
+    parsed = _parse_commitment_date(deadline, today)
+    if parsed is None:
+        return "a definir", "—"
+    return _format_date(parsed), str(max(0, (parsed.date() - today.date()).days))
+
+
+def _normalise_csat(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text if "%" in text else f"{text}%"
+
+
+def _row_value(row: dict[str, Any], *names: str) -> str:
+    for name in names:
+        value = row.get(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _ensure_compromissos_headers(worksheet: Any) -> None:
+    values = worksheet.get_all_values()
+    if not values:
+        worksheet.append_row(COMPROMISSOS_HEADERS, value_input_option="RAW")
+        return
+    current = [str(value).strip() for value in values[0][:len(COMPROMISSOS_HEADERS)]]
+    if current != COMPROMISSOS_HEADERS:
+        try:
+            worksheet.update("A1:H1", [COMPROMISSOS_HEADERS], value_input_option="RAW")
+        except TypeError:
+            worksheet.update("A1:H1", [COMPROMISSOS_HEADERS])
+
+
+def _save_compromissos(compromissos: list[dict[str, Any]], google_client: Any) -> None:
+    """Append commitments using the exact eight-column sheet contract."""
+    if not compromissos:
+        return
+    spreadsheet = google_client.open_by_key(MOP_SPREADSHEET_ID)
+    worksheet = _compromissos_worksheet(spreadsheet)
+    _ensure_compromissos_headers(worksheet)
+    rows: list[list[str]] = []
+    for commitment in compromissos:
+        data_inicio = _row_value(commitment, "data_inicio", "data") or _format_date(_today_brazil())
+        raw_deadline = _row_value(commitment, "data_fim", "prazo")
+        action = _row_value(commitment, "acao", "acao_tomada") or "sem resposta"
+        if action.lower() == "sem resposta" and raw_deadline in {"", "—", "-"}:
+            data_fim, duracao = "—", "—"
+        else:
+            data_fim, _ = _deadline_fields(raw_deadline, _today_brazil())
+            start_date = _parse_commitment_date(data_inicio, _today_brazil())
+            end_date = _parse_commitment_date(data_fim, _today_brazil())
+            duracao = str(max(0, (end_date.date() - start_date.date()).days)) if start_date and end_date else "—"
+        rows.append([
+            _row_value(commitment, "problema", "problema_identificado", "fila") or "Ofensor do report",
+            action,
+            data_inicio,
+            data_fim,
+            duracao,
+            _normalise_csat(_row_value(commitment, "resultado_pre", "pre")) or "a definir",
+            "",
+            "a definir",
+        ])
+    if hasattr(worksheet, "append_rows"):
+        worksheet.append_rows(rows, value_input_option="RAW")
+    else:
+        for row in rows:
+            worksheet.append_row(row, value_input_option="RAW")
+
+
+def _commitment_status(row: dict[str, str], today: datetime | None = None) -> str:
+    today = today or _today_brazil()
+    post = _row_value(row, "Resultado Pós", "resultado_pos")
+    success = _row_value(row, "Sucesso", "sucesso").lower()
+    if post and post.lower() not in {"a definir", "—", "-"}:
+        return "concluído"
+    deadline = _parse_commitment_date(_row_value(row, "Data Fim", "data_fim", "prazo"), today)
+    action = _row_value(row, "Ação Tomada", "acao", "acao_tomada").lower()
+    if action == "sem resposta":
+        return "sem resposta"
+    if deadline is not None and deadline.date() <= today.date():
+        return "prazo vencido"
+    if deadline is not None:
+        return "prazo em andamento"
+    return "prazo a definir" if success != "não" else "prazo vencido"
+
+
+def _get_open_compromissos(google_client: Any) -> str:
+    """Read every commitment and render lifecycle context for the daily prompt."""
+    try:
+        spreadsheet = google_client.open_by_key(MOP_SPREADSHEET_ID)
+        worksheet = _compromissos_worksheet(spreadsheet, create=False)
+        rows = worksheet.get_all_records()
+    except Exception as exc:
+        if exc.__class__.__name__ == "WorksheetNotFound":
+            return ""
+        logger.warning("Could not read commitments from Google Sheets: %s", exc)
+        return ""
+    if not rows:
+        return ""
+    today = _today_brazil()
+    lines = ["COMPROMISSOS ABERTOS:"]
+    for row in rows:
+        problem = _row_value(row, "Problema Identificado", "problema") or "ofensor"
+        action = _row_value(row, "Ação Tomada", "acao") or "sem resposta"
+        deadline_text = _row_value(row, "Data Fim", "data_fim") or "a definir"
+        status = _commitment_status(row, today)
+        if status == "prazo em andamento":
+            deadline = _parse_commitment_date(deadline_text, today)
+            days = max(0, (deadline.date() - today.date()).days) if deadline else 0
+            lines.append(f"- Em andamento: {problem} · {action} · prazo {deadline_text} · faltam {days} dias")
+        elif status == "prazo vencido":
+            pre = _row_value(row, "Resultado Pré", "resultado_pre") or "a definir"
+            label = "vence hoje" if _parse_commitment_date(deadline_text, today) and _parse_commitment_date(deadline_text, today).date() == today.date() else "vencido"
+            lines.append(f"- Prazo {label} em {deadline_text}: {problem} · {action} · CSAT foi de {pre} para a definir — verificar resultado")
+        elif status == "concluído":
+            pre = _row_value(row, "Resultado Pré", "resultado_pre") or "a definir"
+            post = _row_value(row, "Resultado Pós", "resultado_pos")
+            success = _row_value(row, "Sucesso", "sucesso") or "a definir"
+            lines.append(f"- Concluído: {problem} · CSAT de {pre} para {post} — sucesso {success.lower()}")
+        elif status == "sem resposta":
+            lines.append(f"- Sem resposta: {problem} — cobrar novamente")
+        else:
+            lines.append(f"- Sem prazo definido: {problem} · {action} — pedir prazo")
+    lines.extend([
+        "", "No report, para ofensores em andamento, não peça novo plano — só dê update do status.",
+        "Para ofensores vencidos, compare Pré vs Pós e diga se funcionou.",
+        "Para sem resposta, cobre novamente.",
+        "Para novos, peça o plano no formato ação · responsável · prazo na thread até 14h.", "",
+    ])
+    return "\n".join(lines)
+
+
+
+def _worksheet_rows_with_header(worksheet: Any) -> list[tuple[int, dict[str, str]]]:
+    values = worksheet.get_all_values()
+    if not values:
+        return []
+    headers = [str(value).strip() for value in values[0]]
+    return [(n, {h: str(row[i]) if i < len(row) else "" for i, h in enumerate(headers) if h})
+            for n, row in enumerate(values[1:], start=2)]
+
+
+def _update_compromisso_cells(worksheet: Any, row_number: int, resultado_pos: str, sucesso: str) -> None:
+    worksheet.update_cell(row_number, 7, resultado_pos)
+    worksheet.update_cell(row_number, 8, sucesso)
+
+
+def _extract_csat_for_commitment(report_text: str, problem: str, fallback: Any = None) -> str:
+    if isinstance(fallback, dict):
+        for key, value in fallback.items():
+            if str(key).lower() in problem.lower() or problem.lower() in str(key).lower():
+                return _normalise_csat(value)
+    if fallback is not None and not isinstance(fallback, dict):
+        return _normalise_csat(fallback)
+    relevant = [line for line in str(report_text or "").splitlines() if any(token.lower() in line.lower() for token in str(problem).split() if len(token) > 3)]
+    percentages = re.findall(r"(?<!\d)(\d{1,3}(?:[,.]\d+)?)\s*%", " ".join(relevant))
+    if len(percentages) == 1:
+        return _normalise_csat(percentages[0])
+    # A small report/test response may contain one unlabelled D-1 value. Use
+    # it; with several values we leave the row open rather than guessing a fila.
+    all_percentages = re.findall(r"(?<!\d)(\d{1,3}(?:[,.]\d+)?)\s*%", str(report_text or ""))
+    return _normalise_csat(all_percentages[0]) if len(all_percentages) == 1 else ""
+
+
+def _check_deadline_compromissos(google_client: Any, report_text: str = "", csat_by_problem: dict[str, Any] | None = None) -> int:
+    """Fill Resultado Pós/Sucesso for commitments due today or already overdue."""
+    try:
+        worksheet = _compromissos_worksheet(google_client.open_by_key(MOP_SPREADSHEET_ID), create=False)
+        updated = 0
+        today = _today_brazil()
+        for row_number, row in _worksheet_rows_with_header(worksheet):
+            if _row_value(row, "Resultado Pós", "resultado_pos") not in {"", "a definir"}:
+                continue
+            deadline = _parse_commitment_date(_row_value(row, "Data Fim", "data_fim"), today)
+            if deadline is None or deadline.date() > today.date():
+                continue
+            problem = _row_value(row, "Problema Identificado", "problema")
+            post = _extract_csat_for_commitment(report_text, problem, csat_by_problem)
+            if not post:
+                continue
+            pre = _extract_csat_for_commitment("", problem, _row_value(row, "Resultado Pré", "resultado_pre"))
+            def number(value: str) -> float | None:
+                match = re.search(r"\d+(?:[,.]\d+)?", value or "")
+                return float(match.group(0).replace(",", ".")) if match else None
+            pre_num, post_num = number(pre), number(post)
+            if pre_num is None or post_num is None:
+                continue
+            _update_compromisso_cells(worksheet, row_number, post, "Sim" if post_num > pre_num else "Não")
+            updated += 1
+        return updated
+    except Exception as exc:
+        if exc.__class__.__name__ != "WorksheetNotFound":
+            logger.warning("Could not check commitment deadlines: %s", exc)
+        return 0
+
+
+def _human_thread_messages(messages: list[dict[str, Any]], report_ts: str) -> list[str]:
+    """Extract human replies while excluding the report parent and bot posts."""
+    texts: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("ts") == report_ts:
+            continue
+        if message.get("bot_id") or message.get("bot_profile") or message.get("subtype") == "bot_message":
+            continue
+        text = str(message.get("text") or "").strip()
+        if text:
+            texts.append(text)
+    return texts
+
+
+def _commitments_from_thread(messages: list[dict[str, Any]], report_ts: str) -> list[dict[str, str]]:
+    """Parse `ação · responsável · prazo`, including replies with no prazo."""
+    commitments: list[dict[str, str]] = []
+    for text in _human_thread_messages(messages, report_ts):
+        parsed_line = False
+        for line in text.splitlines():
+            if "·" not in line:
+                continue
+            parts = [part.strip() for part in line.split("·", 2)]
+            if len(parts) >= 2 and parts[0]:
+                commitments.append({
+                    "acao": parts[0],
+                    "responsavel": parts[1] or "Liderança",
+                    "prazo": parts[2] if len(parts) == 3 and parts[2] else "a definir",
+                })
+                parsed_line = True
+        if not parsed_line:
+            commitments.append({"acao": text[:200], "responsavel": "Liderança", "prazo": "a definir"})
+    return commitments
+
+
+def _report_problem(parent_text: str) -> str:
+    for line in str(parent_text or "").splitlines():
+        if "%" in line and line.strip().startswith(('-', '•', '*')):
+            return re.sub(r"^[\-•*\s]+", "", line).strip()[:200]
+    return "Ofensor do report"
+
+
+def _read_report_thread(channel_id: str, report_ts: str) -> None:
+    """Read a report thread after two hours and persist the full commitment lifecycle."""
+    try:
+        response = slack_app.client.conversations_replies(channel=channel_id, ts=report_ts)
+        messages = response.get("messages", []) if isinstance(response, dict) else []
+        if not isinstance(messages, list):
+            messages = []
+        parent_text = next((str(m.get("text") or "") for m in messages if isinstance(m, dict) and m.get("ts") == report_ts), "")
+        human_texts = _human_thread_messages(messages, report_ts)
+        google_client = _get_google_client()
+        if google_client is None:
+            return
+        pre = _extract_csat_for_commitment(parent_text, _report_problem(parent_text))
+        # No reply creates a silent `sem resposta` row; only missing deadlines
+        # receive a follow-up question in the thread.
+        if human_texts:
+            parsed = _commitments_from_thread(messages, report_ts)
+            commitments = [{"problema": _report_problem(parent_text), "data_inicio": _format_date(_today_brazil()), "resultado_pre": pre, "thread_ts": report_ts, **item} for item in parsed]
+            _save_compromissos(commitments, google_client)
+            if any(str(item.get("prazo")) == "a definir" for item in parsed):
+                slack_app.client.chat_postMessage(channel=channel_id, text="Qual o prazo para essa ação?", thread_ts=report_ts)
+            slack_app.client.chat_postMessage(channel=channel_id, text=f"Registrado: {len(commitments)} compromissos.", thread_ts=report_ts)
+        else:
+            _save_compromissos([{"problema": _report_problem(parent_text), "data_inicio": _format_date(_today_brazil()), "acao": "sem resposta", "prazo": "—", "resultado_pre": pre, "thread_ts": report_ts}], google_client)
+    except Exception:
+        logger.exception("Failed to read report thread for commitments")
+
 def _mop_attachment(event: dict[str, Any]) -> dict[str, Any] | None:
     """Return the first .xlsx file in an event, or None for ordinary messages."""
     files = event.get("files") or []
@@ -507,6 +839,20 @@ def health():
     return jsonify({"status": "ok", "service": "lyra-slack-bot"}), 200
 
 
+@flask_app.get("/debug/create-compromissos")
+def debug_create_compromissos():
+    """Create the Compromissos worksheet if it doesn't exist. Temporary debug endpoint."""
+    try:
+        google_client = _get_google_client()
+        if google_client is None:
+            return jsonify({"error": "Google credentials not configured"}), 500
+        spreadsheet = google_client.open_by_key(MOP_SPREADSHEET_ID)
+        worksheet = _compromissos_worksheet(spreadsheet, create=True)
+        return jsonify({"ok": True, "worksheet": worksheet.title, "id": worksheet.id})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 @flask_app.get("/debug/mop")
 def debug_mop():
     """Debug endpoint to check Google Sheets connection — temporary."""
@@ -539,7 +885,7 @@ def debug_mop():
             scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
             creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
             gc = gspread.authorize(creds)
-            spreadsheet = gc.open_by_key("1cy23m4iN0D7vEiJbbAw9hRpUtaHgGuRew_fgAUz_l14")
+            spreadsheet = gc.open_by_key("1Up11UQ1j0h9t8KW276AxJPGfEsShs9AsUztF5PAmyyE")
             result["sheets_ok"] = True
             result["spreadsheet_title"] = spreadsheet.title
             worksheets = spreadsheet.worksheets()
@@ -572,14 +918,49 @@ def _next_run_time_brazil() -> float:
 
 
 def _run_daily_report() -> None:
-    """Run and publish the scheduled CSAT report, then ask about MOP."""
-    # 1. Post CSAT report
-    conversation_id, request_id = create_conversation(DAILY_REPORT_PROMPT)
-    answer = get_answer(conversation_id, request_id)
-    answer = _clean_answer(answer)
-    if not answer:
-        answer = EMPTY_ANSWER_MESSAGE
-    slack_app.client.chat_postMessage(channel=DAILY_REPORT_CHANNEL, text=answer)
+    """Run and publish the CSAT report, updating commitment deadlines from it."""
+    google_client = None
+    try:
+        google_client = _get_google_client()
+    except Exception:
+        logger.warning("Daily report: Google Sheets unavailable; skipping commitments", exc_info=True)
+
+    compromissos_text = ""
+    if google_client is not None:
+        try:
+            spreadsheet = google_client.open_by_key(MOP_SPREADSHEET_ID)
+            worksheet = _compromissos_worksheet(spreadsheet)
+            _ensure_compromissos_headers(worksheet)
+            compromissos_text = _get_open_compromissos(google_client)
+        except Exception:
+            logger.warning("Daily report: could not prepare commitments", exc_info=True)
+
+    prompt = compromissos_text + ("\n\n" if compromissos_text else "") + DAILY_REPORT_PROMPT
+    conversation_id, request_id = create_conversation(prompt)
+    answer = _clean_answer(get_answer(conversation_id, request_id)) or EMPTY_ANSWER_MESSAGE
+
+    # The report already contains D-1 CSAT by fila. Use it as the lifecycle
+    # source of truth for due/overdue commitments; a missing match remains open
+    # and is retried on the next report rather than being guessed.
+    if google_client is not None:
+        try:
+            _check_deadline_compromissos(google_client, answer)
+        except Exception:
+            logger.warning("Daily report: could not update commitment deadlines", exc_info=True)
+
+    response = slack_app.client.chat_postMessage(channel=DAILY_REPORT_CHANNEL, text=answer)
+    report_ts = response.get("ts") or response.get("message", {}).get("ts") if isinstance(response, dict) else None
+    if report_ts:
+        with _REPORT_FOLLOWUP_LOCK:
+            _REPORT_FOLLOWUP_THREADS.add(report_ts)
+        try:
+            threading.Timer(
+                COMPROMISSOS_THREAD_DELAY_SECONDS,
+                _read_report_thread,
+                args=(DAILY_REPORT_CHANNEL, report_ts),
+            ).start()
+        except Exception:
+            logger.exception("Could not schedule commitment thread read")
 
 
 
