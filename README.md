@@ -1,124 +1,112 @@
-# Lyra Slack Bot
+# Lyra Slack Bot (v3.2)
 
-Lyra is a Slack bot for iFood CX EPS operations. Team members can mention
-**@Lyra** in a channel or send her a direct message. The Slack app is a thin
-relay: the Toqan Agent API handles intent detection, persona, Databricks
-queries, and response generation.
+## Segregação por EPS (v3.2)
 
-Each Slack message starts a new Toqan conversation. The bot acknowledges the
-Slack event immediately, adds an eyes reaction while the agent is working, polls
-for the answer, removes the eyes reaction, adds a check-mark reaction, and
-posts the answer in the mention's thread or back in the DM. Internal
-`<think>...</think>` sections are removed before posting.
+AeC e CSU dividem as filas e **nada de uma aparece para a outra**. Cada EPS tem um
+canal (`EPS_CHANNELS`) e tudo fica isolado:
 
-Toqan may run Databricks queries, so a response can take several minutes.
-The app polls every ten seconds for up to fifteen minutes. At approximately
-three and seven minutes, Lyra posts a progress update in the thread. If the API fails or
-times out, Lyra replies:
+| O quê | Como isola |
+| --- | --- |
+| Report diário | Um por EPS, no canal dela. Dados filtrados pelo e-mail do operador (`aec` / `csu`), só as células da EPS |
+| Compromissos | Coluna `EPS` na aba; cada report só vê e cobra os da própria EPS |
+| Conversa | O canal define a EPS; o agente recebe um bloco ESCOPO e recusa dado da outra |
+| MOP | Upload no canal da EPS troca só as linhas dela (coluna EPS ou e-mail); o resumo injetado também é filtrado |
+| DM | Só `DM_ALLOWED_USERS` (padrão: quem está em `ALERT_CHANNEL`) |
+| Canal não configurado | A Lyra responde que não está configurada ali |
 
-> Não consegui processar agora, tente novamente
+As células de cada EPS ficam em `EPS_CELULAS` no `app.py`.
 
-## Files
+Lyra é o bot de gestão das EPSs do iFood CX no Slack. O app (Flask + Slack Bolt,
+no Railway) faz três coisas:
 
-- `app.py`: Flask server, Slack Bolt Events API route, and Toqan relay.
-- `requirements.txt`: runtime dependencies for the Slack relay, MOP Excel parsing,
-  and Google Sheets updates; there are no Gemini or Databricks SDK dependencies.
-- `.env.example`: deployment variable template.
-- `Procfile`: `web: python app.py`.
+1. **Relay de conversa:** menções `@Lyra` em canal e DMs vão para o agente Lyra no
+   Toqan, que consulta o Databricks e responde. O app não tem LLM nem credencial de
+   Databricks — **o acesso ao Databricks é configurado dentro do Toqan**.
+2. **Rotinas automáticas** (agendador único, horário de Brasília).
+3. **Planilha** (Google Sheets): MOP, Compromissos e Estado.
 
-There is no local persona or query module: those responsibilities belong to
-the Toqan agent.
+## Rotinas
 
-## Local setup
+| Horário | O que acontece |
+| --- | --- |
+| 08h45 | Relê a thread do report de ontem (respostas tardias) |
+| 09h00 | Report de CSAT: mensagem principal + thread. Até 3 tentativas (a cada 10 min); recupera até 13h após restart |
+| 11h00 (mín. 2h após o post) | Lê a thread, registra compromissos, pergunta prazo que faltar, marca "sem resposta" |
+| 18h00 | Segunda leitura da thread |
+| 14h00 no 1º dia útil e dia 15 | Cobrança do MOP (pula fim de semana e feriado nacional) |
 
-Use Python 3.11+:
+O estado de cada rotina fica na aba **Estado Lyra**. Um redeploy no meio do dia não
+perde as leituras nem duplica o report.
+
+## Planilha
+
+- **Aba gid 0 — MOP:** substituída quando alguém marca `@Lyra` com um `.xlsx`. O app
+  lê valores (não fórmulas), acha a aba com as colunas Nome e Email, salva a versão
+  anterior em **MOP backup** e restaura se a gravação falhar.
+- **Compromissos:** `Problema Identificado, Ação Tomada, Data Inicio, Data Fim,
+  Duração, Resultado Pré, Resultado Pós, Sucesso, Fila, Responsável, Thread`.
+  As 3 últimas colunas são criadas automaticamente; linhas antigas continuam válidas.
+  Pré = CSAT D-1 da fila no report do dia; Pós = CSAT D-1 da fila no primeiro
+  report após o prazo. Sucesso = Sim se Pós > Pré.
+- **Estado Lyra:** controle interno do agendador. Não editar.
+
+## Contrato com o agente (prompt v3.1)
+
+O report precisa vir com `===THREAD===` separando mensagem principal e thread, e a
+thread começa com todas as filas no formato `• *Fila:* Mês X% · D-1 Y% (n=…)`. Se a
+consulta falhar, o agente responde `ERRO: …` e o app não publica nada no canal.
+
+## Variáveis de ambiente
+
+| Variável | Obrigatória | Descrição |
+| --- | --- | --- |
+| `SLACK_BOT_TOKEN` | Sim | Bot User OAuth Token |
+| `SLACK_SIGNING_SECRET` | Sim | Signing secret do app |
+| `TOQAN_API_KEY` | Sim | Chave da API do Toqan |
+| `GOOGLE_CREDENTIALS_JSON` | Sim | JSON da service account (base64 ou cru), com acesso de editor à planilha |
+| `EPS_CHANNELS` | Sim (v3.2) | `AeC:C…,CSU:C…` — canal de cada EPS |
+| `CONSOLIDATED_CHANNEL` | Não | Canal interno com report AeC + CSU. Vazio = desligado |
+| `INTERNAL_CHANNELS` | Não | Outros canais internos com visão completa |
+| `DM_ALLOWED_USERS` | Não | IDs de usuários que podem usar DM. Vazio = só o `ALERT_CHANNEL` |
+| `DAILY_REPORT_CHANNEL` | Não | Só no modo antigo (sem `EPS_CHANNELS`) |
+| `ALERT_CHANNEL` | Recomendada | Canal ou ID de usuário que recebe alertas técnicos |
+| `MOP_ALLOWED_CHANNELS` | Recomendada | IDs de canal liberados para upload do MOP (vírgula). Vazio = qualquer canal |
+| `MOP_SPREADSHEET_ID` | Não | ID da planilha (padrão já no código) |
+| `DEBUG_TOKEN` | Não | Libera `GET /debug/status` com header `X-Debug-Token` |
+| `PORT` | Não | Fornecida pelo Railway |
+
+## Configuração do Slack
+
+**Bot scopes** (OAuth & Permissions) — depois de adicionar, reinstale o app:
+
+- `app_mentions:read`, `chat:write`
+- `channels:history` (ler a thread do report em canal público) e `groups:history` (se o canal for privado)
+- `im:history`, `im:read`
+- `files:read` (baixar o Excel do MOP)
+- `reactions:write` (👀 / ✅)
+
+**Eventos:** `app_mention` e `message.im`. Request URL: `https://<railway-url>/slack/events`.
+Convide a Lyra para o canal do report, para o canal do MOP e para o `ALERT_CHANNEL`.
+
+## Deploy no Railway
+
+- `Procfile`: `web: python app.py` — **não troque por gunicorn**: o agendador roda
+  dentro deste processo.
+- **Use 1 réplica.** Mais de uma réplica duplica as rotinas.
+- Depois do deploy: `GET /health` deve mostrar `"scheduler_alive": true`.
+
+## Rodar local
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
-# Replace the placeholders in .env with your own values.
+cp .env.example .env   # preencha os valores
 python app.py
-```
-
-The local server listens on `http://localhost:3000` by default. Confirm it
-with:
-
-```bash
 curl http://localhost:3000/health
 ```
 
-Expected response:
+## Segurança
 
-```json
-{"service":"lyra-slack-bot","status":"ok"}
-```
-
-## Environment variables
-
-Only three variables are required for a deployed bot:
-
-| Variable | Required | Description |
-| --- | --- | --- |
-| `SLACK_BOT_TOKEN` | Yes | Slack Bot User OAuth Token |
-| `SLACK_SIGNING_SECRET` | Yes | Slack app signing secret |
-| `TOQAN_API_KEY` | Yes | Toqan Agent API key |
-| `GOOGLE_CREDENTIALS_JSON` | For MOP uploads | Base64-encoded Google service-account JSON with access to the destination spreadsheet |
-| `DAILY_REPORT_CHANNEL` | No | Slack channel for the daily 11:00 Brazil CSAT report; defaults to `C0BF6JVFG7N` |
-| `PORT` | No | HTTP port; defaults to `3000` and is supplied by Railway |
-
-Never commit `.env` or real tokens. The app has no Gemini or Databricks
-credentials.
-
-## Slack app configuration
-
-1. Under **OAuth & Permissions**, add bot scopes `app_mentions:read`,
-   `chat:write`, `im:history`, and `im:read`.
-2. Install the app and set `SLACK_BOT_TOKEN`.
-3. Under **Event Subscriptions**, enable events and set the Request URL to:
-   `https://<deployed-url>/slack/events`
-4. Subscribe to bot events `app_mention` and `message.im`.
-   Slack delivers the DM subscription as a `message` payload with
-   `channel_type=im`; `app.py` handles that delivery and ignores other message
-   events.
-5. Set `SLACK_SIGNING_SECRET`, save the configuration, and invite Lyra to
-   channels where she should answer.
-
-The `/slack/events` route delegates URL verification and signature checking to
-Slack Bolt's `SlackRequestHandler`.
-
-## Deploy on Railway
-
-1. Create a Railway service from the repository containing this folder.
-2. In the service **Variables** panel, set exactly these three required
-   variables: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, and `TOQAN_API_KEY`.
-   Railway supplies `PORT`.
-3. Railway installs `requirements.txt` and runs the `Procfile` command
-   (`web: python app.py`).
-4. Copy the public HTTPS URL Railway gives the service.
-5. Set Slack's Event Subscriptions Request URL to
-   `https://<railway-public-url>/slack/events`.
-6. Verify `https://<railway-public-url>/health`, then test an `@Lyra` mention
-   and a DM.
-
-The Toqan agent performs the intent detection and data work. No Databricks
-warehouse, host, token, or HTTP path is configured in this Slack service.
-
-## MOP Excel uploads
-
-The daily report asks whether the MOP is updated. To replace the destination
-worksheet, mention **@Lyra** and attach an `.xlsx` file. Lyra reads the first
-worksheet, clears the configured Google Sheet worksheet, and writes the workbook
-rows starting at `A1`. The service account must have access to the spreadsheet.
-Non-Excel attachments continue through the normal Toqan flow.
-
-MOP upload failures are reported in the originating thread without exposing
-credentials or workbook contents.
-
-## Security notes
-
-- Never commit `.env`, Slack tokens, signing secrets, or Toqan API keys.
-- The Toqan API key is sent only in the `X-Api-Key` header by `app.py`.
-- Do not put customer or operator personal data in logs.
-- The bot does not change systems, open tickets, or adjust Akamai/MOP.
+- Nunca versione `.env` ou tokens.
+- Endpoints de debug só respondem com `DEBUG_TOKEN` configurado e enviado no header.
+- Os logs não registram conteúdo de planilha, de Excel nem dados de clientes.

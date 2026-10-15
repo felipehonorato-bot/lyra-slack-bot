@@ -1,14 +1,40 @@
-"""Lyra Slack bot: a thin Slack-to-Toqan Agent API relay."""
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v3.2).
+
+v3.2 — segregação por EPS:
+- EPS_CHANNELS mapeia cada EPS ao seu canal. Report, leitura de thread,
+  compromissos, cobrança de MOP e conversa ficam isolados por EPS.
+- Toda mensagem ao Toqan leva um bloco ESCOPO; em canal de EPS os dados são
+  filtrados pelo e-mail do operador (aec / csu) e só as células da EPS aparecem.
+- Upload de MOP no canal de uma EPS troca só as linhas daquela EPS.
+- DM só para DM_ALLOWED_USERS; canal não configurado não recebe resposta.
+
+O que mudou na v3.1 (sustentação):
+- Agendador único, resistente a restart: o estado de cada rotina fica na aba
+  "Estado Lyra" da planilha, então um redeploy não perde leituras de thread
+  nem duplica o report.
+- Report dividido em mensagem principal + thread (delimitador ===THREAD===).
+  Falha de consulta não é publicada como report; vira alerta.
+- Ciclo de compromissos com Fila, Responsável e Thread; CSAT pré/pós por fila
+  (lido das linhas "• *Fila:* Mês X% · D-1 Y%" do report).
+- Respostas tardias atualizam o compromisso existente (ex.: prazo informado
+  depois) em vez de duplicar; "sem resposta" é encerrado quando a liderança
+  responde.
+- Upload de MOP: lê valores (não fórmulas), escolhe a aba certa, valida
+  colunas, faz backup antes de substituir e pode ser restrito a canais.
+- Endpoints de debug protegidos por token.
+- Feriados nacionais respeitados na cobrança do MOP.
+"""
 from __future__ import annotations
 
+import base64
+import io
 import json
 import logging
 import os
 import re
-import base64
-import io
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
@@ -25,69 +51,207 @@ load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("lyra-slack-bot")
 
+# ---------------------------------------------------------------------------
+# Configuração
+# ---------------------------------------------------------------------------
+BRAZIL_TIMEZONE = ZoneInfo("America/Sao_Paulo")
+
 TOQAN_BASE_URL = "https://api.toqan.ai/api"
 TOQAN_TIMEOUT_SECONDS = 60
 POLL_INTERVAL_SECONDS = 10
-MAX_POLL_ATTEMPTS = 180
+MAX_POLL_ATTEMPTS = 180  # 180 x 10s = 30 minutos
 PROCESSING_REACTION = "eyes"
 DONE_REACTION = "white_check_mark"
 ERROR_MESSAGE = "Não consegui processar agora, tente novamente"
 TIMEOUT_ERROR_MESSAGE = "Não consegui processar a tempo. Tente refazer a pergunta de forma mais específica."
 EMPTY_ANSWER_MESSAGE = "Não consegui obter uma resposta agora."
-MOP_SUCCESS_MESSAGE = (
-    "MOP atualizado com sucesso! Planilha atualizada: "
-    "https://docs.google.com/spreadsheets/d/1Up11UQ1j0h9t8KW276AxJPGfEsShs9AsUztF5PAmyyE/edit?gid=0#gid=0"
+
+DAILY_REPORT_CHANNEL = os.getenv("DAILY_REPORT_CHANNEL", "C0BF6JVFG7N")
+ALERT_CHANNEL = os.getenv("ALERT_CHANNEL", "").strip()
+DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "").strip()
+
+
+def _parse_channel_map(raw: str) -> dict[str, str]:
+    """'AeC:C111,CSU:C222' -> {'AeC': 'C111', 'CSU': 'C222'}"""
+    result: dict[str, str] = {}
+    for part in raw.split(","):
+        if ":" in part:
+            name, channel = part.split(":", 1)
+            if name.strip() and channel.strip():
+                result[name.strip()] = channel.strip()
+    return result
+
+
+def _parse_id_list(raw: str) -> set[str]:
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+# --- Segregação por EPS -------------------------------------------------------
+# Cada EPS tem o próprio canal; nada de uma EPS aparece no canal da outra.
+EPS_CHANNELS = _parse_channel_map(os.getenv("EPS_CHANNELS", ""))
+# Canal interno iFood com report consolidado (todas as EPS). Vazio = desligado.
+CONSOLIDATED_CHANNEL = os.getenv("CONSOLIDATED_CHANNEL", "").strip()
+# Outros canais internos onde a Lyra responde com visão completa.
+INTERNAL_CHANNELS = _parse_id_list(os.getenv("INTERNAL_CHANNELS", "")) | (
+    {CONSOLIDATED_CHANNEL} if CONSOLIDATED_CHANNEL else set()
 )
-MOP_CREDENTIALS_ERROR_MESSAGE = (
-    "Não consigo atualizar o MOP agora — credenciais do Google não configuradas."
+# Quem pode falar com a Lyra por DM (visão completa). Padrão: o ALERT_CHANNEL, se for um usuário.
+DM_ALLOWED_USERS = _parse_id_list(os.getenv("DM_ALLOWED_USERS", "")) or (
+    {ALERT_CHANNEL} if ALERT_CHANNEL.startswith("U") else set()
 )
+CONSOLIDATED = "Consolidado"
+
+# Células de cada EPS (fonte: Felipe, out/2026). O nome da EPS também é o trecho
+# procurado no e-mail do operador ("aec" em @if-aec..., "csu" em ...csu...).
+EPS_CELULAS: dict[str, list[str]] = {
+    "AeC": [
+        "CX Suporte", "Madrugada", "CX Review - AeC", "CX Super Cliente - AeC",
+        "Fila desativada 37 - Canarinhos",
+    ],
+    "CSU": [
+        "Review", "CX Review - CSU", "CX Super Cliente - CSU", "PF Cancelamento",
+        "PF Super Clientes", "PF Revisão Manual", "CX Denúncia", "Fraudes DX",
+        "DX - PF Contestação", "DX - PF Contestação Bloqueio temporário",
+    ],
+}
+
+
+class Tenant:
+    """Um destino de report: uma EPS (eps='AeC') ou a visão consolidada (eps=None)."""
+
+    def __init__(self, key: str, channel: str, eps: str | None) -> None:
+        self.key, self.channel, self.eps = key, channel, eps
+
+    def __repr__(self) -> str:
+        return f"Tenant({self.key}, {self.channel})"
+
+
+def _build_tenants() -> list[Tenant]:
+    tenants = [Tenant(eps, channel, eps) for eps, channel in EPS_CHANNELS.items()]
+    if CONSOLIDATED_CHANNEL:
+        tenants.append(Tenant(CONSOLIDATED, CONSOLIDATED_CHANNEL, None))
+    if not tenants:  # legado: um canal só, sem recorte de EPS
+        tenants.append(Tenant(CONSOLIDATED, DAILY_REPORT_CHANNEL, None))
+    return tenants
+
+
+TENANTS = _build_tenants()
+# canal -> EPS do canal (None = visão completa)
+CHANNEL_SCOPE: dict[str, str | None] = {t.channel: t.eps for t in TENANTS}
+CHANNEL_SCOPE.update({channel: None for channel in INTERNAL_CHANNELS})
+
+DM_NOT_ALLOWED_MESSAGE = "Por aqui eu não consigo responder. Me chama no canal da sua EPS que eu te ajudo por lá. 🙂"
+CHANNEL_NOT_CONFIGURED_MESSAGE = "Ainda não estou configurada para responder neste canal."
+
+# --- MOP ---------------------------------------------------------------------
+MOP_SPREADSHEET_ID = os.getenv("MOP_SPREADSHEET_ID", "1Up11UQ1j0h9t8KW276AxJPGfEsShs9AsUztF5PAmyyE")
+MOP_WORKSHEET_GID = 0
+MOP_SHEET_URL = (
+    f"https://docs.google.com/spreadsheets/d/{MOP_SPREADSHEET_ID}/edit?gid={MOP_WORKSHEET_GID}#gid={MOP_WORKSHEET_GID}"
+)
+MOP_BACKUP_WORKSHEET_TITLE = "MOP backup"
+MOP_ALLOWED_CHANNELS = {c.strip() for c in os.getenv("MOP_ALLOWED_CHANNELS", "").split(",") if c.strip()}
+MOP_REQUIRED_COLUMNS = ("Nome", "Email")
+MOP_EXPECTED_COLUMNS = (
+    "Nome", "Email", "Pilar", "Célula", "EPS", "Supervisor", "Coordenador",
+    "Entrada", "Saída", "Status", "Versão do Oráculo", "Formato de Trabalho",
+)
+MOP_HEADER_SCAN_ROWS = 10
+
+MOP_CREDENTIALS_ERROR_MESSAGE = "Não consigo atualizar o MOP agora — credenciais do Google não configuradas."
 MOP_DOWNLOAD_ERROR_MESSAGE = "Não consegui baixar o arquivo. Tente enviar novamente."
 MOP_READ_ERROR_MESSAGE = "Não consegui ler o arquivo Excel. Verifique se o formato está correto."
-MOP_SHEETS_ERROR_MESSAGE = "Erro ao atualizar a planilha do MOP. Tente novamente."
-MOP_SPREADSHEET_ID = "1Up11UQ1j0h9t8KW276AxJPGfEsShs9AsUztF5PAmyyE"
-MOP_WORKSHEET_GID = 0
+MOP_SHEETS_ERROR_MESSAGE = "Erro ao atualizar a planilha do MOP. A versão anterior foi mantida. Tente novamente."
+MOP_CHANNEL_NOT_ALLOWED_MESSAGE = (
+    "Esse canal não está liberado para atualizar o MOP. Envie o arquivo no canal oficial do MOP marcando a Lyra."
+)
 
 MOP_INTENT_KEYWORDS = (
     "mop", "hierarquia", "analista", "anlista", "equipe", "pessoas", "efetivo",
     "headcount", "supervisor", "coordenador", "célula", "celula", "pilar",
     "oráculo", "oraculo", "variante", "eps",
 )
+
+MOP_CHECK_MESSAGE = (
+    "Oi, pessoal! 📋 Temos MOP atualizado? Se sim, me envie o arquivo Excel "
+    "marcando a Lyra que eu atualizo a planilha. Se não tiver, tudo bem — segue o dia!"
+)
+
+# --- Compromissos ------------------------------------------------------------
 COMPROMISSOS_WORKSHEET_TITLE = "Compromissos"
+# As 8 primeiras colunas são as originais (linhas antigas continuam válidas);
+# Fila, Responsável e Thread foram adicionadas ao final.
 COMPROMISSOS_HEADERS = [
     "Problema Identificado", "Ação Tomada", "Data Inicio", "Data Fim",
     "Duração", "Resultado Pré", "Resultado Pós", "Sucesso",
+    "Fila", "Responsável", "Thread", "EPS",
 ]
-COMPROMISSOS_THREAD_DELAY_SECONDS = 2 * 60 * 60
-COMPROMISSOS_LATE_THREAD_DELAY_SECONDS = 9 * 60 * 60
+COL_ACAO = COMPROMISSOS_HEADERS.index("Ação Tomada") + 1
+COL_DATA_FIM = COMPROMISSOS_HEADERS.index("Data Fim") + 1
+COL_DURACAO = COMPROMISSOS_HEADERS.index("Duração") + 1
+COL_POS = COMPROMISSOS_HEADERS.index("Resultado Pós") + 1
+COL_SUCESSO = COMPROMISSOS_HEADERS.index("Sucesso") + 1
+COL_RESPONSAVEL = COMPROMISSOS_HEADERS.index("Responsável") + 1
+SEM_RESPOSTA = "sem resposta"
+FILA_GERAL = "Geral"
+OPEN_COMMITMENTS_LIMIT = 15
+SEM_RESPOSTA_WINDOW_DAYS = 3
+EXPIRED_AFTER_DAYS = 7
 
-DAILY_REPORT_CHANNEL = os.getenv("DAILY_REPORT_CHANNEL", "C0BF6JVFG7N")
-DAILY_REPORT_HOUR = 9
+# --- Estado persistido --------------------------------------------------------
+STATE_WORKSHEET_TITLE = "Estado Lyra"
+STATE_HEADERS = ["Chave", "Valor", "Atualizado em"]
+
+# --- Agenda (horário de Brasília) ------------------------------------------------
+DAILY_REPORT_TIME = datetime_time(9, 0)
+REPORT_CATCHUP_UNTIL = datetime_time(13, 0)   # restart até 13h ainda publica o report do dia
+REPORT_MAX_ATTEMPTS = 3
+REPORT_RETRY_MINUTES = 10
+PREVIOUS_THREAD_READ_TIME = datetime_time(8, 45)  # relê a thread de ontem antes do report
+THREAD_READ_FIRST_TIME = datetime_time(11, 0)
+THREAD_READ_FIRST_MIN_DELAY = timedelta(hours=2)
+THREAD_READ_LATE_TIME = datetime_time(18, 0)
+THREAD_READ_LATE_MIN_DELAY = timedelta(hours=4)
+MOP_CHECK_TIME = datetime_time(14, 0)
+MOP_CHECK_UNTIL = datetime_time(18, 0)
+SCHEDULER_TICK_SECONDS = 60
+
+THREAD_DELIMITER = "===THREAD==="
+
 DAILY_REPORT_PROMPT = (
-    "COMPROMISSOS: use o bloco de contexto abaixo como fonte de verdade. "
-    "Não peça plano novo para compromissos em andamento ou concluídos; cobre apenas sem resposta "
-    "e peça para novos ofensores: ação · responsável · prazo na thread até 14h. "
     "Report diário de CSAT — execute o Bloco 3 do seu prompt (report de indicadores). "
-    "Siga a estrutura completa: compromissos de ontem (se houver), CSAT por célula "
-    "(mês, D-2, D-1 com variação), motivo de maior impacto em p.p., reincidência em Q4 "
-    "e chamada para ação pedindo o plano da liderança na thread. "
-    "Use formatação Slack (mrkdwn): negrito com *um asterisco*, bullets com •, "
-    "separadores com • • •. Sem tabelas com |, sem **duplo asterisco**. "
-    "Escreva como uma pessoa, frases curtas e diretas."
+    "Siga a estrutura completa da mensagem principal: compromissos de ontem (se houver), "
+    "Principais resultados por fila (Mês, D-1, n e variação vs D-2), Maior impacto em p.p., "
+    "Cobranças, Status dos compromissos e o fechamento pedindo o plano na thread "
+    "(ação · responsável · prazo até 14h).\n\n"
+    "CONTRATO DE SAÍDA (obrigatório, o app depende disso):\n"
+    f"1. Escreva a mensagem principal, depois uma linha contendo exatamente {THREAD_DELIMITER}, "
+    "depois o conteúdo da thread.\n"
+    "2. A thread começa com *Resultados de todas as filas:* listando TODAS as filas com volume, "
+    "uma por linha, no formato exato: • *Nome da fila:* Mês 62,6% · D-1 63,2% (n=1.839, ▲ 1,9). "
+    "Depois vêm o Q4 (top 5 por fila) e o detalhe de reincidência.\n"
+    "3. Se qualquer consulta falhar ou voltar vazia, responda SOMENTE uma linha começando com "
+    "ERRO: e o motivo. Não publique números parciais.\n\n"
+    "COMPROMISSOS: use o bloco de contexto acima (se houver) como fonte de verdade. "
+    "Não peça plano novo para compromissos em andamento; cobre os sem resposta e peça plano só "
+    "para ofensores novos.\n"
+    "Formatação Slack (mrkdwn): negrito com *um asterisco*, bullets com •, separadores • • •. "
+    "Sem tabelas, sem |, sem **duplo asterisco**. Escreva como uma pessoa, frases curtas e diretas."
+)
+REPORT_FAILED_CHANNEL_MESSAGE = (
+    "Pessoal, o report de CSAT de hoje não saiu — tive um problema pra consultar os dados. "
+    "Já sinalizei o time responsável e publico assim que normalizar."
 )
 
-MOP_CHECK_MESSAGE = (
-    "Bom dia! ☀️ Report de CSAT enviado acima. \n\n"
-    "Outra coisa: temos MOP atualizado? Se sim, me envie o arquivo Excel "
-    "marcando a Lyra que eu atualizo a planilha. Se não tiver atualizado, "
-    "tudo bem — segue o dia! 📋"
-)
-MOP_CHECK_HOUR = 14  # Cobrança do MOP às 14h (Brasília)
+try:  # feriados nacionais (lib opcional)
+    import holidays as _holidays_lib
 
-BRAZIL_TIMEZONE = ZoneInfo("America/Sao_Paulo")
+    _BR_HOLIDAYS = _holidays_lib.country_holidays("BR")
+except Exception:  # pragma: no cover - lib ausente
+    _BR_HOLIDAYS = None
 
-# Slack Bolt can be imported and the health endpoint can run without credentials,
-# which is useful for local smoke tests. Slack event handling still requires the
-# real values in the deployment environment.
+# Slack Bolt sobe sem credenciais para smoke tests locais; em produção os
+# valores reais vêm das variáveis de ambiente.
 slack_app = App(
     token=os.getenv("SLACK_BOT_TOKEN") or "dev-token",
     signing_secret=os.getenv("SLACK_SIGNING_SECRET") or "dev-signing-secret",
@@ -102,12 +266,146 @@ _MENTION_RE = re.compile(r"<@[A-Z0-9]+(?:\|[^>]+)?>")
 _THINK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
 _IN_FLIGHT: set[str] = set()
 _IN_FLIGHT_LOCK = threading.Lock()
-_REPORT_FOLLOWUP_THREADS: set[str] = set()
-_REPORT_FOLLOWUP_LOCK = threading.Lock()
-_REPORT_CAPTURED_MESSAGE_TIMESTAMPS: dict[str, set[str]] = {}
-_REPORT_CAPTURED_MESSAGE_LOCK = threading.Lock()
 
 
+# ---------------------------------------------------------------------------
+# Helpers gerais
+# ---------------------------------------------------------------------------
+def _resp_get(response: Any, key: str, default: Any = None) -> Any:
+    """Lê um campo de SlackResponse ou dict. SlackResponse NÃO é dict."""
+    if response is None:
+        return default
+    getter = getattr(response, "get", None)
+    if callable(getter):
+        try:
+            return getter(key, default)
+        except Exception:
+            pass
+    try:
+        return response[key]
+    except Exception:
+        return default
+
+
+def _now_brazil() -> datetime:
+    return datetime.now(BRAZIL_TIMEZONE)
+
+
+def _today_brazil() -> datetime:
+    return _now_brazil()
+
+
+def _as_date(value: datetime | date) -> date:
+    return value.date() if isinstance(value, datetime) else value
+
+
+def _format_date(value: datetime | date) -> str:
+    return value.strftime("%d/%m/%Y")
+
+
+def _norm_text(value: Any) -> str:
+    """Minúsculas, sem acento, hífens/espaços colapsados — para comparar nomes."""
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[\s\-–—_:]+", " ", text.casefold())
+    return text.strip()
+
+
+def _to_float(value: Any) -> float | None:
+    match = re.search(r"\d+(?:[.,]\d+)?", str(value or ""))
+    return float(match.group(0).replace(",", ".")) if match else None
+
+
+def _fmt_pct(value: float) -> str:
+    return f"{value:.1f}".replace(".", ",") + "%"
+
+
+def _to_int(value: Any) -> int:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return 0
+
+
+def _col_letter(n: int) -> str:
+    letters = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def _row_value(row: dict[str, Any], *names: str) -> str:
+    for name in names:
+        value = row.get(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _alert(text: str) -> None:
+    """Avisa o responsável técnico (ALERT_CHANNEL) — sem expor dados pessoais."""
+    logger.warning("ALERTA: %s", text)
+    if not ALERT_CHANNEL:
+        return
+    try:
+        slack_app.client.chat_postMessage(channel=ALERT_CHANNEL, text=f"⚠️ Lyra — {text}")
+    except Exception:
+        logger.exception("Could not post alert")
+
+
+def _eps_pattern(eps: str) -> str:
+    """Trecho que identifica a EPS no e-mail do operador (ex.: 'aec', 'csu')."""
+    return _compact(eps)
+
+
+def _eps_filter_sql(eps: str) -> str:
+    return f"lower(ticket_last_agent_email) LIKE '%{_eps_pattern(eps)}%'"
+
+
+def _email_eps(email: Any) -> str | None:
+    """EPS deduzida pelo e-mail do operador (None se não bater com nenhuma ou com mais de uma)."""
+    text = str(email or "").casefold()
+    hits = [eps for eps in EPS_CELULAS if _eps_pattern(eps) in text]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _celulas_of(eps: str) -> list[str]:
+    for key, celulas in EPS_CELULAS.items():
+        if _compact(key) == _compact(eps):
+            return celulas
+    return []
+
+
+def _scope_instruction(eps: str | None) -> str:
+    """Bloco de escopo injetado em toda mensagem enviada ao Toqan."""
+    if eps is None:
+        return "ESCOPO: visão interna iFood — todas as EPS. Pode comparar EPS."
+    others = ", ".join(e for e in EPS_CELULAS if _compact(e) != _compact(eps)) or "outras EPS"
+    celulas = _celulas_of(eps)
+    return (
+        f"ESCOPO OBRIGATÓRIO: este canal é exclusivo da EPS {eps}. "
+        f"Filtre TODAS as consultas pelo e-mail do operador: {_eps_filter_sql(eps)}. "
+        + (f"Células/filas da {eps}: {'; '.join(celulas)}. Mostre só essas. " if celulas else "")
+        + f"Use somente filas, operadores, motivos, compromissos e números da {eps}. "
+        f"NUNCA mencione, compare ou mostre dados de {others}, nem o resultado consolidado do iFood. "
+        f"Se pedirem dados de outra EPS, responda que neste canal você só fala da {eps}."
+    )
+
+
+def _event_scope(event: dict[str, Any]) -> tuple[bool, str | None]:
+    """(permitido?, EPS do escopo). EPS None = visão completa."""
+    if event.get("channel_type") == "im":
+        return str(event.get("user") or "") in DM_ALLOWED_USERS, None
+    channel = str(event.get("channel") or "")
+    if channel in CHANNEL_SCOPE:
+        return True, CHANNEL_SCOPE[channel]
+    return False, None
+
+
+# ---------------------------------------------------------------------------
+# Toqan
+# ---------------------------------------------------------------------------
 class ToqanAPIError(RuntimeError):
     """Raised when the Toqan Agent API cannot complete a request."""
 
@@ -122,30 +420,24 @@ def _require_toqan_key() -> str:
 def _toqan_request(method: str, payload: dict[str, str]) -> dict[str, Any]:
     """Make one authenticated JSON request to the Toqan Agent API."""
     body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
+    req = urllib.request.Request(
         url=f"{TOQAN_BASE_URL}/{method}",
         data=body,
-        headers={
-            "X-Api-Key": _require_toqan_key(),
-            "Content-Type": "application/json",
-        },
+        headers={"X-Api-Key": _require_toqan_key(), "Content-Type": "application/json"},
         method="POST" if method == "create_conversation" else "GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=TOQAN_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(req, timeout=TOQAN_TIMEOUT_SECONDS) as response:
             raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        # Do not log the response body: it could contain user data or secrets.
         logger.error("Toqan API returned HTTP %s for %s", exc.code, method)
         raise ToqanAPIError(f"Toqan HTTP {exc.code}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         logger.error("Toqan API request failed for %s: %s", method, exc)
         raise ToqanAPIError("Toqan request failed") from exc
-
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
-        logger.error("Toqan API returned invalid JSON for %s", method)
         raise ToqanAPIError("Toqan returned invalid JSON") from exc
     if not isinstance(data, dict):
         raise ToqanAPIError("Toqan returned an unexpected response")
@@ -153,7 +445,6 @@ def _toqan_request(method: str, payload: dict[str, str]) -> dict[str, Any]:
 
 
 def create_conversation(user_message: str) -> tuple[str, str]:
-    """Start a new Toqan conversation for one Slack message."""
     data = _toqan_request("create_conversation", {"user_message": user_message})
     conversation_id = data.get("conversation_id")
     request_id = data.get("request_id")
@@ -169,12 +460,7 @@ def get_answer(
     request_id: str,
     progress_callback: Callable[[str], Any] | None = None,
 ) -> str:
-    """Poll Toqan until the answer is finished or the poll limit is reached.
-
-    ``progress_callback`` is optional so Slack workers can report long-running
-    queries in the originating thread without coupling the Toqan client to
-    Slack.
-    """
+    """Poll Toqan until the answer is finished or the poll limit is reached."""
     payload = {"conversation_id": conversation_id, "request_id": request_id}
     for attempt in range(MAX_POLL_ATTEMPTS):
         data = _toqan_request("get_answer", payload)
@@ -197,17 +483,17 @@ def get_answer(
                 logger.warning("Could not send Toqan progress message", exc_info=True)
 
         if attempt < MAX_POLL_ATTEMPTS - 1:
-            logger.info("Toqan answer still in progress (poll %d/%d)", attempt + 1, MAX_POLL_ATTEMPTS)
-            # This is intentionally a blocking wait in the worker thread, not in
-            # Slack's acknowledgement request.
             time.sleep(POLL_INTERVAL_SECONDS)
-
     raise ToqanAPIError("Toqan answer polling timed out")
 
 
 def _clean_answer(answer: str) -> str:
-    """Remove internal reasoning tags before a response reaches Slack."""
     return _THINK_RE.sub("", answer).strip()
+
+
+def ask_toqan(prompt: str, progress_callback: Callable[[str], Any] | None = None) -> str:
+    conversation_id, request_id = create_conversation(prompt)
+    return get_answer(conversation_id, request_id, progress_callback=progress_callback)
 
 
 def _strip_mentions(text: str) -> str:
@@ -218,20 +504,31 @@ def _event_key(event: dict[str, Any]) -> str:
     return str(event.get("client_msg_id") or event.get("ts") or event.get("text") or "unknown")
 
 
+# ---------------------------------------------------------------------------
+# Google Sheets
+# ---------------------------------------------------------------------------
 class MOPGoogleCredentialsError(RuntimeError):
-    """Raised when the Google service-account configuration is absent."""
+    """Google service-account configuration is absent or invalid."""
 
 
 class MOPDownloadError(RuntimeError):
-    """Raised when an attached Slack file cannot be downloaded."""
+    """An attached Slack file cannot be downloaded."""
 
 
 class MOPReadError(RuntimeError):
-    """Raised when the attached workbook cannot be read."""
+    """The attached workbook cannot be read."""
+
+
+class MOPValidationError(RuntimeError):
+    """The workbook does not look like a MOP (missing columns or rows)."""
+
+
+class MOPChannelNotAllowedError(RuntimeError):
+    """MOP uploads are restricted to MOP_ALLOWED_CHANNELS."""
 
 
 class MOPSheetsError(RuntimeError):
-    """Raised when the destination Google Sheet cannot be updated."""
+    """The destination Google Sheet cannot be updated."""
 
 
 def _get_google_client():
@@ -240,7 +537,6 @@ def _get_google_client():
     if not raw:
         return None
     try:
-        # Try base64 first, then raw JSON
         try:
             credentials_json = json.loads(base64.b64decode(raw))
         except Exception:
@@ -259,8 +555,157 @@ def _get_google_client():
         raise MOPGoogleCredentialsError(str(exc)) from exc
 
 
+def _safe_google_client():
+    try:
+        return _get_google_client()
+    except Exception:
+        logger.warning("Google Sheets unavailable", exc_info=True)
+        return None
+
+
+def _open_spreadsheet(google_client: Any) -> Any:
+    return google_client.open_by_key(MOP_SPREADSHEET_ID)
+
+
+def _is_not_found(exc: Exception) -> bool:
+    return exc.__class__.__name__ == "WorksheetNotFound"
+
+
+def _worksheet_by_gid(spreadsheet: Any, worksheet_gid: int) -> Any:
+    get_by_id = getattr(spreadsheet, "get_worksheet_by_id", None)
+    if callable(get_by_id):
+        try:
+            worksheet = get_by_id(worksheet_gid)
+            if worksheet is not None:
+                return worksheet
+        except Exception as exc:
+            if not _is_not_found(exc):
+                raise
+    for worksheet in spreadsheet.worksheets():
+        if int(worksheet.id) == worksheet_gid:
+            return worksheet
+    raise MOPSheetsError(f"Worksheet gid {worksheet_gid} was not found")
+
+
+def _get_or_create_worksheet(spreadsheet: Any, title: str, rows: int = 1000, cols: int = 26) -> Any:
+    try:
+        return spreadsheet.worksheet(title)
+    except Exception as exc:
+        if not _is_not_found(exc):
+            raise
+        return spreadsheet.add_worksheet(title, rows=rows, cols=cols)
+
+
+def _ensure_worksheet(spreadsheet: Any, title: str, headers: list[str]) -> Any:
+    """Garante a aba, o número de colunas e o cabeçalho."""
+    worksheet = _get_or_create_worksheet(spreadsheet, title, rows=1000, cols=max(len(headers), 8))
+    col_count = int(getattr(worksheet, "col_count", len(headers)) or len(headers))
+    if col_count < len(headers):
+        worksheet.add_cols(len(headers) - col_count)
+    current = [str(v).strip() for v in worksheet.row_values(1)[: len(headers)]]
+    if current != headers:
+        worksheet.update(
+            values=[headers],
+            range_name=f"A1:{_col_letter(len(headers))}1",
+            value_input_option="RAW",
+        )
+    return worksheet
+
+
+def _worksheet_rows_with_header(worksheet: Any) -> list[tuple[int, dict[str, str]]]:
+    values = worksheet.get_all_values()
+    if not values:
+        return []
+    headers = [str(value).strip() for value in values[0]]
+    return [
+        (n, {h: str(row[i]) if i < len(row) else "" for i, h in enumerate(headers) if h})
+        for n, row in enumerate(values[1:], start=2)
+        if any(str(cell).strip() for cell in row)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Estado persistido (aba "Estado Lyra")
+# ---------------------------------------------------------------------------
+class StateStore:
+    """Chave-valor gravado na planilha, com cache em memória.
+
+    Se o Google estiver indisponível, funciona só em memória (e avisa no log):
+    nesse modo um restart pode repetir uma rotina.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._values: dict[str, str] = {}
+        self._rows: dict[str, int] = {}
+        self._worksheet: Any = None
+        self._next_row = 2
+        self._loaded = False
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        google_client = _safe_google_client()
+        if google_client is None:
+            return
+        try:
+            worksheet = _ensure_worksheet(_open_spreadsheet(google_client), STATE_WORKSHEET_TITLE, STATE_HEADERS)
+            values = worksheet.get_all_values()
+        except Exception:
+            logger.warning("State store: could not load worksheet; using memory only", exc_info=True)
+            return
+        for n, row in enumerate(values[1:], start=2):
+            key = str(row[0]).strip() if row else ""
+            if key:
+                self._rows[key] = n
+                # o que já está em memória (gravado antes do load) prevalece
+                self._values.setdefault(key, str(row[1]) if len(row) > 1 else "")
+        self._next_row = len(values) + 1
+        self._worksheet = worksheet
+        self._loaded = True
+
+    def get(self, key: str) -> str:
+        with self._lock:
+            self._ensure_loaded()
+            return self._values.get(key, "")
+
+    def set(self, key: str, value: str) -> None:
+        with self._lock:
+            self._ensure_loaded()
+            self._values[key] = value
+            if self._worksheet is None:
+                return
+            stamp = _now_brazil().strftime("%d/%m/%Y %H:%M")
+            try:
+                if key in self._rows:
+                    n = self._rows[key]
+                    self._worksheet.update(
+                        values=[[key, value, stamp]], range_name=f"A{n}:C{n}", value_input_option="RAW"
+                    )
+                else:
+                    self._worksheet.append_row([key, value, stamp], value_input_option="RAW")
+                    self._rows[key] = self._next_row
+                    self._next_row += 1
+            except Exception:
+                logger.warning("State store: could not persist %s", key, exc_info=True)
+
+    def snapshot(self, prefix: str = "") -> dict[str, str]:
+        with self._lock:
+            self._ensure_loaded()
+            return {k: v for k, v in self._values.items() if k.startswith(prefix)}
+
+    @property
+    def persistent(self) -> bool:
+        return self._worksheet is not None
+
+
+STATE = StateStore()
+
+
+# ---------------------------------------------------------------------------
+# MOP
+# ---------------------------------------------------------------------------
 def _is_xlsx_attachment(file_info: dict[str, Any]) -> bool:
-    """Return True for .xlsx attachments, checking name, mimetype and filetype."""
     name = str(file_info.get("name") or "").lower()
     mimetype = str(file_info.get("mimetype") or "").lower()
     filetype = str(file_info.get("filetype") or "").lower()
@@ -268,91 +713,266 @@ def _is_xlsx_attachment(file_info: dict[str, Any]) -> bool:
         return True
     if "spreadsheet" in mimetype or "excel" in mimetype:
         return True
-    if filetype in ("xlsx", "xls", "excel"):
-        return True
-    logger.info("File not recognized as xlsx: name=%s mimetype=%s filetype=%s", name, mimetype, filetype)
-    return False
+    return filetype in ("xlsx", "excel")
 
 
 def _download_slack_file(file_info: dict[str, Any], client: Any) -> bytes:
-    """Fetch a Slack file using files.info metadata and its private download URL."""
     details = dict(file_info)
     file_id = details.get("id")
-    if file_id and client is not None:
+    if file_id and client is not None and not (details.get("url_private_download") or details.get("url_private")):
         try:
-            response = client.files_info(file=file_id)
-            remote_file = response.get("file") if isinstance(response, dict) else None
+            remote_file = _resp_get(client.files_info(file=file_id), "file")
             if isinstance(remote_file, dict):
                 details.update(remote_file)
         except Exception as exc:
             logger.warning("Slack files.info failed for attached file: %s", exc)
-            raise MOPDownloadError from exc
+            raise MOPDownloadError("files.info falhou (verifique o scope files:read)") from exc
 
     file_url = details.get("url_private_download") or details.get("url_private")
     if not file_url:
-        raise MOPDownloadError("Slack file has no private download URL")
+        raise MOPDownloadError("o arquivo não tem link de download")
 
     headers = {}
     slack_token = os.getenv("SLACK_BOT_TOKEN")
     if slack_token:
         headers["Authorization"] = f"Bearer {slack_token}"
-    request = urllib.request.Request(str(file_url), headers=headers)
+    req = urllib.request.Request(str(file_url), headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=TOQAN_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(req, timeout=TOQAN_TIMEOUT_SECONDS) as response:
             content = response.read()
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
         logger.error("Slack file download failed")
-        raise MOPDownloadError from exc
+        raise MOPDownloadError("falha no download (verifique o scope files:read)") from exc
     if not content:
-        raise MOPDownloadError("Slack file download was empty")
+        raise MOPDownloadError("o download veio vazio")
+    if content[:2] != b"PK":  # xlsx é um zip; HTML aqui = falta de permissão
+        raise MOPDownloadError("o Slack não liberou o arquivo (verifique o scope files:read)")
     return content
 
 
-def _workbook_rows(workbook_bytes: bytes) -> list[list[str]]:
-    """Read the first worksheet and convert all cell values to strings."""
+def _cell_to_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):  # antes de date: datetime é subclasse de date
+        if value.time() == datetime_time(0, 0):
+            return value.date().isoformat()
+        return value.isoformat(sep=" ")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, datetime_time):
+        return value.strftime("%H:%M")
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _compact(value: Any) -> str:
+    return _norm_text(value).replace(" ", "")
+
+
+def _find_col(header: list[Any], column: str) -> int | None:
+    """Índice da coluna (exato, depois prefixo), ignorando acento, caixa, espaço e hífen."""
+    target = _compact(column)
+    cells = [_compact(h) for h in header]
+    for i, cell in enumerate(cells):
+        if cell and cell == target:
+            return i
+    for i, cell in enumerate(cells):
+        if cell and cell.startswith(target):
+            return i
+    return None
+
+
+def _header_matches(header_cells: list[str], column: str) -> bool:
+    return _find_col(header_cells, column) is not None
+
+
+def _eps_matches(value: Any, eps: str) -> bool:
+    v, e = _compact(value), _compact(eps)
+    return bool(v) and (v == e or e in v)
+
+
+def _read_mop_workbook(workbook_bytes: bytes) -> tuple[list[list[str]], str, list[str]]:
+    """Encontra a aba/linha de cabeçalho do MOP e devolve (linhas, aba, colunas ausentes).
+
+    Lê VALORES (data_only=True), nunca fórmulas.
+    """
     try:
         from openpyxl import load_workbook
-        from datetime import datetime, date, time as dtime
 
-        workbook = load_workbook(io.BytesIO(workbook_bytes), data_only=False, read_only=True)
-        worksheet = workbook.active
+        workbook = load_workbook(io.BytesIO(workbook_bytes), data_only=True, read_only=True)
+    except Exception as exc:
+        logger.error("Excel workbook could not be opened: %s", exc)
+        raise MOPReadError(str(exc)) from exc
+
+    try:
+        chosen: tuple[Any, int] | None = None
+        for worksheet in workbook.worksheets:
+            for idx, row in enumerate(
+                worksheet.iter_rows(min_row=1, max_row=MOP_HEADER_SCAN_ROWS, values_only=True), start=1
+            ):
+                cells = [_norm_text(_cell_to_str(c)) for c in row]
+                if all(_header_matches(cells, col) for col in MOP_REQUIRED_COLUMNS):
+                    chosen = (worksheet, idx)
+                    break
+            if chosen:
+                break
+        if chosen is None:
+            raise MOPValidationError(
+                "não encontrei uma aba com as colunas Nome e Email nas primeiras linhas"
+            )
+        worksheet, header_row = chosen
         rows: list[list[str]] = []
-        for row in worksheet.iter_rows(values_only=True):
-            converted = []
-            for value in row:
-                if value is None:
-                    converted.append("")
-                elif isinstance(value, dtime):
-                    converted.append(value.strftime("%H:%M:%S"))
-                elif isinstance(value, date):
-                    converted.append(value.isoformat())
-                elif isinstance(value, datetime):
-                    converted.append(value.isoformat(sep=" "))
-                else:
-                    converted.append(str(value))
+        for row in worksheet.iter_rows(min_row=header_row, values_only=True):
+            converted = [_cell_to_str(v) for v in row]
+            while converted and converted[-1] == "":
+                converted.pop()
             rows.append(converted)
-        workbook.close()
-        return rows
+        title = str(worksheet.title)
+    except MOPValidationError:
+        raise
     except Exception as exc:
         logger.error("Excel workbook could not be read: %s", exc)
         raise MOPReadError(str(exc)) from exc
+    finally:
+        try:
+            workbook.close()
+        except Exception:
+            pass
+
+    while rows and not any(rows[-1]):
+        rows.pop()
+    data_rows = [r for r in rows[1:] if any(r)]
+    if not data_rows:
+        raise MOPValidationError("a aba do MOP não tem nenhuma pessoa abaixo do cabeçalho")
+    header_cells = [_norm_text(c) for c in rows[0]]
+    missing = [col for col in MOP_EXPECTED_COLUMNS if not _header_matches(header_cells, col)]
+    return rows, title, missing
 
 
-def _worksheet_by_gid(spreadsheet: Any, worksheet_gid: int) -> Any:
-    """Find a worksheet by numeric gid, supporting gspread API variants."""
-    get_by_id = getattr(spreadsheet, "get_worksheet_by_id", None)
-    if callable(get_by_id):
-        worksheet = get_by_id(worksheet_gid)
-        if worksheet is not None:
-            return worksheet
-    for worksheet in spreadsheet.worksheets():
-        if int(worksheet.id) == worksheet_gid:
-            return worksheet
-    raise MOPSheetsError(f"Worksheet gid {worksheet_gid} was not found")
+def _count_people(values: list[list[Any]]) -> int:
+    return len([r for r in values[1:] if any(str(c).strip() for c in r)])
+
+
+def _row_eps(row: list[Any], eps_col: int | None, email_col: int | None) -> str:
+    """EPS da linha do MOP: coluna EPS; se vazia, deduz pelo e-mail."""
+    value = str(row[eps_col]).strip() if eps_col is not None and eps_col < len(row) else ""
+    if value:
+        return value
+    email = row[email_col] if email_col is not None and email_col < len(row) else ""
+    return _email_eps(email) or ""
+
+
+def _count_eps_people(values: list[list[Any]], eps: str) -> int:
+    if not values:
+        return 0
+    eps_col, email_col = _find_col(values[0], "EPS"), _find_col(values[0], "Email")
+    return len([
+        r for r in values[1:]
+        if any(str(c).strip() for c in r) and _eps_matches(_row_eps(r, eps_col, email_col), eps)
+    ])
+
+
+def _merge_mop_rows(current: list[list[str]], new_rows: list[list[str]], eps: str) -> tuple[list[list[str]], int, int]:
+    """Troca só as linhas da EPS e mantém as das outras.
+
+    Devolve (planilha final, linhas de outra EPS ignoradas no arquivo, pessoas da EPS no arquivo).
+    """
+    new_header = new_rows[0]
+    if current and _find_col(current[0], "Email") is not None:
+        target_header = list(current[0])
+    else:
+        target_header = list(new_header)
+    if _find_col(target_header, "EPS") is None:
+        target_header.append("EPS")
+    eps_col = _find_col(target_header, "EPS")
+    email_col = _find_col(target_header, "Email")
+    mapping = [_find_col(new_header, h) if str(h).strip() else None for h in target_header]
+    new_eps_col, new_email_col = _find_col(new_header, "EPS"), _find_col(new_header, "Email")
+
+    ignored = 0
+    incoming: list[list[str]] = []
+    for row in new_rows[1:]:
+        if not any(str(c).strip() for c in row):
+            continue
+        row_eps = _row_eps(row, new_eps_col, new_email_col)
+        if row_eps and not _eps_matches(row_eps, eps):
+            ignored += 1
+            continue
+        out = [row[j] if j is not None and j < len(row) else "" for j in mapping]
+        out[eps_col] = row_eps or eps
+        incoming.append(out)
+
+    kept = [
+        list(r) for r in current[1:]
+        if any(str(c).strip() for c in r) and not _eps_matches(_row_eps(r, eps_col, email_col), eps)
+    ] if current and _find_col(current[0], "Email") is not None else []
+    return [target_header] + kept + incoming, ignored, len(incoming)
+
+
+def _update_mop_sheet(
+    rows: list[list[str]], google_client: Any, eps: str | None = None
+) -> tuple[int, int, int]:
+    """Atualiza a aba do MOP com backup e rollback. Devolve (antes, depois, ignoradas).
+
+    Com eps: substitui só as linhas daquela EPS (antes/depois contam só a EPS).
+    Sem eps: substitui a aba inteira.
+    """
+    try:
+        spreadsheet = _open_spreadsheet(google_client)
+        worksheet = _worksheet_by_gid(spreadsheet, MOP_WORKSHEET_GID)
+        current = worksheet.get_all_values()
+    except MOPSheetsError:
+        raise
+    except Exception as exc:
+        raise MOPSheetsError(str(exc)) from exc
+
+    ignored = 0
+    if eps:
+        before = _count_eps_people(current, eps)
+        rows, ignored, after_eps = _merge_mop_rows(current, rows, eps)
+        if after_eps == 0:
+            raise MOPValidationError(f"o arquivo não tem nenhuma pessoa da {eps}")
+    width = max([len(r) for r in rows] + [len(r) for r in current] + [1])
+
+    # 1) backup da versão atual
+    try:
+        backup = _get_or_create_worksheet(
+            spreadsheet, MOP_BACKUP_WORKSHEET_TITLE, rows=max(len(current) + 10, 1000), cols=max(width, 26)
+        )
+        backup.resize(rows=max(len(current) + 10, int(backup.row_count)), cols=max(width, int(backup.col_count)))
+        backup.clear()
+        if current:
+            backup.update(values=current, range_name="A1", value_input_option="RAW")
+    except Exception as exc:
+        logger.error("MOP backup failed; aborting update: %s", exc)
+        raise MOPSheetsError("não consegui salvar o backup da versão atual") from exc
+
+    # 2) substitui; se falhar, restaura
+    try:
+        worksheet.resize(rows=max(len(rows) + 10, int(worksheet.row_count)), cols=max(width, int(worksheet.col_count)))
+        worksheet.clear()
+        worksheet.update(values=rows, range_name="A1", value_input_option="RAW")
+    except Exception as exc:
+        logger.error("Google Sheets MOP update failed, restoring backup: %s", exc)
+        try:
+            worksheet.clear()
+            if current:
+                worksheet.update(values=current, range_name="A1", value_input_option="RAW")
+        except Exception:
+            logger.exception("MOP restore failed")
+            _alert("Falha ao restaurar o MOP após erro de atualização. Use a aba 'MOP backup'.")
+        raise MOPSheetsError(str(exc)) from exc
+
+    if eps:
+        after = after_eps
+    else:
+        before, after = _count_people(current), _count_people(rows)
+    logger.info("MOP sheet updated (%s): %d -> %d people", eps or "todas", before, after)
+    return before, after, ignored
 
 
 def _mop_column_index(header_index: dict[str, int], *aliases: str) -> int | None:
-    """Find a column index by aliases, matching case-insensitively (exact, then substring)."""
     for alias in aliases:
         idx = header_index.get(alias.casefold())
         if idx is not None:
@@ -365,54 +985,33 @@ def _mop_column_index(header_index: dict[str, int], *aliases: str) -> int | None
     return None
 
 
-def _mop_display(value: Any) -> str:
-    """Normalize one cell into a display string (datetimes become HH:MM)."""
-    if value is None:
-        return ""
-    if isinstance(value, datetime):
-        return value.strftime("%H:%M")
-    if isinstance(value, datetime_time):
-        return value.strftime("%H:%M")
-    return str(value).strip()
-
-
 def _mop_counts(rows: list[list[Any]], idx: int | None) -> dict[str, int] | None:
-    """Count non-empty values of one column, grouping case-insensitively."""
     if idx is None:
         return None
     counts: dict[str, int] = {}
     display: dict[str, str] = {}
     for row in rows:
-        cell = row[idx] if idx < len(row) else ""
-        text = _mop_display(cell)
+        text = str(row[idx] if idx < len(row) else "").strip()
         if not text:
             continue
         key = text.casefold()
-        if key not in display:
-            display[key] = text
+        display.setdefault(key, text)
         counts[key] = counts.get(key, 0) + 1
     if not counts:
         return None
     return {display[key]: count for key, count in counts.items()}
 
 
-def _mop_summary_text(google_client: Any = None) -> str:
-    """Build a compact summary of the MOP worksheet for prompt context.
+def _mop_summary_text(google_client: Any = None, eps: str | None = None) -> str:
+    """Resumo compacto do MOP para injetar no prompt ("" se indisponível).
 
-    Returns "" when the sheet cannot be read or is empty, so callers fall
-    back to sending the question unchanged.
+    Com eps, considera só as pessoas daquela EPS.
     """
-    if google_client is None:
-        try:
-            google_client = _get_google_client()
-        except Exception:
-            logger.warning("MOP summary: Google credentials unavailable", exc_info=True)
-            return ""
+    google_client = google_client or _safe_google_client()
     if google_client is None:
         return ""
     try:
-        spreadsheet = google_client.open_by_key(MOP_SPREADSHEET_ID)
-        worksheet = _worksheet_by_gid(spreadsheet, MOP_WORKSHEET_GID)
+        worksheet = _worksheet_by_gid(_open_spreadsheet(google_client), MOP_WORKSHEET_GID)
         all_values = worksheet.get_all_values()
     except Exception:
         logger.warning("MOP summary: could not read MOP worksheet", exc_info=True)
@@ -422,22 +1021,23 @@ def _mop_summary_text(google_client: Any = None) -> str:
     header_index: dict[str, int] = {}
     for idx, raw in enumerate(all_values[0]):
         text = str(raw).strip()
-        if not text:
-            continue
-        header_index.setdefault(text.casefold(), idx)
+        if text:
+            header_index.setdefault(text.casefold(), idx)
     data_rows = [row for row in all_values[1:] if any(str(cell).strip() for cell in row)]
+    if eps:
+        eps_col, email_col = _find_col(all_values[0], "EPS"), _find_col(all_values[0], "Email")
+        data_rows = [r for r in data_rows if _eps_matches(_row_eps(r, eps_col, email_col), eps)]
     if not data_rows:
         return ""
 
-    lines: list[str] = [f"Total de analistas na planilha: {len(data_rows)}"]
+    scope = f" da {eps}" if eps else ""
+    lines: list[str] = [f"Total de pessoas{scope} no MOP: {len(data_rows)}"]
 
     def add_group(label: str, *aliases: str, limit: int = 15) -> None:
-        idx = _mop_column_index(header_index, *aliases)
-        counts = _mop_counts(data_rows, idx)
+        counts = _mop_counts(data_rows, _mop_column_index(header_index, *aliases))
         if counts is None:
             return
-        lines.append("")
-        lines.append(f"{label}:")
+        lines.extend(["", f"{label}:"])
         ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold()))
         for value, count in ordered[:limit]:
             lines.append(f"- {value}: {count}")
@@ -449,516 +1049,808 @@ def _mop_summary_text(google_client: Any = None) -> str:
     add_group("Por Pilar", "pilar")
     add_group("Por Versão do Oráculo", "versão do oráculo", "versao do oraculo", "oráculo", "oraculo")
     add_group("Total por Célula (top 10)", "célula", "celula", limit=10)
+    add_group("Por Supervisor (top 15)", "supervisor")
+    add_group("Por Coordenador", "coordenador")
     add_group("Por horário de Entrada", "entrada", limit=8)
     add_group("Por horário de Saída", "saída", "saida", limit=8)
-
-    # Last update, if detectable from the worksheet tab name (e.g. "MOP 14/10").
-    title = str(getattr(worksheet, "title", "") or "")
-    match = re.search(r"\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?", title)
-    if match:
-        lines.append("")
-        lines.append(f"Última atualização detectável (nome da aba): {match.group(0)}")
-
+    updated = STATE.get(f"mop_updated_at:{eps or CONSOLIDATED}")
+    if updated:
+        lines.extend(["", f"Última atualização do MOP pelo app: {updated}"])
     return "\n".join(lines)
 
 
 def _question_has_mop_intent(question: str) -> bool:
-    """Whether the question mentions any MOP-related keyword (case-insensitive)."""
     lowered = question.casefold()
     return any(keyword in lowered for keyword in MOP_INTENT_KEYWORDS)
 
 
-def _inject_mop_context(question: str) -> str:
-    """Prepend live MOP worksheet context when the question looks MOP-related.
-
-    Returns the question unchanged when there is no MOP intent or when the
-    worksheet cannot be read (empty summary).
-    """
+def _inject_mop_context(question: str, eps: str | None = None) -> str:
     if not question or not _question_has_mop_intent(question):
         return question
-    summary = _mop_summary_text()
+    summary = _mop_summary_text(eps=eps)
     if not summary:
         return question
     return (
-        "CONTEXTO DO MOP (dados da planilha oficial, lidos agora):\n"
+        f"CONTEXTO DO MOP{' — somente ' + eps if eps else ''} (dados da planilha oficial, lidos agora pelo app):\n"
         f"{summary}\n\n"
-        "Use esses dados como fonte para responder. Se a pergunta puder ser "
-        "respondida com eles, NÃO peça o arquivo Excel.\n"
+        "Use esses dados para perguntas sobre pessoas, hierarquia e efetivo — NÃO peça o arquivo Excel. "
+        "Para indicadores (CSAT, SLA, TMA, reabertura), continue consultando o Databricks.\n"
         f"Pergunta do usuário: {question}"
     )
 
 
-def _update_mop_sheet(workbook_bytes: bytes, google_client: Any = None) -> None:
-    """Replace destination worksheet values with the first worksheet's Excel rows."""
-    if google_client is None:
-        google_client = _get_google_client()
+def _mop_attachment(event: dict[str, Any]) -> dict[str, Any] | None:
+    files = event.get("files") or []
+    if not isinstance(files, list):
+        return None
+    return next((f for f in files if isinstance(f, dict) and _is_xlsx_attachment(f)), None)
+
+
+def _mop_channel_allowed(event: dict[str, Any]) -> bool:
+    if not MOP_ALLOWED_CHANNELS:
+        return True
+    return str(event.get("channel") or "") in MOP_ALLOWED_CHANNELS
+
+
+def _process_mop_upload(event: dict[str, Any], client: Any, eps: str | None = None) -> str | None:
+    """Processa um .xlsx; devolve None quando o evento não é upload de Excel.
+
+    Com eps (canal de EPS): troca só as linhas daquela EPS.
+    """
+    attachment = _mop_attachment(event)
+    if attachment is None:
+        return None
+    if not _mop_channel_allowed(event):
+        raise MOPChannelNotAllowedError
+    google_client = _get_google_client()
     if google_client is None:
         raise MOPGoogleCredentialsError
+    workbook_bytes = _download_slack_file(attachment, client)
+    rows, sheet_title, missing = _read_mop_workbook(workbook_bytes)
+    before, after, ignored = _update_mop_sheet(rows, google_client, eps)
+    STATE.set(f"mop_updated_at:{eps or CONSOLIDATED}", _now_brazil().strftime("%d/%m/%Y %H:%M"))
+    if eps:
+        missing = [m for m in missing if _compact(m) != "eps"]
 
-    rows = _workbook_rows(workbook_bytes)
-    try:
-        spreadsheet = google_client.open_by_key(MOP_SPREADSHEET_ID)
-        worksheet = _worksheet_by_gid(spreadsheet, MOP_WORKSHEET_GID)
-        # Clear existing data
-        worksheet.clear()
-        if rows:
-            # Use append_rows for better compatibility across gspread versions
-            worksheet.append_rows(rows, value_input_option="RAW")
-        logger.info("MOP sheet updated with %d rows", len(rows))
-    except MOPSheetsError:
-        raise
-    except Exception as exc:
-        logger.error("Google Sheets MOP update failed: %s", exc)
-        raise MOPSheetsError(str(exc)) from exc
-
-
-def _compromissos_worksheet(spreadsheet: Any, create: bool = True) -> Any:
-    """Return the commitments worksheet, creating it on first use."""
-    try:
-        return spreadsheet.worksheet(COMPROMISSOS_WORKSHEET_TITLE)
-    except Exception as exc:
-        # Keep the gspread import local so the app can still serve /health in a
-        # minimal local environment without Google dependencies configured.
-        try:
-            import gspread
-            worksheet_not_found = isinstance(exc, gspread.WorksheetNotFound)
-        except Exception:
-            worksheet_not_found = exc.__class__.__name__ == "WorksheetNotFound"
-        if not worksheet_not_found or not create:
-            raise
-        return spreadsheet.add_worksheet(COMPROMISSOS_WORKSHEET_TITLE, rows=1000, cols=8)
+    who = f" da {eps}" if eps else ""
+    lines = [
+        f"MOP{who} atualizado com sucesso! ✅ {after} pessoas{who} (antes: {before}). Aba lida: _{sheet_title}_.",
+    ]
+    if eps:
+        lines.append("As linhas das outras EPS foram mantidas.")
+    else:
+        lines.append(f"Planilha: {MOP_SHEET_URL}")
+    if ignored:
+        lines.append(f"⚠️ {ignored} linha(s) de outra EPS no arquivo foram ignoradas.")
+    if missing:
+        lines.append(f"⚠️ Colunas não encontradas: {', '.join(missing)} — confira o modelo de 12 colunas.")
+    if before and after < before * 0.5:
+        lines.append(
+            "⚠️ O número de pessoas caiu mais de 50%. Se não for esperado, reenvie o arquivo correto — "
+            f"a versão anterior está na aba _{MOP_BACKUP_WORKSHEET_TITLE}_."
+        )
+    return "\n".join(lines)
 
 
-def _today_brazil() -> datetime:
-    return datetime.now(BRAZIL_TIMEZONE)
+# ---------------------------------------------------------------------------
+# Report: leitura das filas
+# ---------------------------------------------------------------------------
+_NUM = r"\d{1,3}(?:[.,]\d+)?"
+FILA_LINE_RE = re.compile(
+    rf"\*(?P<fila>[^*\n]{{2,80}}?)\s*:?\s*\*\s*:?\s*(?:Mês|Mes|MTD)\s*(?P<mes>{_NUM})\s*%"
+    rf"[^\n%]{{0,20}}?D\s*[-–]?\s*1\s*(?P<d1>{_NUM})\s*%",
+    re.IGNORECASE,
+)
 
 
-def _format_date(value: datetime) -> str:
-    return value.strftime("%d/%m/%Y")
+def _parse_report_csat(text: str) -> dict[str, dict[str, float]]:
+    """Extrai {fila: {"mes": x, "d1": y}} das linhas '• *Fila:* Mês X% · D-1 Y%'."""
+    result: dict[str, dict[str, float]] = {}
+    for match in FILA_LINE_RE.finditer(text or ""):
+        fila = match.group("fila").strip().rstrip(":").strip()
+        mes, d1 = _to_float(match.group("mes")), _to_float(match.group("d1"))
+        if fila and mes is not None and d1 is not None:
+            result.setdefault(fila, {"mes": mes, "d1": d1})
+    return result
 
 
-def _parse_commitment_date(value: Any, today: datetime | None = None) -> datetime | None:
-    """Parse the human deadline formats accepted in a Slack commitment."""
-    text = str(value or "").strip().lower()
-    if not text or text in {"a definir", "sem prazo", "não informado", "nao informado", "—", "-"}:
+def _match_fila(name: str, filas: list[str]) -> str | None:
+    """Casa um nome livre com uma fila conhecida (exato, depois o mais específico)."""
+    target = _norm_text(name)
+    if not target or not filas:
         return None
-    today = today or _today_brazil()
-    if any(token in text for token in ("hoje", "today")):
-        return today
-    if "amanhã" in text or "amanha" in text or "tomorrow" in text:
-        return today + timedelta(days=1)
-    for pattern, fmt in ((r"\b(\d{1,2}/\d{1,2}/\d{4})\b", "%d/%m/%Y"),
-                         (r"\b(\d{1,2}-\d{1,2}-\d{4})\b", "%d-%m-%Y"),
-                         (r"\b(\d{4}-\d{1,2}-\d{1,2})\b", "%Y-%m-%d")):
+    normalized = {f: _norm_text(f) for f in filas}
+    for fila, norm in normalized.items():
+        if norm == target:
+            return fila
+    candidates = [f for f, n in normalized.items() if n and (n in target or target in n)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda f: len(normalized[f]))
+
+
+def _split_report(answer: str) -> tuple[str, str]:
+    if THREAD_DELIMITER in answer:
+        main, thread = answer.split(THREAD_DELIMITER, 1)
+        return main.strip(), thread.strip()
+    return answer.strip(), ""
+
+
+def _is_error_answer(answer: str) -> bool:
+    first = next((line.strip() for line in str(answer or "").splitlines() if line.strip()), "")
+    return not first or first.upper().lstrip("*_ ").startswith("ERRO")
+
+
+# ---------------------------------------------------------------------------
+# Datas de compromisso
+# ---------------------------------------------------------------------------
+_NO_DATE = {"", "a definir", "sem prazo", "não informado", "nao informado", "—", "-", "n/a"}
+_WEEKDAYS = {
+    "segunda": 0, "terça": 1, "terca": 1, "quarta": 2, "quinta": 3,
+    "sexta": 4, "sábado": 5, "sabado": 5, "domingo": 6,
+}
+
+
+def _midnight(day: date) -> datetime:
+    return datetime.combine(day, datetime_time(0, 0), tzinfo=BRAZIL_TIMEZONE)
+
+
+def _parse_commitment_date(value: Any, today: datetime | date | None = None) -> datetime | None:
+    """Entende dd/mm[/aaaa], aaaa-mm-dd, hoje, amanhã, dia da semana, semana que vem, fim do mês…"""
+    text = str(value or "").strip().casefold()
+    if text in _NO_DATE:
+        return None
+    base = _as_date(today or _today_brazil())
+
+    for pattern, fmt in (
+        (r"\b(\d{1,2}/\d{1,2}/\d{4})\b", "%d/%m/%Y"),
+        (r"\b(\d{1,2}-\d{1,2}-\d{4})\b", "%d-%m-%Y"),
+        (r"\b(\d{4}-\d{1,2}-\d{1,2})\b", "%Y-%m-%d"),
+    ):
         match = re.search(pattern, text)
         if match:
             try:
-                return datetime.strptime(match.group(1), fmt).replace(tzinfo=BRAZIL_TIMEZONE)
+                return _midnight(datetime.strptime(match.group(1), fmt).date())
             except ValueError:
                 return None
-    short_date = re.search(r"\b(\d{1,2})/(\d{1,2})\b", text)
-    if short_date:
+    match = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2}))?\b", text)
+    if match:
+        day, month = int(match.group(1)), int(match.group(2))
+        year = 2000 + int(match.group(3)) if match.group(3) else base.year
         try:
-            return datetime(today.year, int(short_date.group(2)), int(short_date.group(1)), tzinfo=BRAZIL_TIMEZONE)
+            parsed = date(year, month, day)
+            if not match.group(3) and parsed < base - timedelta(days=180):
+                parsed = date(year + 1, month, day)
         except ValueError:
             return None
+        return _midnight(parsed)
+
+    if "depois de amanh" in text:
+        return _midnight(base + timedelta(days=2))
+    if "amanh" in text or "tomorrow" in text:
+        return _midnight(base + timedelta(days=1))
+    if "hoje" in text or "today" in text:
+        return _midnight(base)
+    if re.search(r"fi(m|nal) do m[eê]s", text):
+        first_next = date(base.year + (base.month == 12), base.month % 12 + 1, 1)
+        return _midnight(first_next - timedelta(days=1))
+    if re.search(r"semana que vem|pr[oó]xima semana", text):
+        return _midnight(base + timedelta(days=7))
+    if re.search(r"fi(m|nal) da semana", text):
+        return _midnight(base + timedelta(days=(4 - base.weekday()) % 7))
+    match = re.search(r"\b(\d{1,2})\s*dias?\b", text)
+    if match:
+        return _midnight(base + timedelta(days=int(match.group(1))))
+    for name, weekday in _WEEKDAYS.items():
+        if re.search(rf"\b{name}", text):
+            return _midnight(base + timedelta(days=(weekday - base.weekday()) % 7))
     return None
 
 
-def _deadline_fields(deadline: Any, today: datetime | None = None) -> tuple[str, str]:
-    today = today or _today_brazil()
-    parsed = _parse_commitment_date(deadline, today)
+def _deadline_fields(raw: Any, today: datetime | date) -> tuple[str, str]:
+    """(Data Fim, Duração em dias) a partir do prazo informado."""
+    parsed = _parse_commitment_date(raw, today)
     if parsed is None:
         return "a definir", "—"
-    return _format_date(parsed), str(max(0, (parsed.date() - today.date()).days))
+    return _format_date(parsed), str(max(0, (parsed.date() - _as_date(today)).days))
 
 
-def _normalise_csat(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    return text if "%" in text else f"{text}%"
+# ---------------------------------------------------------------------------
+# Compromissos
+# ---------------------------------------------------------------------------
+def _compromissos_ws(google_client: Any) -> Any:
+    return _ensure_worksheet(_open_spreadsheet(google_client), COMPROMISSOS_WORKSHEET_TITLE, COMPROMISSOS_HEADERS)
 
 
-def _row_value(row: dict[str, Any], *names: str) -> str:
-    for name in names:
-        value = row.get(name)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    return ""
-
-
-def _ensure_compromissos_headers(worksheet: Any) -> None:
-    values = worksheet.get_all_values()
-    if not values:
-        worksheet.append_row(COMPROMISSOS_HEADERS, value_input_option="RAW")
-        return
-    current = [str(value).strip() for value in values[0][:len(COMPROMISSOS_HEADERS)]]
-    if current != COMPROMISSOS_HEADERS:
-        try:
-            worksheet.update("A1:H1", [COMPROMISSOS_HEADERS], value_input_option="RAW")
-        except TypeError:
-            worksheet.update("A1:H1", [COMPROMISSOS_HEADERS])
-
-
-def _save_compromissos(compromissos: list[dict[str, Any]], google_client: Any) -> None:
-    """Append commitments using the exact eight-column sheet contract."""
-    if not compromissos:
-        return
-    spreadsheet = google_client.open_by_key(MOP_SPREADSHEET_ID)
-    worksheet = _compromissos_worksheet(spreadsheet)
-    _ensure_compromissos_headers(worksheet)
-    rows: list[list[str]] = []
-    for commitment in compromissos:
-        data_inicio = _row_value(commitment, "data_inicio", "data") or _format_date(_today_brazil())
-        raw_deadline = _row_value(commitment, "data_fim", "prazo")
-        action = _row_value(commitment, "acao", "acao_tomada") or "sem resposta"
-        if action.lower() == "sem resposta" and raw_deadline in {"", "—", "-"}:
-            data_fim, duracao = "—", "—"
-        else:
-            data_fim, _ = _deadline_fields(raw_deadline, _today_brazil())
-            start_date = _parse_commitment_date(data_inicio, _today_brazil())
-            end_date = _parse_commitment_date(data_fim, _today_brazil())
-            duracao = str(max(0, (end_date.date() - start_date.date()).days)) if start_date and end_date else "—"
-        rows.append([
-            _row_value(commitment, "problema", "problema_identificado", "fila") or "Ofensor do report",
-            action,
-            data_inicio,
-            data_fim,
-            duracao,
-            _normalise_csat(_row_value(commitment, "resultado_pre", "pre")) or "a definir",
-            "",
-            "a definir",
-        ])
-    if hasattr(worksheet, "append_rows"):
-        worksheet.append_rows(rows, value_input_option="RAW")
-    else:
-        for row in rows:
-            worksheet.append_row(row, value_input_option="RAW")
-
-
-def _commitment_status(row: dict[str, str], today: datetime | None = None) -> str:
-    today = today or _today_brazil()
-    post = _row_value(row, "Resultado Pós", "resultado_pos")
-    success = _row_value(row, "Sucesso", "sucesso").lower()
-    if post and post.lower() not in {"a definir", "—", "-"}:
+def _commitment_status(row: dict[str, str], today: datetime | date | None = None) -> str:
+    """concluído | encerrado | sem resposta | prazo a definir | vence hoje | prazo vencido | expirado | em andamento"""
+    base = _as_date(today or _today_brazil())
+    if _row_value(row, "Sucesso").casefold() == "encerrado":
+        return "encerrado"
+    post = _row_value(row, "Resultado Pós")
+    if post and post.casefold() not in {"a definir"}:
         return "concluído"
-    deadline = _parse_commitment_date(_row_value(row, "Data Fim", "data_fim", "prazo"), today)
-    action = _row_value(row, "Ação Tomada", "acao", "acao_tomada").lower()
-    if action == "sem resposta":
+    if _row_value(row, "Ação Tomada").casefold() == SEM_RESPOSTA:
         return "sem resposta"
-    if deadline is not None and deadline.date() <= today.date():
+    deadline = _parse_commitment_date(_row_value(row, "Data Fim"), base)
+    if deadline is None:
+        return "prazo a definir"
+    if deadline.date() == base:
+        return "vence hoje"
+    if deadline.date() < base - timedelta(days=EXPIRED_AFTER_DAYS):
+        return "expirado"
+    if deadline.date() < base:
         return "prazo vencido"
-    if deadline is not None:
-        return "prazo em andamento"
-    return "prazo a definir" if success != "não" else "prazo vencido"
+    return "em andamento"
 
 
-def _get_open_compromissos(google_client: Any) -> str:
-    """Read every commitment and render lifecycle context for the daily prompt."""
+_STATUS_PRIORITY = {
+    "prazo vencido": 0, "vence hoje": 1, "sem resposta": 2, "prazo a definir": 3,
+    "em andamento": 4, "concluído": 5,
+}
+
+
+def _commitment_fila(row: dict[str, str], filas: list[str] | None = None) -> str:
+    fila = _row_value(row, "Fila")
+    if fila:
+        return fila
+    if filas:  # linhas antigas, sem coluna Fila: tenta achar no texto do problema
+        return _match_fila(_row_value(row, "Problema Identificado"), filas) or FILA_GERAL
+    return FILA_GERAL
+
+
+def _get_open_compromissos(
+    google_client: Any, today: datetime | date | None = None, tenant_key: str = CONSOLIDATED
+) -> str:
+    """Contexto de compromissos para o prompt do report (só o que está em aberto, só desta EPS)."""
+    base = _as_date(today or _today_brazil())
     try:
-        spreadsheet = google_client.open_by_key(MOP_SPREADSHEET_ID)
-        worksheet = _compromissos_worksheet(spreadsheet, create=False)
-        rows = worksheet.get_all_records()
-    except Exception as exc:
-        if exc.__class__.__name__ == "WorksheetNotFound":
-            return ""
-        logger.warning("Could not read commitments from Google Sheets: %s", exc)
+        rows = _worksheet_rows_with_header(_compromissos_ws(google_client))
+    except Exception:
+        logger.warning("Could not read commitments from Google Sheets", exc_info=True)
         return ""
-    if not rows:
+
+    selected: list[tuple[int, date, str, dict[str, str]]] = []
+    for _, row in rows:
+        if not _same_tenant(row, tenant_key):
+            continue
+        status = _commitment_status(row, base)
+        if status in {"encerrado", "expirado"}:
+            continue
+        deadline = _parse_commitment_date(_row_value(row, "Data Fim"), base)
+        if status == "concluído":
+            # mostra resultado só de quem fechou nos últimos 2 dias
+            if deadline is None or deadline.date() < base - timedelta(days=2):
+                continue
+        if status == "sem resposta":
+            start = _parse_commitment_date(_row_value(row, "Data Inicio"), base)
+            if start is None or start.date() < base - timedelta(days=SEM_RESPOSTA_WINDOW_DAYS):
+                continue
+        sort_day = deadline.date() if deadline else base + timedelta(days=365)
+        selected.append((_STATUS_PRIORITY.get(status, 9), sort_day, status, row))
+
+    if not selected:
         return ""
-    today = _today_brazil()
-    lines = ["COMPROMISSOS ABERTOS:"]
-    for row in rows:
-        problem = _row_value(row, "Problema Identificado", "problema") or "ofensor"
-        action = _row_value(row, "Ação Tomada", "acao") or "sem resposta"
-        deadline_text = _row_value(row, "Data Fim", "data_fim") or "a definir"
-        status = _commitment_status(row, today)
-        if status == "prazo em andamento":
-            deadline = _parse_commitment_date(deadline_text, today)
-            days = max(0, (deadline.date() - today.date()).days) if deadline else 0
-            lines.append(f"- Em andamento: {problem} · {action} · prazo {deadline_text} · faltam {days} dias")
-        elif status == "prazo vencido":
-            pre = _row_value(row, "Resultado Pré", "resultado_pre") or "a definir"
-            label = "vence hoje" if _parse_commitment_date(deadline_text, today) and _parse_commitment_date(deadline_text, today).date() == today.date() else "vencido"
-            lines.append(f"- Prazo {label} em {deadline_text}: {problem} · {action} · CSAT foi de {pre} para a definir — verificar resultado")
+    selected.sort(key=lambda item: (item[0], item[1]))
+    lines = ["COMPROMISSOS EM ABERTO (aba Compromissos, lida agora pelo app):"]
+    for _, _, status, row in selected[:OPEN_COMMITMENTS_LIMIT]:
+        fila = _commitment_fila(row)
+        action = _row_value(row, "Ação Tomada") or SEM_RESPOSTA
+        owner = _row_value(row, "Responsável") or "Liderança"
+        deadline_text = _row_value(row, "Data Fim") or "a definir"
+        pre = _row_value(row, "Resultado Pré") or "a definir"
+        if status == "em andamento":
+            lines.append(f"- Em andamento: {fila} · {action} · {owner} · prazo {deadline_text}")
+        elif status in {"prazo vencido", "vence hoje"}:
+            label = "vence hoje" if status == "vence hoje" else f"venceu em {deadline_text}"
+            lines.append(f"- Prazo {label}: {fila} · {action} · {owner} · CSAT pré {pre} — pedir o status")
         elif status == "concluído":
-            pre = _row_value(row, "Resultado Pré", "resultado_pre") or "a definir"
-            post = _row_value(row, "Resultado Pós", "resultado_pos")
-            success = _row_value(row, "Sucesso", "sucesso") or "a definir"
-            lines.append(f"- Concluído: {problem} · CSAT de {pre} para {post} — sucesso {success.lower()}")
+            post = _row_value(row, "Resultado Pós")
+            success = _row_value(row, "Sucesso") or "a definir"
+            lines.append(f"- Concluído: {fila} · {action} · CSAT {pre} → {post} — funcionou: {success}")
         elif status == "sem resposta":
-            lines.append(f"- Sem resposta: {problem} — cobrar novamente")
+            lines.append(f"- Sem resposta: report de {_row_value(row, 'Data Inicio')} — cobrar novamente")
         else:
-            lines.append(f"- Sem prazo definido: {problem} · {action} — pedir prazo")
+            lines.append(f"- Sem prazo: {fila} · {action} · {owner} — pedir prazo")
+    if len(selected) > OPEN_COMMITMENTS_LIMIT:
+        lines.append(f"- (+{len(selected) - OPEN_COMMITMENTS_LIMIT} compromissos com prazo mais distante)")
     lines.extend([
-        "", "No report, para ofensores em andamento, não peça novo plano — só dê update do status.",
-        "Para ofensores vencidos, compare Pré vs Pós e diga se funcionou.",
-        "Para sem resposta, cobre novamente.",
-        "Para novos, peça o plano no formato ação · responsável · prazo na thread até 14h.", "",
+        "",
+        "Em andamento: não peça plano novo, só pergunte o status. Vencidos: peça o status. "
+        "Sem resposta: cobre de novo. Ofensores novos: peça ação · responsável · prazo na thread até 14h.",
     ])
     return "\n".join(lines)
 
 
-
-def _worksheet_rows_with_header(worksheet: Any) -> list[tuple[int, dict[str, str]]]:
-    values = worksheet.get_all_values()
-    if not values:
-        return []
-    headers = [str(value).strip() for value in values[0]]
-    return [(n, {h: str(row[i]) if i < len(row) else "" for i, h in enumerate(headers) if h})
-            for n, row in enumerate(values[1:], start=2)]
-
-
-def _update_compromisso_cells(worksheet: Any, row_number: int, resultado_pos: str, sucesso: str) -> None:
-    worksheet.update_cell(row_number, 7, resultado_pos)
-    worksheet.update_cell(row_number, 8, sucesso)
+def _commitment_row(
+    fila: str, acao: str, responsavel: str, prazo: str, pre: str, report_ts: str, today: datetime | date,
+    tenant_key: str = CONSOLIDATED,
+) -> list[str]:
+    data_fim, duracao = _deadline_fields(prazo, today)
+    problema = f"{fila} · CSAT D-1 {pre}" if pre else f"{fila} · ofensor do report"
+    return [
+        problema, acao, _format_date(today), data_fim, duracao,
+        pre or "a definir", "", "a definir", fila, responsavel or "Liderança", report_ts, tenant_key,
+    ]
 
 
-def _extract_csat_for_commitment(report_text: str, problem: str, fallback: Any = None) -> str:
-    if isinstance(fallback, dict):
-        for key, value in fallback.items():
-            if str(key).lower() in problem.lower() or problem.lower() in str(key).lower():
-                return _normalise_csat(value)
-    if fallback is not None and not isinstance(fallback, dict):
-        return _normalise_csat(fallback)
-    relevant = [line for line in str(report_text or "").splitlines() if any(token.lower() in line.lower() for token in str(problem).split() if len(token) > 3)]
-    percentages = re.findall(r"(?<!\d)(\d{1,3}(?:[,.]\d+)?)\s*%", " ".join(relevant))
-    if len(percentages) == 1:
-        return _normalise_csat(percentages[0])
-    # A small report/test response may contain one unlabelled D-1 value. Use
-    # it; with several values we leave the row open rather than guessing a fila.
-    all_percentages = re.findall(r"(?<!\d)(\d{1,3}(?:[,.]\d+)?)\s*%", str(report_text or ""))
-    return _normalise_csat(all_percentages[0]) if len(all_percentages) == 1 else ""
+def _sem_resposta_row(report_ts: str, today: datetime | date, tenant_key: str = CONSOLIDATED) -> list[str]:
+    return [
+        "Report sem resposta da liderança", SEM_RESPOSTA, _format_date(today), "—", "—",
+        "a definir", "", "a definir", FILA_GERAL, "Liderança", report_ts, tenant_key,
+    ]
 
 
-def _check_deadline_compromissos(google_client: Any, report_text: str = "", csat_by_problem: dict[str, Any] | None = None) -> int:
-    """Fill Resultado Pós/Sucesso for commitments due today or already overdue."""
-    try:
-        worksheet = _compromissos_worksheet(google_client.open_by_key(MOP_SPREADSHEET_ID), create=False)
-        updated = 0
-        today = _today_brazil()
-        for row_number, row in _worksheet_rows_with_header(worksheet):
-            if _row_value(row, "Resultado Pós", "resultado_pos") not in {"", "a definir"}:
-                continue
-            deadline = _parse_commitment_date(_row_value(row, "Data Fim", "data_fim"), today)
-            if deadline is None or deadline.date() > today.date():
-                continue
-            problem = _row_value(row, "Problema Identificado", "problema")
-            post = _extract_csat_for_commitment(report_text, problem, csat_by_problem)
-            if not post:
-                continue
-            pre = _extract_csat_for_commitment("", problem, _row_value(row, "Resultado Pré", "resultado_pre"))
-            def number(value: str) -> float | None:
-                match = re.search(r"\d+(?:[,.]\d+)?", value or "")
-                return float(match.group(0).replace(",", ".")) if match else None
-            pre_num, post_num = number(pre), number(post)
-            if pre_num is None or post_num is None:
-                continue
-            _update_compromisso_cells(worksheet, row_number, post, "Sim" if post_num > pre_num else "Não")
-            updated += 1
-        return updated
-    except Exception as exc:
-        if exc.__class__.__name__ != "WorksheetNotFound":
-            logger.warning("Could not check commitment deadlines: %s", exc)
+def _row_tenant(row: dict[str, str]) -> str:
+    return _row_value(row, "EPS") or CONSOLIDATED
+
+
+def _same_tenant(row: dict[str, str], tenant_key: str) -> bool:
+    return _compact(_row_tenant(row)) == _compact(tenant_key)
+
+
+def _check_deadline_compromissos(
+    google_client: Any, csat: dict[str, dict[str, float]], today: datetime | date | None = None,
+    tenant_key: str = CONSOLIDATED,
+) -> int:
+    """Preenche Resultado Pós/Sucesso dos compromissos vencidos usando o D-1 da fila.
+
+    Só fecha quando o prazo já passou (o D-1 do report cobre o dia do prazo).
+    """
+    if not csat:
         return 0
+    base = _as_date(today or _today_brazil())
+    filas = list(csat)
+    worksheet = _compromissos_ws(google_client)
+    updated = 0
+    for row_number, row in _worksheet_rows_with_header(worksheet):
+        if not _same_tenant(row, tenant_key):
+            continue
+        if _commitment_status(row, base) not in {"prazo vencido", "expirado"}:
+            continue
+        fila = _match_fila(_commitment_fila(row, filas), filas)
+        pre = _to_float(_row_value(row, "Resultado Pré"))
+        if fila is None or pre is None:
+            continue
+        post = csat[fila]["d1"]
+        worksheet.update_cell(row_number, COL_POS, _fmt_pct(post))
+        worksheet.update_cell(row_number, COL_SUCESSO, "Sim" if post > pre else "Não")
+        updated += 1
+    return updated
+
+
+def _strip_json_code_blocks(answer: str) -> str:
+    text = str(answer or "").strip()
+    match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.IGNORECASE | re.DOTALL)
+    return match.group(1).strip() if match else text
+
+
+def _parse_extraction(answer: str) -> dict[str, list[dict[str, Any]]] | None:
+    text = _strip_json_code_blocks(answer)
+    parsed: Any = None
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        match = re.search(r"(\{.*\}|\[.*\])", text, flags=re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                parsed = None
+    if isinstance(parsed, list):
+        return {"novos": [i for i in parsed if isinstance(i, dict)], "atualizacoes": []}
+    if isinstance(parsed, dict):
+        return {
+            "novos": [i for i in (parsed.get("novos") or []) if isinstance(i, dict)],
+            "atualizacoes": [i for i in (parsed.get("atualizacoes") or []) if isinstance(i, dict)],
+        }
+    return None
+
+
+def _extract_commitments_via_toqan(
+    messages: list[str],
+    filas: list[str],
+    existing: list[tuple[int, dict[str, str]]],
+    today: datetime | date,
+) -> dict[str, list[dict[str, Any]]]:
+    """Pede ao Toqan os compromissos novos e as atualizações dos já registrados."""
+    base = _as_date(today)
+    weekday = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"][base.weekday()]
+    existing_lines = "\n".join(
+        f"linha {n} · {_commitment_fila(r)} · {_row_value(r, 'Ação Tomada')} · "
+        f"{_row_value(r, 'Responsável') or 'Liderança'} · prazo {_row_value(r, 'Data Fim') or 'a definir'}"
+        for n, r in existing
+        if _row_value(r, "Ação Tomada").casefold() != SEM_RESPOSTA
+    ) or "(nenhum)"
+    prompt = (
+        "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Responda APENAS com JSON válido, "
+        "sem markdown, sem texto antes ou depois.\n\n"
+        "Você é um extrator de compromissos de plano de ação da liderança das EPSs.\n"
+        f"Hoje é {_format_date(base)} ({weekday}).\n"
+        f"Filas do report: {', '.join(filas) if filas else '(não identificadas)'}\n"
+        f"Compromissos já registrados nesta thread:\n{existing_lines}\n\n"
+        "Mensagens novas da liderança:\n" + "\n---\n".join(messages) + "\n\n"
+        "Formato de saída:\n"
+        '{"novos":[{"fila":"...","acao":"...","responsavel":"...","prazo":"dd/mm/aaaa ou a definir"}],'
+        '"atualizacoes":[{"linha":12,"acao":"...","responsavel":"...","prazo":"dd/mm/aaaa"}]}\n\n'
+        "Regras:\n"
+        "- novos: planos de ação novos. fila = exatamente um nome da lista de filas; se não der pra saber, use \"Geral\".\n"
+        "- atualizacoes: quando a mensagem completa ou corrige um compromisso já registrado (ex.: informa o prazo "
+        "que faltava). Use o número da linha e inclua só os campos que mudaram.\n"
+        "- prazo: converta para dd/mm/aaaa a partir de hoje (\"sexta\" = próxima sexta; \"semana que vem\" = hoje + 7 dias; "
+        "\"fim do mês\" = último dia do mês). Sem prazo → \"a definir\".\n"
+        "- responsavel: quem executa; se não mencionado, \"Liderança\".\n"
+        "- Status de compromisso (\"concluído\", \"em andamento\") não é compromisso novo.\n"
+        '- Não invente. Sem plano nem atualização → {"novos":[],"atualizacoes":[]}'
+    )
+    answer = ask_toqan(prompt)
+    parsed = _parse_extraction(answer)
+    if parsed is None:
+        logger.warning("Commitment extraction was not JSON; keeping raw message as commitment")
+        raw = " / ".join(m.strip() for m in messages if m.strip())[:200]
+        return {"novos": [{"fila": FILA_GERAL, "acao": raw, "responsavel": "Liderança", "prazo": "a definir"}],
+                "atualizacoes": []}
+    return parsed
 
 
 def _human_thread_message_records(messages: list[dict[str, Any]], report_ts: str) -> list[tuple[str, str]]:
-    """Extract human reply timestamps and text, excluding bot posts."""
     records: list[tuple[str, str]] = []
     for message in messages:
         if not isinstance(message, dict) or message.get("ts") == report_ts:
             continue
         if message.get("bot_id") or message.get("bot_profile") or message.get("subtype") == "bot_message":
             continue
-        text = str(message.get("text") or "").strip()
+        text = _strip_mentions(str(message.get("text") or ""))
         timestamp = str(message.get("ts") or "").strip()
         if text and timestamp:
             records.append((timestamp, text))
     return records
 
 
-def _human_thread_messages(messages: list[dict[str, Any]], report_ts: str) -> list[str]:
-    """Extract human replies while excluding the report parent and bot posts."""
-    return [text for _, text in _human_thread_message_records(messages, report_ts)]
+def _fetch_thread(channel_id: str, report_ts: str) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    cursor = None
+    for _ in range(10):
+        kwargs: dict[str, Any] = {"channel": channel_id, "ts": report_ts, "limit": 200}
+        if cursor:
+            kwargs["cursor"] = cursor
+        response = slack_app.client.conversations_replies(**kwargs)
+        page = _resp_get(response, "messages", []) or []
+        messages.extend(m for m in page if isinstance(m, dict))
+        cursor = (_resp_get(response, "response_metadata", {}) or {}).get("next_cursor")
+        if not cursor:
+            break
+    return messages
 
 
-def _strip_json_code_blocks(answer: str) -> str:
-    """Remove an optional Markdown JSON fence returned by the model."""
-    text = str(answer or "").strip()
-    match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.IGNORECASE | re.DOTALL)
-    return match.group(1).strip() if match else text
+def _read_report_thread(
+    channel_id: str, report_ts: str, phase: str, today: datetime | date | None = None,
+    tenant_key: str = CONSOLIDATED,
+) -> dict[str, int]:
+    """Lê a thread do report e registra/atualiza compromissos. Levanta exceção em falha.
 
-
-def _fallback_commitment(thread_text: str) -> list[dict[str, str]]:
-    """Preserve a raw leadership message when the model answer is not JSON."""
-    text = str(thread_text or "").strip()
-    if not text:
-        return []
-    return [{"acao": text[:200], "responsavel": "Liderança", "prazo": "a definir"}]
-
-
-def _extract_commitments_via_toqan(thread_messages: list[str], report_context: str) -> list[dict[str, str]]:
-    """Use Toqan to extract natural-language leadership commitments."""
-    messages_text = "\n\n".join(str(message).strip() for message in thread_messages if str(message).strip())
-    if not messages_text:
-        return []
-
-    extraction_prompt = (
-        "Você é um extrator de compromissos. Leia as mensagens da liderança abaixo e identifique TODOS os planos de ação mencionados, "
-        "mesmo que não estejam em formato estruturado. Para cada compromisso encontrado, retorne APENAS um JSON válido (sem markdown, "
-        "sem texto extra) no formato: [{\"acao\": \"descrição da ação\", \"responsavel\": \"nome ou papel\", \"prazo\": \"data ou a definir\"}]. "
-        "Regras: acao é o que vai ser feito, responsavel é quem vai executar (se não mencionado use Liderança), prazo é a data limite "
-        "(se não mencionado use a definir). Se a mensagem NÃO contém nenhum plano de ação, retorne []. NÃO invente compromissos. "
-        f"Mensagens da liderança: {messages_text} Contexto do report: {report_context}"
+    phase: "first" (2h depois; registra "sem resposta" se ninguém respondeu),
+           "late" (18h) ou "next" (manhã seguinte, antes do report).
+    """
+    base = _as_date(today or _today_brazil())
+    messages = _fetch_thread(channel_id, report_ts)
+    report_text = "\n".join(
+        str(m.get("text") or "")
+        for m in messages
+        if m.get("ts") == report_ts or m.get("bot_id") or m.get("subtype") == "bot_message"
     )
+    csat = _parse_report_csat(report_text)
+    filas = list(csat)
 
-    conversation_id, request_id = create_conversation(extraction_prompt)
-    answer = get_answer(conversation_id, request_id)
-    try:
-        parsed = json.loads(_strip_json_code_blocks(answer))
-    except (json.JSONDecodeError, TypeError) as exc:
-        logger.warning("Could not parse Toqan commitment extraction as JSON: %s", exc)
-        return _fallback_commitment(messages_text)
+    records = _human_thread_message_records(messages, report_ts)
+    captured_key = f"captured:{report_ts}"
+    captured = {t for t in STATE.get(captured_key).split(",") if t}
+    new_records = [(t, text) for t, text in records if t not in captured]
 
-    if not isinstance(parsed, list):
-        logger.warning("Toqan commitment extraction was not a JSON list")
-        return _fallback_commitment(messages_text)
+    google_client = _get_google_client()
+    if google_client is None:
+        raise MOPGoogleCredentialsError("GOOGLE_CREDENTIALS_JSON não configurado")
+    worksheet = _compromissos_ws(google_client)
+    thread_rows = [(n, r) for n, r in _worksheet_rows_with_header(worksheet) if _row_value(r, "Thread") == report_ts]
 
-    commitments: list[dict[str, str]] = []
-    for item in parsed:
-        if not isinstance(item, dict):
-            continue
+    if not new_records:
+        if phase == "first" and not records and not thread_rows:
+            worksheet.append_row(_sem_resposta_row(report_ts, base, tenant_key), value_input_option="RAW")
+        return {"novos": 0, "atualizados": 0}
+
+    extraction = _extract_commitments_via_toqan([text for _, text in new_records], filas, thread_rows, base)
+
+    # novos
+    new_rows: list[list[str]] = []
+    missing_deadline: list[str] = []
+    for item in extraction["novos"]:
         action = str(item.get("acao") or "").strip()
         if not action:
             continue
-        commitments.append({
-            "acao": action,
-            "responsavel": str(item.get("responsavel") or "Liderança").strip() or "Liderança",
-            "prazo": str(item.get("prazo") or "a definir").strip() or "a definir",
-        })
-    return commitments
+        fila = _match_fila(str(item.get("fila") or ""), filas) or FILA_GERAL
+        pre = _fmt_pct(csat[fila]["d1"]) if fila in csat else ""
+        prazo = str(item.get("prazo") or "a definir").strip() or "a definir"
+        row = _commitment_row(
+            fila, action, str(item.get("responsavel") or "").strip(), prazo, pre, report_ts, base, tenant_key
+        )
+        new_rows.append(row)
+        if row[COL_DATA_FIM - 1] == "a definir":
+            missing_deadline.append(action)
+    if new_rows:
+        worksheet.append_rows(new_rows, value_input_option="RAW")
+
+    # atualizações (só linhas desta thread)
+    valid_rows = {n: r for n, r in thread_rows}
+    updated = 0
+    for item in extraction["atualizacoes"]:
+        n = _to_int(item.get("linha"))
+        if n not in valid_rows:
+            continue
+        changed = False
+        if str(item.get("acao") or "").strip():
+            worksheet.update_cell(n, COL_ACAO, str(item["acao"]).strip())
+            changed = True
+        if str(item.get("responsavel") or "").strip():
+            worksheet.update_cell(n, COL_RESPONSAVEL, str(item["responsavel"]).strip())
+            changed = True
+        if str(item.get("prazo") or "").strip():
+            start = _parse_commitment_date(_row_value(valid_rows[n], "Data Inicio"), base) or _midnight(base)
+            data_fim, duracao = _deadline_fields(item["prazo"], start)
+            if data_fim != "a definir":
+                worksheet.update_cell(n, COL_DATA_FIM, data_fim)
+                worksheet.update_cell(n, COL_DURACAO, duracao)
+                changed = True
+        updated += int(changed)
+
+    # liderança respondeu: encerra o "sem resposta" desta thread
+    if new_rows or updated:
+        for n, r in thread_rows:
+            if _row_value(r, "Ação Tomada").casefold() == SEM_RESPOSTA:
+                worksheet.update_cell(n, COL_ACAO, f"sem resposta (respondido em {_format_date(base)})")
+                worksheet.update_cell(n, COL_SUCESSO, "encerrado")
+
+    STATE.set(captured_key, ",".join(sorted(captured | {t for t, _ in new_records})))
+
+    if new_rows or updated:
+        parts = []
+        if new_rows:
+            parts.append(f"{len(new_rows)} novo(s) compromisso(s)")
+        if updated:
+            parts.append(f"{updated} atualizado(s)")
+        text = f"Registrado: {' e '.join(parts)} ✅"
+        if missing_deadline:
+            text += "\nQual o prazo para:\n" + "\n".join(f"• {a[:120]}" for a in missing_deadline)
+        slack_app.client.chat_postMessage(channel=channel_id, text=text, thread_ts=report_ts)
+    return {"novos": len(new_rows), "atualizados": updated}
 
 
-def _mark_report_messages_captured(report_ts: str, timestamps: set[str]) -> None:
-    """Remember human message timestamps already persisted for a report."""
-    if not timestamps:
+# ---------------------------------------------------------------------------
+# Report diário (um por EPS + consolidado opcional)
+# ---------------------------------------------------------------------------
+class ReportGenerationError(RuntimeError):
+    """O Toqan não devolveu um report publicável."""
+
+
+def _report_prompt(tenant: Tenant, compromissos_text: str) -> str:
+    scope = _scope_instruction(tenant.eps)
+    if tenant.eps:
+        scope += (
+            f" Este é o report da {tenant.eps}: use os nomes das células da {tenant.eps} como filas; "
+            "células sem volume em D-1 aparecem como 'sem volume em D-1'. "
+            "Não use a palavra iFood para se referir a totais — o total do report é o total da EPS."
+        )
+    parts = [scope]
+    if compromissos_text:
+        parts.append(compromissos_text)
+    parts.append(DAILY_REPORT_PROMPT)
+    return "\n\n".join(parts)
+
+
+def _run_daily_report(now: datetime | None = None, tenant: Tenant | None = None) -> str:
+    """Gera e publica o report de um tenant; devolve o ts da mensagem principal."""
+    now = now or _now_brazil()
+    tenant = tenant or TENANTS[0]
+    google_client = _safe_google_client()
+    compromissos_text = _get_open_compromissos(google_client, now, tenant.key) if google_client else ""
+
+    answer = ask_toqan(_report_prompt(tenant, compromissos_text))
+    if _is_error_answer(answer):
+        raise ReportGenerationError(answer.strip()[:300] or "resposta vazia")
+    main, thread = _split_report(answer)
+    if not main:
+        raise ReportGenerationError("mensagem principal vazia")
+    csat = _parse_report_csat(answer)
+    if not csat:
+        _alert(f"[{tenant.key}] Report sem linhas de fila no formato esperado — pré/pós dos compromissos não será calculado hoje.")
+    if not thread:
+        logger.warning("[%s] Report without %s delimiter; posting everything as main message", tenant.key, THREAD_DELIMITER)
+
+    response = slack_app.client.chat_postMessage(channel=tenant.channel, text=main)
+    report_ts = _resp_get(response, "ts") or (_resp_get(response, "message", {}) or {}).get("ts")
+    if not report_ts:
+        raise ReportGenerationError("Slack não devolveu o ts do report")
+    STATE.set(f"report:{tenant.key}:{now.date().isoformat()}", str(report_ts))
+    if thread:
+        try:
+            slack_app.client.chat_postMessage(channel=tenant.channel, text=thread, thread_ts=report_ts)
+        except Exception:
+            logger.exception("Could not post report thread")
+            _alert(f"[{tenant.key}] O report saiu, mas não consegui postar a thread (Q4/filas).")
+
+    if google_client is not None and csat:
+        try:
+            closed = _check_deadline_compromissos(google_client, csat, now, tenant.key)
+            logger.info("[%s] Daily report: %d commitments closed with pós", tenant.key, closed)
+        except Exception:
+            logger.warning("Daily report: could not update commitment deadlines", exc_info=True)
+    return str(report_ts)
+
+
+# ---------------------------------------------------------------------------
+# Calendário do MOP
+# ---------------------------------------------------------------------------
+def _is_business_day(day: date) -> bool:
+    if day.weekday() >= 5:
+        return False
+    return not (_BR_HOLIDAYS is not None and day in _BR_HOLIDAYS)
+
+
+def _next_business_day(day: date) -> date:
+    while not _is_business_day(day):
+        day += timedelta(days=1)
+    return day
+
+
+def _mop_fire_dates_for_month(year: int, month: int) -> list[date]:
+    """1º dia útil e dia 15 (ou próximo dia útil). Fim de semana e feriado nacional pulados."""
+    return [_next_business_day(date(year, month, 1)), _next_business_day(date(year, month, 15))]
+
+
+def _is_mop_day(day: date) -> bool:
+    return day in _mop_fire_dates_for_month(day.year, day.month)
+
+
+# ---------------------------------------------------------------------------
+# Agendador único
+# ---------------------------------------------------------------------------
+_report_next_attempt_at: dict[str, datetime] = {}
+_scheduler_thread: threading.Thread | None = None
+_scheduler_last_tick: datetime | None = None
+
+
+def _skey(kind: str, tenant: Tenant, day: date) -> str:
+    return f"{kind}:{tenant.key}:{day.isoformat()}"
+
+
+def _posted_at(ts: str) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(float(ts), tz=BRAZIL_TIMEZONE)
+    except Exception:
+        return None
+
+
+def _run_thread_read(tenant: Tenant, report_ts: str, phase: str, state_key: str, today: date) -> None:
+    try:
+        result = _read_report_thread(tenant.channel, report_ts, phase, today, tenant.key)
+        logger.info("[%s] Thread read %s: %s", tenant.key, phase, result)
+        STATE.set(state_key, "ok")
+    except Exception as exc:
+        logger.exception("[%s] Thread read %s failed", tenant.key, phase)
+        STATE.set(state_key, "erro")
+        _alert(f"[{tenant.key}] Falha ao ler a thread do report ({phase}): {type(exc).__name__}: {str(exc)[:200]}")
+
+
+def _tenant_tick(tenant: Tenant, now: datetime) -> None:
+    today = now.date()
+
+    # 1) Releitura da thread de ontem (respostas tardias) antes do report
+    if now.time() >= PREVIOUS_THREAD_READ_TIME:
+        yesterday = today - timedelta(days=1)
+        y_ts = STATE.get(_skey("report", tenant, yesterday))
+        if y_ts and STATE.get(_skey("read_first", tenant, yesterday)) and not STATE.get(_skey("read_next", tenant, yesterday)):
+            _run_thread_read(tenant, y_ts, "next", _skey("read_next", tenant, yesterday), today)
+
+    # 2) Report diário (com recuperação após restart e novas tentativas)
+    if not STATE.get(_skey("report", tenant, today)):
+        fail_key = _skey("report_fail", tenant, today)
+        if DAILY_REPORT_TIME <= now.time() < REPORT_CATCHUP_UNTIL:
+            failures = _to_int(STATE.get(fail_key))
+            next_at = _report_next_attempt_at.get(tenant.key)
+            if failures < REPORT_MAX_ATTEMPTS and (next_at is None or now >= next_at):
+                try:
+                    _run_daily_report(now, tenant)
+                    _report_next_attempt_at.pop(tenant.key, None)
+                except Exception as exc:
+                    failures += 1
+                    STATE.set(fail_key, str(failures))
+                    _report_next_attempt_at[tenant.key] = now + timedelta(minutes=REPORT_RETRY_MINUTES)
+                    logger.exception("[%s] Daily report attempt %d failed", tenant.key, failures)
+                    detail = f"{type(exc).__name__}: {str(exc)[:250]}"
+                    if failures >= REPORT_MAX_ATTEMPTS:
+                        _alert(f"[{tenant.key}] Report de {_format_date(today)} não saiu após {failures} tentativas. Último erro: {detail}")
+                        try:
+                            slack_app.client.chat_postMessage(channel=tenant.channel, text=REPORT_FAILED_CHANNEL_MESSAGE)
+                        except Exception:
+                            logger.exception("Could not post report failure notice")
+                    else:
+                        _alert(f"[{tenant.key}] Tentativa {failures} do report falhou ({detail}). Nova tentativa em {REPORT_RETRY_MINUTES} min.")
+        elif now.time() >= REPORT_CATCHUP_UNTIL and not STATE.get(_skey("report_missed", tenant, today)) \
+                and _to_int(STATE.get(fail_key)) < REPORT_MAX_ATTEMPTS:
+            STATE.set(_skey("report_missed", tenant, today), "1")
+            _alert(f"[{tenant.key}] O report de {_format_date(today)} não rodou (app fora do ar na janela 09h–13h?).")
+
+    # 3) Leituras da thread de hoje
+    report_ts = STATE.get(_skey("report", tenant, today))
+    if report_ts:
+        posted = _posted_at(report_ts) or now
+        first_due = max(datetime.combine(today, THREAD_READ_FIRST_TIME, tzinfo=BRAZIL_TIMEZONE),
+                        posted + THREAD_READ_FIRST_MIN_DELAY)
+        first_key = _skey("read_first", tenant, today)
+        if now >= first_due and not STATE.get(first_key):
+            _run_thread_read(tenant, report_ts, "first", first_key, today)
+        late_due = max(datetime.combine(today, THREAD_READ_LATE_TIME, tzinfo=BRAZIL_TIMEZONE),
+                       posted + THREAD_READ_LATE_MIN_DELAY)
+        late_key = _skey("read_late", tenant, today)
+        if now >= late_due and STATE.get(first_key) and not STATE.get(late_key):
+            _run_thread_read(tenant, report_ts, "late", late_key, today)
+
+    # 4) Cobrança do MOP (só canais de EPS; o consolidado não recebe se houver EPS configuradas)
+    if tenant.eps is None and EPS_CHANNELS:
         return
-    with _REPORT_CAPTURED_MESSAGE_LOCK:
-        _REPORT_CAPTURED_MESSAGE_TIMESTAMPS.setdefault(report_ts, set()).update(timestamps)
+    mop_key = _skey("mop_check", tenant, today)
+    if _is_mop_day(today) and MOP_CHECK_TIME <= now.time() < MOP_CHECK_UNTIL and not STATE.get(mop_key):
+        try:
+            slack_app.client.chat_postMessage(channel=tenant.channel, text=MOP_CHECK_MESSAGE)
+            STATE.set(mop_key, "ok")
+        except Exception as exc:
+            STATE.set(mop_key, "erro")
+            _alert(f"[{tenant.key}] Falha ao postar a cobrança do MOP: {type(exc).__name__}")
 
 
-def _new_report_message_records(report_ts: str, records: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    """Return human replies not yet captured for this report thread."""
-    with _REPORT_CAPTURED_MESSAGE_LOCK:
-        captured = _REPORT_CAPTURED_MESSAGE_TIMESTAMPS.setdefault(report_ts, set())
-        return [(timestamp, text) for timestamp, text in records if timestamp not in captured]
+def _scheduler_tick(now: datetime | None = None) -> None:
+    global _scheduler_last_tick
+    now = now or _now_brazil()
+    _scheduler_last_tick = now
+    for tenant in TENANTS:
+        try:
+            _tenant_tick(tenant, now)
+        except Exception:
+            logger.exception("[%s] Scheduler tick failed", tenant.key)
 
 
-def _report_problem(parent_text: str) -> str:
-    for line in str(parent_text or "").splitlines():
-        if "%" in line and line.strip().startswith(('-', '•', '*')):
-            return re.sub(r"^[\-•*\s]+", "", line).strip()[:200]
-    return "Ofensor do report"
+def _scheduler_loop() -> None:
+    STATE.get("boot")  # força a carga do estado
+    if not STATE.persistent:
+        logger.warning("State store em memória: um restart pode repetir rotinas do dia.")
+    logger.info("Scheduler started for %s", TENANTS)
+    while True:
+        try:
+            _scheduler_tick()
+        except Exception:
+            logger.exception("Scheduler tick failed")
+        time.sleep(SCHEDULER_TICK_SECONDS)
 
 
-def _read_report_thread(channel_id: str, report_ts: str) -> None:
-    """Read a report thread after two hours and persist the full commitment lifecycle."""
-    try:
-        response = slack_app.client.conversations_replies(channel=channel_id, ts=report_ts)
-        messages = response.get("messages", []) if isinstance(response, dict) else []
-        if not isinstance(messages, list):
-            messages = []
-        parent_text = next((str(m.get("text") or "") for m in messages if isinstance(m, dict) and m.get("ts") == report_ts), "")
-        human_texts = _human_thread_messages(messages, report_ts)
-        human_records = _human_thread_message_records(messages, report_ts)
-        google_client = _get_google_client()
-        if google_client is None:
-            return
-        pre = _extract_csat_for_commitment(parent_text, _report_problem(parent_text))
-        # No reply creates a silent `sem resposta` row; only missing deadlines
-        # receive a follow-up question in the thread.
-        if human_texts:
-            parsed = _extract_commitments_via_toqan(human_texts, parent_text)
-            commitments = [{"problema": _report_problem(parent_text), "data_inicio": _format_date(_today_brazil()), "resultado_pre": pre, "thread_ts": report_ts, **item} for item in parsed]
-            if commitments:
-                _save_compromissos(commitments, google_client)
-            _mark_report_messages_captured(report_ts, {timestamp for timestamp, _ in human_records})
-            if any(str(item.get("prazo")) == "a definir" for item in parsed):
-                slack_app.client.chat_postMessage(channel=channel_id, text="Qual o prazo para essa ação?", thread_ts=report_ts)
-            slack_app.client.chat_postMessage(channel=channel_id, text=f"Registrado: {len(commitments)} compromissos.", thread_ts=report_ts)
-        else:
-            _save_compromissos([{"problema": _report_problem(parent_text), "data_inicio": _format_date(_today_brazil()), "acao": "sem resposta", "prazo": "—", "resultado_pre": pre, "thread_ts": report_ts}], google_client)
-    except Exception:
-        logger.exception("Failed to read report thread for commitments")
+def _start_scheduler() -> None:
+    global _scheduler_thread
+    if _scheduler_thread is not None and _scheduler_thread.is_alive():
+        return
+    _scheduler_thread = threading.Thread(target=_scheduler_loop, name="lyra-scheduler", daemon=True)
+    _scheduler_thread.start()
 
 
-def _read_report_thread_late(channel_id: str, report_ts: str) -> None:
-    """Read the report thread again at 18:00 and persist only new replies."""
-    try:
-        response = slack_app.client.conversations_replies(channel=channel_id, ts=report_ts)
-        messages = response.get("messages", []) if isinstance(response, dict) else []
-        if not isinstance(messages, list):
-            messages = []
-        parent_text = next((str(m.get("text") or "") for m in messages if isinstance(m, dict) and m.get("ts") == report_ts), "")
-        new_records = _new_report_message_records(report_ts, _human_thread_message_records(messages, report_ts))
-        if not new_records:
-            return
-        google_client = _get_google_client()
-        if google_client is None:
-            return
-
-        parsed = _extract_commitments_via_toqan([text for _, text in new_records], parent_text)
-        _mark_report_messages_captured(report_ts, {timestamp for timestamp, _ in new_records})
-        if not parsed:
-            return
-
-        pre = _extract_csat_for_commitment(parent_text, _report_problem(parent_text))
-        commitments = [{"problema": _report_problem(parent_text), "data_inicio": _format_date(_today_brazil()), "resultado_pre": pre, "thread_ts": report_ts, **item} for item in parsed]
-        _save_compromissos(commitments, google_client)
-        if any(str(item.get("prazo")) == "a definir" for item in parsed):
-            slack_app.client.chat_postMessage(channel=channel_id, text="Qual o prazo para essa ação?", thread_ts=report_ts)
-        slack_app.client.chat_postMessage(channel=channel_id, text=f"Registrado: {len(commitments)} novos compromissos", thread_ts=report_ts)
-    except Exception:
-        logger.exception("Failed to read late report thread for commitments")
-
-def _mop_attachment(event: dict[str, Any]) -> dict[str, Any] | None:
-    """Return the first .xlsx file in an event, or None for ordinary messages."""
-    files = event.get("files") or []
-    if not isinstance(files, list):
-        return None
-    return next((file_info for file_info in files if isinstance(file_info, dict) and _is_xlsx_attachment(file_info)), None)
-
-
-def _process_mop_upload(event: dict[str, Any], client: Any) -> str | None:
-    """Process one xlsx mention; return None when the event is not an Excel upload."""
-    attachment = _mop_attachment(event)
-    if attachment is None:
-        return None
-    google_client = _get_google_client()
-    if google_client is None:
-        raise MOPGoogleCredentialsError
-    workbook_bytes = _download_slack_file(attachment, client)
-    _update_mop_sheet(workbook_bytes, google_client)
-    return MOP_SUCCESS_MESSAGE
-
-
+# ---------------------------------------------------------------------------
+# Slack events
+# ---------------------------------------------------------------------------
 def _say(say: Callable[..., Any], answer: str, event: dict[str, Any], in_thread: bool) -> None:
     if in_thread:
-        thread_ts = event.get("thread_ts") or event.get("ts")
-        say(text=answer, thread_ts=thread_ts)
+        say(text=answer, thread_ts=event.get("thread_ts") or event.get("ts"))
     else:
         say(text=answer)
 
 
-def _process_event(
-    event: dict[str, Any],
-    say: Callable[..., Any],
-    in_thread: bool,
-    client: Any = None,
-) -> None:
-    """Process an Excel MOP upload or relay an ordinary event to Toqan."""
+def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bool, client: Any = None) -> None:
+    """Processa upload de MOP ou repassa a mensagem para o Toqan."""
     event_key = _event_key(event)
     with _IN_FLIGHT_LOCK:
         if event_key in _IN_FLIGHT:
@@ -967,53 +1859,43 @@ def _process_event(
 
     question = _strip_mentions(str(event.get("text") or ""))
     try:
-        mop_answer = _process_mop_upload(event, client)
+        allowed, eps = _event_scope(event)
+        if not allowed:
+            is_im = event.get("channel_type") == "im"
+            _say(say, DM_NOT_ALLOWED_MESSAGE if is_im else CHANNEL_NOT_CONFIGURED_MESSAGE, event, in_thread)
+            return
+        mop_answer = _process_mop_upload(event, client, eps)
         if mop_answer is not None:
             _say(say, mop_answer, event, in_thread=True)
             return
-
         if not question:
             _say(say, "Oi! Sou a Lyra. Como posso ajudar?", event, in_thread)
             return
 
-        # Prepend live MOP worksheet context when the question is MOP-related.
-        conversation_id, request_id = create_conversation(_inject_mop_context(question))
-
         def send_progress(message: str) -> None:
-            # Progress always replies in the originating thread, including for
-            # events whose final answer is posted directly to a DM.
             _say(say, message, event, in_thread=True)
 
-        answer = get_answer(conversation_id, request_id, progress_callback=send_progress)
-        if not answer:
-            answer = EMPTY_ANSWER_MESSAGE
-        _say(say, answer, event, in_thread)
+        prompt = f"{_scope_instruction(eps)}\n\n{_inject_mop_context(question, eps)}"
+        answer = ask_toqan(prompt, progress_callback=send_progress)
+        _say(say, answer or EMPTY_ANSWER_MESSAGE, event, in_thread)
+    except MOPChannelNotAllowedError:
+        _say(say, MOP_CHANNEL_NOT_ALLOWED_MESSAGE, event, in_thread=True)
     except MOPGoogleCredentialsError as exc:
-        detail = str(exc) if str(exc) else ""
-        msg = f"Erro credenciais Google: {detail}" if detail else MOP_CREDENTIALS_ERROR_MESSAGE
-        logger.warning("MOP upload: Google credentials error: %s", detail)
-        _say(say, msg, event, in_thread=True)
+        logger.warning("MOP upload: Google credentials error: %s", exc)
+        _say(say, MOP_CREDENTIALS_ERROR_MESSAGE, event, in_thread=True)
     except MOPDownloadError as exc:
-        detail = str(exc) if str(exc) else ""
-        msg = f"Erro ao baixar arquivo: {detail}" if detail else MOP_DOWNLOAD_ERROR_MESSAGE
-        logger.warning("MOP upload could not download Slack file: %s", detail)
-        _say(say, msg, event, in_thread=True)
+        _say(say, f"Não consegui baixar o arquivo: {exc}" if str(exc) else MOP_DOWNLOAD_ERROR_MESSAGE, event, in_thread=True)
+    except MOPValidationError as exc:
+        _say(say, f"Não atualizei o MOP: {exc}. A planilha atual foi mantida.", event, in_thread=True)
     except MOPReadError as exc:
-        detail = str(exc) if str(exc) else ""
-        msg = f"Erro ao ler Excel: {detail}" if detail else MOP_READ_ERROR_MESSAGE
-        logger.warning("MOP upload: Excel read error: %s", detail)
-        _say(say, msg, event, in_thread=True)
+        logger.warning("MOP upload: Excel read error: %s", exc)
+        _say(say, MOP_READ_ERROR_MESSAGE, event, in_thread=True)
     except MOPSheetsError as exc:
-        detail = str(exc) if str(exc) else ""
-        msg = f"Erro ao atualizar MOP: {detail}" if detail else MOP_SHEETS_ERROR_MESSAGE
-        logger.warning("MOP upload could not update Google Sheets: %s", detail)
-        _say(say, msg, event, in_thread=True)
+        logger.warning("MOP upload could not update Google Sheets: %s", exc)
+        _say(say, MOP_SHEETS_ERROR_MESSAGE, event, in_thread=True)
     except ToqanAPIError as exc:
         logger.exception("Lyra could not process Slack event")
-        if "polling timed out" in str(exc):
-            _say(say, TIMEOUT_ERROR_MESSAGE, event, in_thread)
-        else:
-            _say(say, ERROR_MESSAGE, event, in_thread)
+        _say(say, TIMEOUT_ERROR_MESSAGE if "polling timed out" in str(exc) else ERROR_MESSAGE, event, in_thread)
     except Exception:
         logger.exception("Lyra could not process Slack event")
         _say(say, ERROR_MESSAGE, event, in_thread)
@@ -1023,7 +1905,6 @@ def _process_event(
 
 
 def _dispatch(event: dict[str, Any], say: Callable[..., Any], client: Any, ack: Callable[[], Any]) -> None:
-    """Acknowledge quickly, show processing state, and run the relay worker."""
     ack()
     channel = event.get("channel")
     timestamp = event.get("ts")
@@ -1050,8 +1931,6 @@ def _dispatch(event: dict[str, Any], say: Callable[..., Any], client: Any, ack: 
                 except Exception:
                     logger.debug("Could not add done reaction", exc_info=True)
 
-    # Keep the event acknowledgement fast while allowing the Toqan poll to run
-    # for up to about one minute in the background.
     try:
         threading.Thread(target=worker, name=f"lyra-{event_key}", daemon=True).start()
     except Exception:
@@ -1065,82 +1944,53 @@ def handle_app_mention(event, say, client, ack):
 
 @slack_app.event("message")
 def handle_message(event, say, client, ack):
-    # MOP Excel uploads marked @Lyra are processed in ANY channel the bot is
-    # in (e.g. #testes-novo-oraculo), not only the daily-report channel:
-    # _process_mop_upload is channel-agnostic. Ordinary conversation is only
-    # relayed from direct messages; channel messages need an app_mention.
+    # Em canal, a conversa precisa de @menção (tratada em app_mention).
+    # Em DM, aceita texto e arquivo (subtype "file_share").
     if event.get("bot_id"):
         ack()
         return
     is_im = event.get("channel_type") == "im"
-    has_mop_excel = _mop_attachment(event) is not None and "<@" in str(event.get("text") or "")
-    if (is_im and not event.get("subtype")) or has_mop_excel:
+    if is_im and event.get("subtype") in (None, "file_share"):
         _dispatch(event, say, client, ack)
     else:
         ack()
 
 
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
 @flask_app.get("/")
 @flask_app.get("/health")
 def health():
-    return jsonify({"status": "ok", "service": "lyra-slack-bot"}), 200
+    alive = _scheduler_thread is not None and _scheduler_thread.is_alive()
+    return jsonify({
+        "status": "ok",
+        "service": "lyra-slack-bot",
+        "scheduler_alive": alive,
+        "last_tick": _scheduler_last_tick.isoformat() if _scheduler_last_tick else None,
+    }), 200
 
 
-@flask_app.get("/debug/create-compromissos")
-def debug_create_compromissos():
-    """Create the Compromissos worksheet if it doesn't exist. Temporary debug endpoint."""
+def _debug_allowed() -> bool:
+    return bool(DEBUG_TOKEN) and request.headers.get("X-Debug-Token") == DEBUG_TOKEN
+
+
+@flask_app.get("/debug/status")
+def debug_status():
+    """Diagnóstico protegido (header X-Debug-Token). Sem DEBUG_TOKEN, responde 404."""
+    if not _debug_allowed():
+        return jsonify({"error": "not found"}), 404
+    result: dict[str, Any] = {"state_persistent": STATE.persistent}
     try:
         google_client = _get_google_client()
-        if google_client is None:
-            return jsonify({"error": "Google credentials not configured"}), 500
-        spreadsheet = google_client.open_by_key(MOP_SPREADSHEET_ID)
-        worksheet = _compromissos_worksheet(spreadsheet, create=True)
-        return jsonify({"ok": True, "worksheet": worksheet.title, "id": worksheet.id})
+        spreadsheet = _open_spreadsheet(google_client)
+        result["sheets_ok"] = True
+        result["worksheets"] = [ws.title for ws in spreadsheet.worksheets()]
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-
-
-@flask_app.get("/debug/mop")
-def debug_mop():
-    """Debug endpoint to check Google Sheets connection — temporary."""
-    import base64 as b64
-    raw = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
-    result = {"env_set": bool(raw), "env_length": len(raw)}
-    
-    # Check if it's base64 or raw JSON
-    if raw:
-        try:
-            decoded = b64.b64decode(raw)
-            creds_json = json.loads(decoded)
-            result["format"] = "base64"
-        except Exception:
-            try:
-                creds_json = json.loads(raw)
-                result["format"] = "raw_json"
-            except Exception as e:
-                result["format"] = "INVALID"
-                result["error"] = str(e)
-                return jsonify(result), 200
-        
-        result["client_email"] = creds_json.get("client_email", "NOT FOUND")
-        result["has_private_key"] = bool(creds_json.get("private_key"))
-        
-        # Try to connect
-        try:
-            from google.oauth2.service_account import Credentials
-            import gspread
-            scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-            creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
-            gc = gspread.authorize(creds)
-            spreadsheet = gc.open_by_key("1Up11UQ1j0h9t8KW276AxJPGfEsShs9AsUztF5PAmyyE")
-            result["sheets_ok"] = True
-            result["spreadsheet_title"] = spreadsheet.title
-            worksheets = spreadsheet.worksheets()
-            result["worksheets"] = [{"name": ws.title, "gid": ws.id} for ws in worksheets]
-        except Exception as e:
-            result["sheets_ok"] = False
-            result["sheets_error"] = f"{type(e).__name__}: {str(e)}"
-    
+        result["sheets_ok"] = False
+        result["sheets_error"] = type(exc).__name__
+    today = _now_brazil().date().isoformat()
+    result["today"] = {k: v for k, v in STATE.snapshot().items() if today in k and not k.startswith("captured:")}
     return jsonify(result), 200
 
 
@@ -1149,175 +1999,7 @@ def slack_events():
     return slack_handler.handle(request)
 
 
-def _next_run_time_brazil() -> float:
-    """Return seconds until the next 09:00 in America/Sao_Paulo."""
-    now_utc = datetime.now(timezone.utc)
-    now_brazil = now_utc.astimezone(BRAZIL_TIMEZONE)
-    target_date = now_brazil.date()
-    if now_brazil.time() >= datetime_time(DAILY_REPORT_HOUR, 0):
-        target_date += timedelta(days=1)
-    target_brazil = datetime.combine(
-        target_date,
-        datetime_time(DAILY_REPORT_HOUR, 0),
-        tzinfo=BRAZIL_TIMEZONE,
-    )
-    return max(0.0, (target_brazil.astimezone(timezone.utc) - now_utc).total_seconds())
-
-
-def _run_daily_report() -> None:
-    """Run and publish the CSAT report, updating commitment deadlines from it."""
-    google_client = None
-    try:
-        google_client = _get_google_client()
-    except Exception:
-        logger.warning("Daily report: Google Sheets unavailable; skipping commitments", exc_info=True)
-
-    compromissos_text = ""
-    if google_client is not None:
-        try:
-            spreadsheet = google_client.open_by_key(MOP_SPREADSHEET_ID)
-            worksheet = _compromissos_worksheet(spreadsheet)
-            _ensure_compromissos_headers(worksheet)
-            compromissos_text = _get_open_compromissos(google_client)
-        except Exception:
-            logger.warning("Daily report: could not prepare commitments", exc_info=True)
-
-    prompt = compromissos_text + ("\n\n" if compromissos_text else "") + DAILY_REPORT_PROMPT
-    conversation_id, request_id = create_conversation(prompt)
-    answer = _clean_answer(get_answer(conversation_id, request_id)) or EMPTY_ANSWER_MESSAGE
-
-    # The report already contains D-1 CSAT by fila. Use it as the lifecycle
-    # source of truth for due/overdue commitments; a missing match remains open
-    # and is retried on the next report rather than being guessed.
-    if google_client is not None:
-        try:
-            _check_deadline_compromissos(google_client, answer)
-        except Exception:
-            logger.warning("Daily report: could not update commitment deadlines", exc_info=True)
-
-    response = slack_app.client.chat_postMessage(channel=DAILY_REPORT_CHANNEL, text=answer)
-    report_ts = response.get("ts") or response.get("message", {}).get("ts") if isinstance(response, dict) else None
-    if report_ts:
-        _schedule_daily_report(DAILY_REPORT_CHANNEL, report_ts)
-
-
-
-def _schedule_daily_report(channel_id: str, report_ts: str) -> None:
-    """Schedule the initial two-hour and late 18:00 thread reads."""
-    with _REPORT_FOLLOWUP_LOCK:
-        _REPORT_FOLLOWUP_THREADS.add(report_ts)
-    try:
-        threading.Timer(
-            COMPROMISSOS_THREAD_DELAY_SECONDS,
-            _read_report_thread,
-            args=(channel_id, report_ts),
-        ).start()
-        threading.Timer(
-            COMPROMISSOS_LATE_THREAD_DELAY_SECONDS,
-            _read_report_thread_late,
-            args=(channel_id, report_ts),
-        ).start()
-    except Exception:
-        logger.exception("Could not schedule commitment thread reads")
-
-
-def _is_business_day(day: date) -> bool:
-    """Business day = weekday. Weekends are skipped; holidays are intentionally
-    NOT handled (a holiday firing is accepted as-is)."""
-    return day.weekday() < 5
-
-
-def _next_business_day(day: date) -> date:
-    """Roll a date forward to the next business day when it falls on a weekend."""
-    while not _is_business_day(day):
-        day += timedelta(days=1)
-    return day
-
-
-def _first_business_day(year: int, month: int) -> date:
-    """1st business day of a month (the 1st rolls forward off a weekend)."""
-    return _next_business_day(date(year, month, 1))
-
-
-def _mop_fire_dates_for_month(year: int, month: int) -> list[date]:
-    """The two MOP cobrança dates of a month: the 1st business day and day 15
-    (or the next business day when day 15 falls on a weekend)."""
-    return [
-        _first_business_day(year, month),
-        _next_business_day(date(year, month, 15)),
-    ]
-
-
-def _next_mop_fire_at(now: datetime) -> datetime:
-    """Next MOP cobrança datetime at MOP_CHECK_HOUR in America/Sao_Paulo.
-
-    Fires on (a) the 1st business day of each month and (b) day 15 of each
-    month (weekend rolled to the next business day). Holidays are not handled.
-    ``now`` must be timezone-aware. A restart after 14:00 on a firing day skips
-    that day's post instead of sending it late.
-    """
-    months = [(now.year, now.month)]
-    months.append((now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1))
-    candidates: list[datetime] = []
-    for year, month in months:
-        for fire_date in _mop_fire_dates_for_month(year, month):
-            candidates.append(
-                datetime.combine(fire_date, datetime_time(MOP_CHECK_HOUR, 0), tzinfo=BRAZIL_TIMEZONE)
-            )
-    upcoming = [candidate for candidate in candidates if candidate > now]
-    return min(upcoming)
-
-
-def _next_mop_run_time(now: datetime | None = None) -> float:
-    """Seconds until the next MOP cobrança (1st business day and day 15, 14h)."""
-    now_brazil = now if now is not None else datetime.now(BRAZIL_TIMEZONE)
-    if now_brazil.tzinfo is None:
-        now_brazil = now_brazil.replace(tzinfo=BRAZIL_TIMEZONE)
-    now_brazil = now_brazil.astimezone(BRAZIL_TIMEZONE)
-    target = _next_mop_fire_at(now_brazil)
-    return max(0.0, (target.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds())
-
-
-def _mop_check_loop() -> None:
-    """Sleep until each MOP cobrança (1st business day and day 15, 14h Brazil)."""
-    while True:
-        wait_seconds = _next_mop_run_time()
-        logger.info(
-            "MOP check: sleeping %.0fs until next 1st-business-day/day-15 14:00 Brazil time",
-            wait_seconds,
-        )
-        time.sleep(wait_seconds)
-        try:
-            slack_app.client.chat_postMessage(channel=DAILY_REPORT_CHANNEL, text=MOP_CHECK_MESSAGE)
-        except Exception:
-            logger.exception("MOP check post failed")
-
-
-def _start_mop_scheduler() -> None:
-    """Start daemon thread for the monthly MOP cadence (1st business day + day 15)."""
-    thread = threading.Thread(target=_mop_check_loop, name="lyra-mop-check", daemon=True)
-    thread.start()
-
-
-def _daily_report_loop() -> None:
-    """Sleep until each 09:00 Brazil run and isolate failures per run."""
-    while True:
-        wait_seconds = _next_run_time_brazil()
-        logger.info("Daily report: sleeping %.0fs until next 09:00 Brazil time", wait_seconds)
-        time.sleep(wait_seconds)
-        try:
-            _run_daily_report()
-        except Exception:
-            logger.exception("Daily report failed")
-
-
-def _start_daily_report_scheduler() -> None:
-    """Start one daemon scheduler thread for this process."""
-    thread = threading.Thread(target=_daily_report_loop, name="lyra-daily-report", daemon=True)
-    thread.start()
-
-
 if __name__ == "__main__":
-    _start_daily_report_scheduler()
-    _start_mop_scheduler()
+    # Rode com `python app.py` (Procfile) e UMA réplica: o agendador vive neste processo.
+    _start_scheduler()
     flask_app.run(host="0.0.0.0", port=PORT)
