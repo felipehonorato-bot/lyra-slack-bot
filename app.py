@@ -1,4 +1,11 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v3.5).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v3.7).
+
+v3.7 — monitoramento dos agentes (Lyra + MONITORED_AGENTS: Nexus, Vera, ClubIA…) 4x ao dia, DM só quando
+um agente para ou volta; lembrete do token do Databricks no 6º dia (validade de 7 dias a partir de
+"troquei o token" na DM, ou inferida quando um agente volta depois de erro de token).
+
+v3.6 — MOP conversacional: span por supervisor/coordenador, busca das pessoas citadas na
+pergunta (só da EPS do canal) e envio do Excel do MOP quando pedem ("me manda o MOP").
 
 v3.5 — duas planilhas: MOP oficial em MOP_SPREADSHEET_ID (aba MOP Consolidado);
 Compromissos, Estado Lyra e MOP backup em LYRA_SPREADSHEET_ID.
@@ -182,7 +189,9 @@ MOP_CHANNEL_NOT_ALLOWED_MESSAGE = (
 MOP_INTENT_KEYWORDS = (
     "mop", "hierarquia", "analista", "anlista", "equipe", "pessoas", "efetivo",
     "headcount", "supervisor", "coordenador", "célula", "celula", "pilar",
-    "oráculo", "oraculo", "variante", "eps",
+    "oráculo", "oraculo", "variante", "eps", "span", "spam", "gestor", "gestão", "gestao",
+    "time do", "time da", "turno", "escala", "férias", "ferias", "licença", "licenca",
+    "entrada", "saída", "saida", "formato de trabalho", "remoto", "presencial", "quem é", "quem e",
 )
 
 # Canal do fluxo "Reportar Oráculo": o Excel do MOP postado na thread de um chamado
@@ -229,10 +238,33 @@ MOP_MISSING_ALERT_TIME = datetime_time(18, 0)
 MOP_UPDATE_GRACE_DAYS = 2  # atualização feita até 2 dias antes também conta
 SCHEDULER_TICK_SECONDS = 60
 
+# --- Saúde dos agentes e do token do Databricks ---------------------------------------
+# Agentes monitorados além da Lyra: "Nexus:<api_key>,Vera:<api_key>,ClubIA:<api_key>"
+MONITORED_AGENTS = _parse_channel_map(os.getenv("MONITORED_AGENTS", ""))
+AGENT_CHECK_TIMES = [
+    datetime_time(int(h), 30) for h in os.getenv("AGENT_CHECK_HOURS", "7,11,15,19").split(",") if h.strip().isdigit()
+]
+AGENT_CHECK_MAX_POLLS = 30  # 30 x 10s = 5 min por agente
+# O token do Databricks dura DATABRICKS_TOKEN_VALIDITY_DAYS a partir da troca.
+DATABRICKS_TOKEN_VALIDITY_DAYS = int(os.getenv("DATABRICKS_TOKEN_VALIDITY_DAYS", "7"))
+# Agentes que usam o MESMO token do Databricks (só para o texto do alerta)
+SHARED_TOKEN_AGENTS = [a.strip() for a in os.getenv("SHARED_TOKEN_AGENTS", "Nexus,Vera,ClubIA").split(",") if a.strip()]
+DATABRICKS_TOKEN_RENEWED = os.getenv("DATABRICKS_TOKEN_RENEWED", "").strip()  # opcional: data da última troca
+TOKEN_REMINDER_TIME = datetime_time(9, 30)
+TOKEN_ERROR_HINTS = ("403", "401", "invalid access token", "token", "unauthorized", "unauthenticated",
+                     "expired", "expirado", "permission", "permiss", "credential", "credencia")
+HEALTHCHECK_PROMPT = (
+    "TAREFA INTERNA DE MONITORAMENTO — não é pergunta de usuário e não vai para o Slack.\n"
+    "Faça uma consulta mínima na sua fonte de dados (no Databricks, por exemplo: "
+    "SELECT COUNT(*) AS n FROM saex.gold.cx_support WHERE dt >= date_sub(current_date(), 2)). "
+    "Se você usa subagentes, peça ao subagente de dados com 'EPS: iFood' e 'Pedido: verificação de acesso'.\n"
+    "Responda APENAS uma linha: 'OK <n>' se conseguiu consultar, ou 'ERRO: <mensagem técnica exata do erro>' se falhou."
+)
+
 THREAD_DELIMITER = "===THREAD==="
 
 DAILY_REPORT_PROMPT = (
-    "Report diário de CSAT — execute o Bloco 3 do seu prompt (report de indicadores). "
+    "Report diário de CSAT — execute o report diário do seu prompt (seção Report diário / Bloco 3). "
     "Siga a estrutura completa da mensagem principal: compromissos de ontem (se houver), "
     "Principais resultados por fila (Mês, D-1, n e variação vs D-2), Maior impacto em p.p., "
     "Cobranças, Status dos compromissos e o fechamento pedindo o plano na thread "
@@ -431,13 +463,13 @@ def _require_toqan_key() -> str:
     return api_key
 
 
-def _toqan_request(method: str, payload: dict[str, str]) -> dict[str, Any]:
-    """Make one authenticated JSON request to the Toqan Agent API."""
+def _toqan_request(method: str, payload: dict[str, str], api_key: str | None = None) -> dict[str, Any]:
+    """Make one authenticated JSON request to the Toqan Agent API (chave da Lyra por padrão)."""
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url=f"{TOQAN_BASE_URL}/{method}",
         data=body,
-        headers={"X-Api-Key": _require_toqan_key(), "Content-Type": "application/json"},
+        headers={"X-Api-Key": api_key or _require_toqan_key(), "Content-Type": "application/json"},
         method="POST" if method == "create_conversation" else "GET",
     )
     try:
@@ -458,8 +490,8 @@ def _toqan_request(method: str, payload: dict[str, str]) -> dict[str, Any]:
     return data
 
 
-def create_conversation(user_message: str) -> tuple[str, str]:
-    data = _toqan_request("create_conversation", {"user_message": user_message})
+def create_conversation(user_message: str, api_key: str | None = None) -> tuple[str, str]:
+    data = _toqan_request("create_conversation", {"user_message": user_message}, api_key)
     conversation_id = data.get("conversation_id")
     request_id = data.get("request_id")
     if not isinstance(conversation_id, str) or not conversation_id:
@@ -473,11 +505,13 @@ def get_answer(
     conversation_id: str,
     request_id: str,
     progress_callback: Callable[[str], Any] | None = None,
+    api_key: str | None = None,
+    max_attempts: int = MAX_POLL_ATTEMPTS,
 ) -> str:
     """Poll Toqan until the answer is finished or the poll limit is reached."""
     payload = {"conversation_id": conversation_id, "request_id": request_id}
-    for attempt in range(MAX_POLL_ATTEMPTS):
-        data = _toqan_request("get_answer", payload)
+    for attempt in range(max_attempts):
+        data = _toqan_request("get_answer", payload, api_key)
         if data.get("status") == "finished":
             answer = data.get("answer", "")
             if not isinstance(answer, str):
@@ -496,7 +530,7 @@ def get_answer(
             except Exception:
                 logger.warning("Could not send Toqan progress message", exc_info=True)
 
-        if attempt < MAX_POLL_ATTEMPTS - 1:
+        if attempt < max_attempts - 1:
             time.sleep(POLL_INTERVAL_SECONDS)
     raise ToqanAPIError("Toqan answer polling timed out")
 
@@ -1075,8 +1109,24 @@ def _mop_summary_text(google_client: Any = None, eps: str | None = None, values:
     add_group("Por Pilar", "pilar")
     add_group("Por Versão do Oráculo", "versão do oráculo", "versao do oraculo", "oráculo", "oraculo")
     add_group("Total por Célula (top 10)", "célula", "celula", limit=10)
-    add_group("Por Supervisor (top 15)", "supervisor")
-    add_group("Por Coordenador", "coordenador")
+    add_group("Span por supervisor (pessoas por supervisor)", "supervisor", limit=80)
+    add_group("Pessoas por coordenador", "coordenador", limit=40)
+    sup_idx = _mop_column_index(header_index, "supervisor")
+    coord_idx = _mop_column_index(header_index, "coordenador")
+    sup_counts = _mop_counts(data_rows, sup_idx)
+    if sup_counts:
+        lines.extend(["", f"Span médio: {len(data_rows) / len(sup_counts):.1f} pessoas por supervisor ({len(sup_counts)} supervisores)"])
+    if sup_idx is not None and coord_idx is not None:
+        sups_by_coord: dict[str, set[str]] = {}
+        for row in data_rows:
+            coord = str(row[coord_idx] if coord_idx < len(row) else "").strip()
+            sup = str(row[sup_idx] if sup_idx < len(row) else "").strip()
+            if coord and sup:
+                sups_by_coord.setdefault(coord, set()).add(sup.casefold())
+        if sups_by_coord:
+            lines.extend(["", "Span por coordenador (supervisores por coordenador):"])
+            for coord, sups in sorted(sups_by_coord.items(), key=lambda item: (-len(item[1]), item[0])):
+                lines.append(f"- {coord}: {len(sups)}")
     add_group("Por horário de Entrada", "entrada", limit=8)
     add_group("Por horário de Saída", "saída", "saida", limit=8)
     updated = STATE.get(f"mop_updated_at:{eps or CONSOLIDATED}")
@@ -1096,10 +1146,11 @@ INTERNAL_NOTE = (
 )
 
 
-def _mop_situation(eps: str | None) -> str:
+def _mop_situation(eps: str | None, values: list[list[str]] | None = None) -> str:
     """Situação do MOP em linguagem de negócio, sempre preenchida."""
     who = f"da {eps}" if eps else "da operação"
-    values = _read_mop_values()
+    if values is None:
+        values = _read_mop_values()
     if values is None:
         return (
             f"Situação do MOP {who}: não deu para consultar o MOP agora (instabilidade). "
@@ -1117,10 +1168,138 @@ def _mop_situation(eps: str | None) -> str:
     )
 
 
+_LOOKUP_STOPWORDS = {
+    "mop", "quem", "qual", "quais", "quantas", "quantos", "pessoas", "pessoa", "supervisor", "supervisora",
+    "coordenador", "coordenadora", "celula", "equipe", "time", "esta", "estao", "onde", "como", "sobre",
+    "tem", "temos", "para", "pela", "pelo", "dele", "dela", "deles", "delas", "esse", "essa", "isso",
+    "lyra", "analista", "analistas", "operador", "operadores", "lista", "manda", "mandar", "favor",
+    "turno", "entrada", "saida", "status", "ativo", "ativos", "ferias", "licenca", "maior", "menor",
+    "span", "spam", "gestao", "gestor", "hoje", "agora", "todos", "todas", "aqui", "voces", "nosso", "nossa",
+    "trabalha", "trabalham", "horario", "formato", "remoto", "presencial", "oraculo", "versao", "variante",
+}
+MOP_LOOKUP_LIMIT = 40
+
+
+def _mop_lookup_rows(question: str, values: list[list[str]], eps: str | None) -> list[str]:
+    """Linhas do MOP que batem com nomes/e-mails/supervisores citados na pergunta (só da EPS do canal)."""
+    if not values or len(values) < 2:
+        return []
+    header = values[0]
+    tokens = [t for t in re.findall(r"[a-z0-9.]+", _norm_text(question)) if len(t) >= 4 and t not in _LOOKUP_STOPWORDS]
+    if not tokens:
+        return []
+    cols = {name: _find_col(header, name) for name in (
+        "Nome", "Email", "Célula", "Supervisor", "Coordenador", "Entrada", "Saída", "Status",
+        "Versão do Oráculo", "Formato de Trabalho", "EPS", "Pilar")}
+    eps_col, email_col = cols["EPS"], cols["Email"]
+
+    def cell(row: list[str], name: str) -> str:
+        idx = cols[name]
+        return str(row[idx]).strip() if idx is not None and idx < len(row) else ""
+
+    scored: list[tuple[int, list[str]]] = []
+    for row in values[1:]:
+        if not any(str(c).strip() for c in row):
+            continue
+        if eps and not _eps_matches(_row_eps(row, eps_col, email_col), eps):
+            continue
+        blob = _norm_text(" ".join(cell(row, n) for n in ("Nome", "Email", "Supervisor", "Coordenador", "Célula")))
+        score = sum(1 for t in set(tokens) if t in blob)
+        if score:
+            scored.append((score, row))
+    if not scored:
+        return []
+    best = max(score for score, _ in scored)
+    rows = [row for score, row in scored if score == best][:MOP_LOOKUP_LIMIT]
+    lines = []
+    for row in rows:
+        user = cell(row, "Email").split("@")[0]
+        lines.append(
+            f"- {cell(row, 'Nome')} ({user}) · célula {cell(row, 'Célula') or '—'} · supervisor {cell(row, 'Supervisor') or '—'} "
+            f"· coordenador {cell(row, 'Coordenador') or '—'} · {cell(row, 'Entrada') or '—'}–{cell(row, 'Saída') or '—'} "
+            f"· {cell(row, 'Status') or '—'} · {cell(row, 'Versão do Oráculo') or '—'} · {cell(row, 'Formato de Trabalho') or '—'}"
+        )
+    total = len([1 for score, _ in scored if score == best])
+    if total > len(rows):
+        lines.append(f"- (+{total - len(rows)} pessoas)")
+    return lines
+
+
+_EXPORT_RE = re.compile(
+    r"\b(manda|mande|mandar|envia|envie|enviar|extrai|extraia|extrair|exporta|exporte|exportar|baixa|baixar|"
+    r"gera|gere|gerar|passa|passe|compartilha|compartilhe)\b.*\bmop\b|\bmop\b.*\b(excel|xlsx|planilha|arquivo)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_mop_export_request(question: str) -> bool:
+    return bool(_EXPORT_RE.search(_norm_text(question)))
+
+
+def _build_mop_xlsx(values: list[list[str]], eps: str | None) -> tuple[bytes, int]:
+    """Excel do MOP (só a EPS do canal, ou tudo na visão interna). Devolve (bytes, pessoas)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    header = values[0]
+    eps_col, email_col = _find_col(header, "EPS"), _find_col(header, "Email")
+    rows = [
+        r for r in values[1:]
+        if any(str(c).strip() for c in r) and (not eps or _eps_matches(_row_eps(r, eps_col, email_col), eps))
+    ]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"MOP {eps}" if eps else "MOP Consolidado"
+    ws.append(list(header))
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="EA1D2C")
+    for r in rows:
+        ws.append(list(r) + [""] * (len(header) - len(r)))
+    for idx, name in enumerate(header, start=1):
+        width = max([len(str(name))] + [len(str(r[idx - 1])) for r in rows[:300] if idx - 1 < len(r)])
+        ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = min(max(width + 2, 10), 45)
+    ws.freeze_panes = "A2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue(), len(rows)
+
+
+def _send_mop_export(event: dict[str, Any], client: Any, eps: str | None) -> str | None:
+    """Gera e envia o Excel do MOP na thread. Devolve texto de resposta se não deu para enviar."""
+    values = _read_mop_values()
+    if values is None:
+        return "Não consegui puxar o MOP agora. Tenta de novo em alguns minutos?"
+    if len(values) < 2:
+        return "O MOP ainda está vazio por aqui."
+    content, people = _build_mop_xlsx(values, eps)
+    if people == 0:
+        return f"Ainda não tenho ninguém da {eps} no MOP." if eps else "O MOP ainda está vazio por aqui."
+    who = f" da {eps}" if eps else ""
+    stamp = _now_brazil().strftime("%d-%m-%Y")
+    uploader = client or slack_app.client
+    uploader.files_upload_v2(
+        channel=event.get("channel"),
+        thread_ts=event.get("thread_ts") or event.get("ts"),
+        content=content,
+        filename=f"MOP{('_' + eps) if eps else '_Consolidado'}_{stamp}.xlsx",
+        title=f"MOP{who} — {stamp}",
+        initial_comment=f"Segue o MOP{who} atualizado 📋",
+    )
+    return None
+
+
 def _inject_mop_context(question: str, eps: str | None = None) -> str:
-    if not question or not _question_has_mop_intent(question):
+    if not question:
         return question
-    return f"{INTERNAL_NOTE}\n{_mop_situation(eps)}\n\nMensagem de quem perguntou: {question}"
+    values = _read_mop_values() if _question_has_mop_intent(question) else None
+    people = _mop_lookup_rows(question, values or [], eps) if values else []
+    if not _question_has_mop_intent(question) and not people:
+        return question
+    extra = ""
+    if people:
+        extra = "\nPessoas do MOP citadas na pergunta (nome · usuário · célula · supervisor · coordenador · turno · status · Oráculo · formato):\n" + "\n".join(people)
+    return f"{INTERNAL_NOTE}\n{_mop_situation(eps, values)}{extra}\n\nMensagem de quem perguntou: {question}"
 
 
 def _mop_attachment(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -1860,6 +2039,165 @@ def _is_mop_day(day: date) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Saúde dos agentes (Lyra, Nexus, Vera, ClubIA...) e do token do Databricks
+# ---------------------------------------------------------------------------
+def _parse_any_date(value: str) -> date | None:
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(value.strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _looks_like_token_error(text: str) -> bool:
+    low = str(text or "").casefold()
+    return any(hint in low for hint in TOKEN_ERROR_HINTS)
+
+
+def _monitored_agents() -> list[tuple[str, str | None]]:
+    """(nome, api_key). A Lyra usa a TOQAN_API_KEY (None)."""
+    return [("Lyra", None)] + [(name, key) for name, key in MONITORED_AGENTS.items()]
+
+
+def _ask_agent(api_key: str | None, prompt: str) -> str:
+    conversation_id, request_id = create_conversation(prompt, api_key)
+    return get_answer(conversation_id, request_id, api_key=api_key, max_attempts=AGENT_CHECK_MAX_POLLS)
+
+
+def _check_agent(name: str, api_key: str | None) -> tuple[str, str]:
+    """('ok' | 'token' | 'erro' | 'fora', detalhe). Nunca levanta exceção."""
+    try:
+        answer = _ask_agent(api_key, HEALTHCHECK_PROMPT).strip()
+    except ToqanAPIError as exc:
+        if "timed out" in str(exc):
+            return "fora", "não respondeu em 5 minutos"
+        return "fora", f"API do Toqan: {str(exc)[:120]}"
+    except Exception as exc:
+        return "fora", f"{type(exc).__name__}: {str(exc)[:120]}"
+    first = next((line.strip() for line in answer.splitlines() if line.strip()), "")
+    if first.upper().lstrip("*_ ").startswith("OK"):
+        return "ok", first[:60]
+    if not first:
+        return "fora", "resposta vazia"
+    if _looks_like_token_error(answer):
+        return "token", first[:200]
+    if first.upper().lstrip("*_ ").startswith("ERRO"):
+        return "erro", first[:200]
+    # respondeu, mas fora do padrão: está vivo; não alarma
+    return "ok", "respondeu (fora do padrão)"
+
+
+_STATUS_LABEL = {
+    "ok": "✅ funcionando",
+    "token": "🔴 token do Databricks expirado/sem permissão",
+    "erro": "🟡 erro ao consultar dados",
+    "fora": "🔴 sem resposta",
+}
+
+
+def _token_expiry() -> date | None:
+    renewed = _parse_any_date(STATE.get("token_renewed") or DATABRICKS_TOKEN_RENEWED or "")
+    return renewed + timedelta(days=DATABRICKS_TOKEN_VALIDITY_DAYS) if renewed else None
+
+
+def _mark_token_renewed(day: date) -> date:
+    STATE.set("token_renewed", day.isoformat())
+    return day + timedelta(days=DATABRICKS_TOKEN_VALIDITY_DAYS)
+
+
+def _run_agent_checks(now: datetime) -> dict[str, tuple[str, str]]:
+    """Testa todos os agentes, grava o status e avisa só nas mudanças."""
+    results: dict[str, tuple[str, str]] = {}
+    broke: list[str] = []
+    recovered: list[str] = []
+    token_fixed = False
+    for name, key in _monitored_agents():
+        status, detail = _check_agent(name, key)
+        results[name] = (status, detail)
+        previous = STATE.get(f"agent_status:{name}")
+        STATE.set(f"agent_status:{name}", status)
+        if status != "ok" and previous != status:
+            broke.append(f"• *{name}:* {_STATUS_LABEL[status]} — {detail}")
+        elif status == "ok" and previous and previous != "ok":
+            recovered.append(name)
+            token_fixed = token_fixed or previous == "token"
+    if broke:
+        text = "Agente(s) com problema:\n" + "\n".join(broke)
+        if any(results[n][0] == "token" for n, _ in _monitored_agents()):
+            others = [a for a in SHARED_TOKEN_AGENTS if a not in results]
+            if others:
+                text += f"\n⚠️ O token é o mesmo de {', '.join(others)} — eles também devem estar sem acesso aos dados."
+            text += "\nPra token: Databricks → Settings → Developer → Access tokens, gere um novo e atualize no Toqan. Depois me manda \"troquei o token\"."
+        _alert(text)
+    if recovered:
+        _alert(f"Voltou a funcionar ✅ {', '.join(recovered)}")
+    if token_fixed:
+        expiry = _mark_token_renewed(now.date())  # voltou depois de erro de token = token trocado
+        logger.info("Token renewal inferred; next expiry %s", expiry)
+    return results
+
+
+def _agents_summary(results: dict[str, tuple[str, str]]) -> str:
+    lines = ["*Status dos agentes:*"]
+    for name, (status, detail) in results.items():
+        lines.append(f"• *{name}:* {_STATUS_LABEL[status]}" + ("" if status == "ok" else f" — {detail}"))
+    expiry = _token_expiry()
+    if expiry:
+        lines.append(f"Token do Databricks: vence em {_format_date(expiry)} (lembro você na véspera).")
+    return "\n".join(lines)
+
+
+def _token_reminder_tick(now: datetime) -> None:
+    expiry = _token_expiry()
+    if not expiry or now.time() < TOKEN_REMINDER_TIME:
+        return
+    today = now.date()
+    key = f"token_reminder:{today.isoformat()}"
+    if STATE.get(key):
+        return
+    days_left = (expiry - today).days
+    if days_left == 1:
+        _alert(f"Lembrete: o token do Databricks (Lyra, Nexus, Vera, ClubIA…) vence amanhã ({_format_date(expiry)}). "
+               "Bom momento pra gerar o novo e atualizar no Toqan — depois me manda \"troquei o token\".")
+    elif days_left == 0:
+        _alert("O token do Databricks vence HOJE. Gere o novo e atualize no Toqan — depois me manda \"troquei o token\".")
+    elif days_left < 0:
+        _alert(f"O token do Databricks venceu em {_format_date(expiry)}. Se já trocou, me manda \"troquei o token\".")
+    STATE.set(key, str(days_left))
+
+
+def _agent_health_tick(now: datetime) -> None:
+    _token_reminder_tick(now)
+    today = now.date()
+    due = [t for t in AGENT_CHECK_TIMES if now.time() >= t]
+    if not due:
+        return
+    slot = max(due)
+    key = f"agent_check:{today.isoformat()}:{slot.strftime('%H%M')}"
+    if STATE.get(key):
+        return
+    STATE.set(key, "rodando")
+    _run_agent_checks(now)
+    STATE.set(key, "ok")
+
+
+_DATA_TEST_RE = re.compile(
+    r"\b(testa|teste|testar|verifica|verificar|checa|checar|status|como estao|como esta)\b.*"
+    r"\b(databricks|token|dados|base|agentes?|nexus|vera|clubia|lyra)\b"
+)
+_TOKEN_RENEWED_RE = re.compile(r"\b(troquei|renovei|atualizei|gerei|trocamos|renovamos)\b.*\btokens?\b")
+
+
+def _is_data_test_request(question: str) -> bool:
+    return bool(_DATA_TEST_RE.search(_norm_text(question)))
+
+
+def _is_token_renewed_message(question: str) -> bool:
+    return bool(_TOKEN_RENEWED_RE.search(_norm_text(question)))
+
+
+# ---------------------------------------------------------------------------
 # Agendador único
 # ---------------------------------------------------------------------------
 _report_next_attempt_at: dict[str, datetime] = {}
@@ -1915,6 +2253,8 @@ def _tenant_tick(tenant: Tenant, now: datetime) -> None:
                     _report_next_attempt_at[tenant.key] = now + timedelta(minutes=REPORT_RETRY_MINUTES)
                     logger.exception("[%s] Daily report attempt %d failed", tenant.key, failures)
                     detail = f"{type(exc).__name__}: {str(exc)[:250]}"
+                    if _looks_like_token_error(str(exc)):
+                        detail += " — parece o token do Databricks: gere um novo e atualize no Toqan"
                     if failures >= REPORT_MAX_ATTEMPTS:
                         _alert(f"[{tenant.key}] Report de {_format_date(today)} não saiu após {failures} tentativas. Último erro: {detail}")
                         try:
@@ -1958,6 +2298,10 @@ def _scheduler_tick(now: datetime | None = None) -> None:
         _mop_missing_check(now)
     except Exception:
         logger.exception("MOP missing check failed")
+    try:
+        _agent_health_tick(now)
+    except Exception:
+        logger.exception("Agent health check failed")
 
 
 def _mop_missing_check(now: datetime) -> None:
@@ -2050,6 +2394,23 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             return
         if not question:
             _say(say, "Oi! Sou a Lyra. Como posso ajudar?", event, in_thread)
+            return
+
+        if eps is None and _is_token_renewed_message(question):
+            expiry = _mark_token_renewed(_now_brazil().date())
+            reminder = expiry - timedelta(days=1)
+            _say(say, f"Anotado ✅ Token novo vale até {_format_date(expiry)}; te lembro dia {_format_date(reminder)}. "
+                      "Vou testar os agentes agora…", event, in_thread)
+            _say(say, _agents_summary(_run_agent_checks(_now_brazil())), event, in_thread)
+            return
+        if eps is None and _is_data_test_request(question):
+            _say(say, _agents_summary(_run_agent_checks(_now_brazil())), event, in_thread)
+            return
+
+        if _is_mop_export_request(question):
+            problem = _send_mop_export(event, client, eps)
+            if problem:
+                _say(say, problem, event, in_thread)
             return
 
         def send_progress(message: str) -> None:
