@@ -1156,14 +1156,7 @@ def _process_mop_upload(event: dict[str, Any], client: Any, eps: str | None = No
     if eps:
         missing = [m for m in missing if _compact(m) != "eps"]
 
-    who = f" da {eps}" if eps else ""
-    lines = [
-        f"MOP{who} atualizado com sucesso! ✅ {after} pessoas{who} (antes: {before}). Aba lida: _{sheet_title}_.",
-    ]
-    if eps:
-        lines.append("As linhas das outras EPS foram mantidas.")
-    else:
-        lines.append(f"Planilha: {MOP_SHEET_URL}")
+    lines = ["MOP atualizado na planilha ✅"]
     if ignored:
         lines.append(f"⚠️ {ignored} linha(s) de outra EPS no arquivo foram ignoradas.")
     if missing:
@@ -1244,23 +1237,14 @@ def _process_mop_flow(event: dict[str, Any], client: Any) -> str:
     before, after, ignored = _update_mop_sheet(rows, google_client, single_eps)
     _mark_mop_updated([single_eps] if single_eps else None)
 
-    values = _read_mop_values(google_client) or []
-    eps_col, email_col = (_find_col(values[0], "EPS"), _find_col(values[0], "Email")) if values else (None, None)
-    people = [r for r in values[1:] if any(str(c).strip() for c in r)]
-    per_eps = " · ".join(f"{e} {_count_eps_people(values, e)}" for e in EPS_CELULAS)
-    no_eps = len([r for r in people if not _row_eps(r, eps_col, email_col)])
-
-    if single_eps:
-        lines = [f"MOP da {single_eps} atualizado ✅ {after} pessoas (antes: {before}). As outras EPS foram mantidas."]
-    else:
-        lines = [f"MOP atualizado ✅ {after} pessoas (antes: {before})."]
-    lines.append(f"Por EPS: {per_eps}" + (f" · {no_eps} sem EPS identificada" if no_eps else ""))
+    lines = ["MOP atualizado na planilha ✅"]
+    # Só fala mais se houver algo que precise de atenção
     if ignored:
         lines.append(f"⚠️ {ignored} linha(s) de outra EPS foram ignoradas.")
     if missing:
         lines.append(f"⚠️ Colunas não encontradas: {', '.join(missing)}.")
     if before and after < before * 0.5:
-        lines.append(f"⚠️ O número de pessoas caiu mais de 50% — confira o arquivo. A versão anterior ficou guardada.")
+        lines.append("⚠️ O número de pessoas caiu mais de 50% — confira o arquivo. A versão anterior ficou guardada.")
     return "\n".join(lines)
 
 
