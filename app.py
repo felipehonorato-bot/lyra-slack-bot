@@ -1,4 +1,6 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v3.7).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v3.8).
+
+v3.8 — "roda o report [da aec|da csu]" na DM: dispara o report na hora (teste manual).
 
 v3.7 — monitoramento dos agentes (Lyra + MONITORED_AGENTS: Nexus, Vera, ClubIA…) 4x ao dia, DM só quando
 um agente para ou volta; lembrete do token do Databricks no 6º dia (validade de 7 dias a partir de
@@ -256,7 +258,7 @@ TOKEN_ERROR_HINTS = ("403", "401", "invalid access token", "token", "unauthorize
 HEALTHCHECK_PROMPT = (
     "TAREFA INTERNA DE MONITORAMENTO — não é pergunta de usuário e não vai para o Slack.\n"
     "Faça uma consulta mínima na sua fonte de dados (no Databricks, por exemplo: "
-    "SELECT COUNT(*) AS n FROM saex.gold.cx_support WHERE dt >= date_sub(current_date(), 2)). "
+    "SELECT COUNT(*) AS n FROM saex.gold.cx_support WHERE DATE(ticket_created_at) >= date_sub(current_date(), 2)). "
     "Se você usa subagentes, peça ao subagente de dados com 'EPS: iFood' e 'Pedido: verificação de acesso'.\n"
     "Responda APENAS uma linha: 'OK <n>' se conseguiu consultar, ou 'ERRO: <mensagem técnica exata do erro>' se falhou."
 )
@@ -430,8 +432,8 @@ def _scope_instruction(eps: str | None) -> str:
     celulas = _celulas_of(eps)
     return (
         f"ESCOPO OBRIGATÓRIO: este canal é exclusivo da EPS {eps}. "
-        f"Filtre TODAS as consultas pelo e-mail do operador: {_eps_filter_sql(eps)}. "
-        + (f"Células/filas da {eps}: {'; '.join(celulas)}. Mostre só essas. " if celulas else "")
+        + (f"Filas da {eps} (fila do ticket = ticket_last_form.queue_name): {'; '.join(celulas)}. Use só essas. " if celulas else "")
+        + f"Para operadores (Q4, rankings), use só e-mails da {eps}: {_eps_filter_sql(eps)}. "
         + f"Use somente filas, operadores, motivos, compromissos e números da {eps}. "
         f"NUNCA mencione, compare ou mostre dados de {others}, nem o resultado consolidado do iFood. "
         f"Se pedirem dados de outra EPS, diga com naturalidade que aqui você acompanha só a {eps}. "
@@ -2197,6 +2199,34 @@ def _is_token_renewed_message(question: str) -> bool:
     return bool(_TOKEN_RENEWED_RE.search(_norm_text(question)))
 
 
+_RUN_REPORT_RE = re.compile(r"\b(roda|rode|rodar|dispara|dispare|disparar|gera|gere|gerar|manda|mande|solta|solte)\b.*\breport\b")
+
+
+def _report_targets(question: str) -> list[Tenant] | None:
+    """Tenants pedidos em "roda o report [da aec|da csu]"; None se não for esse comando."""
+    text = _norm_text(question)
+    if not _RUN_REPORT_RE.search(text):
+        return None
+    named = [t for t in TENANTS if t.eps and re.search(rf"\b{_compact(t.eps)}\b", text.replace(" ", " "))]
+    return named or list(TENANTS)
+
+
+def _run_report_now(targets: list[Tenant]) -> list[str]:
+    """Roda o report na hora (teste manual). Devolve uma linha de resultado por tenant."""
+    lines = []
+    now = _now_brazil()
+    for tenant in targets:
+        try:
+            _run_daily_report(now, tenant)
+            lines.append(f"• *{tenant.key}:* report postado no canal ✅")
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {str(exc)[:200]}"
+            if _looks_like_token_error(str(exc)):
+                detail += " (parece o token do Databricks)"
+            lines.append(f"• *{tenant.key}:* não saiu — {detail}")
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Agendador único
 # ---------------------------------------------------------------------------
@@ -2402,6 +2432,11 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             _say(say, f"Anotado ✅ Token novo vale até {_format_date(expiry)}; te lembro dia {_format_date(reminder)}. "
                       "Vou testar os agentes agora…", event, in_thread)
             _say(say, _agents_summary(_run_agent_checks(_now_brazil())), event, in_thread)
+            return
+        targets = _report_targets(question) if eps is None else None
+        if targets:
+            _say(say, f"Rodando o report agora ({', '.join(t.key for t in targets)})… pode levar alguns minutos.", event, in_thread)
+            _say(say, "\n".join(_run_report_now(targets)), event, in_thread)
             return
         if eps is None and _is_data_test_request(question):
             _say(say, _agents_summary(_run_agent_checks(_now_brazil())), event, in_thread)
