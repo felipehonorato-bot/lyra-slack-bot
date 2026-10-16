@@ -290,6 +290,12 @@ AGENT_CHECK_MAX_POLLS = 30  # 30 x 10s = 5 min por agente
 # O token do Databricks dura DATABRICKS_TOKEN_VALIDITY_DAYS a partir da troca.
 DATABRICKS_TOKEN_VALIDITY_DAYS = int(os.getenv("DATABRICKS_TOKEN_VALIDITY_DAYS", "7"))
 # Agentes que usam o MESMO token do Databricks (só para o texto do alerta)
+# Agentes que não consultam o Databricks: o teste só confere se respondem (sem consulta, sem alerta de token)
+NO_DATA_AGENTS = {a.strip().casefold() for a in os.getenv("NO_DATA_AGENTS", "Em preparo").split(",") if a.strip()}
+PING_PROMPT = (
+    "TAREFA INTERNA DE MONITORAMENTO — não é pergunta de usuário e não vai para o Slack. "
+    "Não consulte nada. Responda APENAS: OK"
+)
 SHARED_TOKEN_AGENTS = [a.strip() for a in os.getenv("SHARED_TOKEN_AGENTS", "Nexus,Vera,ClubIA").split(",") if a.strip()]
 DATABRICKS_TOKEN_RENEWED = os.getenv("DATABRICKS_TOKEN_RENEWED", "").strip()  # opcional: data da última troca
 TOKEN_REMINDER_TIME = datetime_time(9, 30)
@@ -2549,8 +2555,9 @@ def _ask_agent(api_key: str | None, prompt: str) -> str:
 
 def _check_agent(name: str, api_key: str | None) -> tuple[str, str]:
     """('ok' | 'token' | 'erro' | 'fora', detalhe). Nunca levanta exceção."""
+    no_data = name.casefold() in NO_DATA_AGENTS
     try:
-        answer = _ask_agent(api_key, HEALTHCHECK_PROMPT).strip()
+        answer = _ask_agent(api_key, PING_PROMPT if no_data else HEALTHCHECK_PROMPT).strip()
     except ToqanAPIError as exc:
         if "timed out" in str(exc):
             return "fora", "não respondeu em 5 minutos"
@@ -2562,6 +2569,8 @@ def _check_agent(name: str, api_key: str | None) -> tuple[str, str]:
         return "ok", first[:60]
     if not first:
         return "fora", "resposta vazia"
+    if no_data:
+        return "ok", "respondeu (sem dados)"
     if _looks_like_token_error(answer):
         return "token", first[:200]
     if first.upper().lstrip("*_ ").startswith("ERRO"):
@@ -2633,7 +2642,8 @@ def _agents_summary(results: dict[str, tuple[str, str]]) -> str:
     lines = ["*Status dos agentes:*"]
     for name, (status, detail) in results.items():
         note = f" — {detail}" if status != "ok" else (
-            " (respondeu, mas não confirmou a consulta — confira o prompt dele)" if detail.startswith("respondeu (fora") else "")
+            " (respondeu, mas não confirmou a consulta — confira o prompt dele)" if detail.startswith("respondeu (fora")
+            else " (não usa token — só confiro se responde)" if detail == "respondeu (sem dados)" else "")
         lines.append(f"• *{name}:* {_STATUS_LABEL[status]}{note}")
     pending = [n for n, (st, _) in results.items() if st == "token"]
     if pending:
