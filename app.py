@@ -1,4 +1,10 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v4.1).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v4.3).
+
+v4.3 — alarmística dos agentes: teste chega em cada subagente, reaviso enquanto continuar parado,
+       teste na hora quando uma conversa volta com erro de acesso, aviso de agente esquecido na troca do token.
+
+v4.2 — o APP monta o layout do report: título "Governança · <Fila> — dd/mm" no canal e detalhe
+       + cobrança na thread. O modelo só devolve dados (JSON por fila); texto livre também é lido.
 
 v4.1 — bloco por fila enxuto (3–4 linhas: status, D-1 vs meta, ofensor, cobrança 👉 com owner).
 
@@ -124,7 +130,7 @@ INTERNAL_CHANNELS = _parse_id_list(os.getenv("INTERNAL_CHANNELS", "")) | (
 )
 # Quem pode falar com a Lyra por DM (visão completa). Padrão: o ALERT_CHANNEL, se for um usuário.
 DM_ALLOWED_USERS = _parse_id_list(os.getenv("DM_ALLOWED_USERS", "")) or (
-    {ALERT_CHANNEL} if ALERT_CHANNEL.startswith("U") else set()
+    {t for t in _parse_id_list(ALERT_CHANNEL) if t.startswith("U")}
 )
 CONSOLIDATED = "Consolidado"
 
@@ -290,32 +296,39 @@ TOKEN_REMINDER_TIME = datetime_time(9, 30)
 TOKEN_ERROR_HINTS = ("403", "401", "invalid access token", "token", "unauthorized", "unauthenticated",
                      "expired", "expirado", "permission", "permiss", "credential", "credencia")
 HEALTHCHECK_PROMPT = (
+    "EPS: iFood\n"
+    "Pedido: verificação de acesso\n\n"
     "TAREFA INTERNA DE MONITORAMENTO — não é pergunta de usuário e não vai para o Slack.\n"
-    "Faça uma consulta mínima na sua fonte de dados (no Databricks, por exemplo: "
-    "SELECT COUNT(*) AS n FROM saex.gold.cx_support WHERE DATE(ticket_created_at) >= date_sub(current_date(), 2)). "
-    "Se você usa subagentes, peça ao subagente de dados com 'EPS: iFood' e 'Pedido: verificação de acesso'.\n"
-    "Responda APENAS uma linha: 'OK <n>' se conseguiu consultar, ou 'ERRO: <mensagem técnica exata do erro>' se falhou."
+    "Se você consulta dados direto: rode SELECT COUNT(*) AS n FROM saex.gold.cx_support "
+    "WHERE DATE(ticket_created_at) >= date_sub(current_date(), 2).\n"
+    "Se você usa subagentes: chame CADA subagente que consulta dados (ex.: Lyra Indicadores e Lyra Qualidade), "
+    "um por um, com 'EPS: iFood' e 'Pedido: verificação de acesso'.\n"
+    "Responda APENAS uma linha: 'OK <n>' se TODAS as consultas funcionaram, ou "
+    "'ERRO: <nome do subagente, se houver>: <mensagem técnica exata do erro>' se qualquer uma falhou."
 )
 
 THREAD_DELIMITER = "===THREAD==="
 
 FILA_BLOCK_RE = re.compile(r"^\s*===\s*FILA\s*:\s*(?P<fila>.+?)\s*===\s*$", re.MULTILINE)
 DAILY_REPORT_PROMPT = (
-    "Report diário de CSAT em BLOCOS POR FILA — siga a seção Report diário do seu prompt.\n\n"
-    "CONTRATO DE SAÍDA (obrigatório, o app depende disso):\n"
-    "1. Um bloco para CADA fila da lista da EPS. Ordem: filas com D-1 abaixo da meta primeiro (maior gap primeiro), depois as demais.\n"
-    "2. Antes de cada bloco, uma linha exatamente: ===FILA: <nome exato da fila>===\n"
-    "3. Bloco LIMPO, no máximo 4 linhas, sem bullets, sem separadores:\n"
-    "   Linha 1: <🔴 se D-1 abaixo da meta | 🟢 se na meta ou acima | ⚪ meta a definir> `<Fila>` · <dd/mm do D-1>  (nome da fila em código do Slack, entre crases)\n"
-    "   Linha 2 (formato exato): *<D-1>%* em D-1 (n=<n>, <▲|▼> <var p.p.>) · meta <m>% · mês <mês>%\n"
-    "   Linha 3 (só se 🔴): Maior ofensor: <motivo> (−<x,x> p.p.) · <q> no Q4\n"
-    "   Linha 4: 🔴 → começa com 👉: diga quanto faltou pra meta, pergunte o que está sendo feito e peça o plano aqui na thread "
-    "até 14h no formato *ação · responsável · prazo*. 🟢 → começa com ✅: reconhecimento curto. ⚪ → sem linha 4.\n"
-    "   Compromisso em aberto desta fila (do contexto): troque a linha 3 por 📌 <ação> · prazo <dd/mm> — qual o status?\n"
-    "4. Fila sem volume em D-1: uma linha só: ⚪ `<Fila>` · <dd/mm> · sem volume em D-1\n"
-    "5. Nunca nome, usuário ou e-mail de operador. Não escreva menções (@) — o app marca o owner.\n"
-    "6. Se qualquer consulta falhar ou voltar vazia: responda SOMENTE uma linha começando com ERRO: e o motivo.\n"
-    "Formatação Slack: negrito com *um asterisco*. Sem tabelas, sem |, sem **duplo asterisco**. Tom de gestora, frases curtas."
+    "Report diário de CSAT por fila. ESTA TAREFA É DO APP: este contrato vale acima de qualquer layout do seu prompt. "
+    "Você NÃO escreve o texto do Slack — o app monta o layout. Você devolve só os dados.\n\n"
+    "1. Chame o Lyra Indicadores (EPS do escopo, 'Pedido: dados do report diário').\n"
+    "2. Para CADA fila da lista da EPS, escreva exatamente duas linhas:\n"
+    "===FILA: <nome exato da fila>===\n"
+    '{"d1": 74.5, "n": 51, "var": 24.5, "meta": 85, "mes": 69.3, "ofensor": "item impróprio para consumo", '
+    '"ofensor_pp": -3.3, "q1": 7, "q2": 2, "q3": 0, "q4": 7, "reincidentes": 0, "compromisso": "", '
+    '"cobranca": "Q4 com 7 operadores e item impróprio puxando 3,3 p.p. — o que está sendo feito pra fechar esse gap?", "elogio": ""}\n'
+    "3. Campos: d1 = CSAT D-1 em %; n = avaliações em D-1; var = variação do D-1 vs dia anterior em p.p. (negativo se caiu); "
+    "meta em % (null se não definida); mes = CSAT do mês em %; ofensor = motivo de maior impacto negativo no D-1 "
+    "(texto curto, linguagem de gestão, sem nome de coluna); ofensor_pp = impacto em p.p. (negativo); q1..q4 = operadores em cada quadrante; "
+    "reincidentes = operadores reincidentes no Q4; compromisso = se houver compromisso em aberto DESTA fila no contexto, "
+    "'<ação> · prazo <dd/mm>', senão vazio; cobranca = UMA frase de cobrança pelo D-1, citando o que pesou e terminando em pergunta "
+    "(só se D-1 abaixo da meta; sem 'Plano aqui na thread', o app completa); elogio = reconhecimento curto (só se na meta ou acima).\n"
+    '4. Fila sem volume em D-1: {"sem_volume": true}.\n'
+    "5. Só isso: nenhum título, texto, bullet, separador (---) ou comentário fora dessas linhas. Números com ponto decimal. "
+    "Nunca nome, usuário ou e-mail de operador. Não escreva menções (@).\n"
+    "6. Se qualquer consulta falhar ou voltar vazia: responda SOMENTE uma linha começando com ERRO: e o motivo."
 )
 REPORT_FAILED_CHANNEL_MESSAGE = (
     "Pessoal, o report de CSAT de hoje não saiu — tive um problema pra consultar os dados. "
@@ -425,12 +438,11 @@ def _row_value(row: dict[str, Any], *names: str) -> str:
 def _alert(text: str) -> None:
     """Avisa o responsável técnico (ALERT_CHANNEL) — sem expor dados pessoais."""
     logger.warning("ALERTA: %s", text)
-    if not ALERT_CHANNEL:
-        return
-    try:
-        slack_app.client.chat_postMessage(channel=ALERT_CHANNEL, text=f"⚠️ Lyra — {text}")
-    except Exception:
-        logger.exception("Could not post alert")
+    for target in [t.strip() for t in ALERT_CHANNEL.split(",") if t.strip()]:
+        try:
+            slack_app.client.chat_postMessage(channel=target, text=f"⚠️ Lyra — {text}")
+        except Exception:
+            logger.exception("Could not post alert to %s", target)
 
 
 def _eps_pattern(eps: str) -> str:
@@ -2165,9 +2177,17 @@ class ReportGenerationError(RuntimeError):
     """O Toqan não devolveu um report publicável."""
 
 
-def _split_blocks(answer: str) -> list[tuple[str, str]]:
+_FILA_HEADER_RE = re.compile(
+    r"^\s*(?:[🔴🟢⚪🟡]\s*)?\*{0,2}\s*(?:Governan[çc]a\s*·\s*)?\*{0,2}\s*`?(?P<fila>[^`*\n·—]+?)`?\s*\*{0,2}\s*[·—–-]\s*\d{1,2}/\d{1,2}\b.*$",
+    re.MULTILINE,
+)
+
+
+def _split_blocks(answer: str, use_headers: bool = False) -> list[tuple[str, str]]:
     """[(fila, texto do bloco)] a partir dos marcadores ===FILA: x===. Vazio se não houver marcador."""
     marks = list(FILA_BLOCK_RE.finditer(answer or ""))
+    if not marks and use_headers:  # report diário sem marcadores: usa os títulos de fila que o modelo escreveu
+        marks = list(_FILA_HEADER_RE.finditer(answer or ""))
     blocks = []
     for i, m in enumerate(marks):
         end = marks[i + 1].start() if i + 1 < len(marks) else len(answer)
@@ -2178,7 +2198,7 @@ def _split_blocks(answer: str) -> list[tuple[str, str]]:
 
 
 def _tag_block(fila: str, text: str) -> tuple[str, bool]:
-    """Marca o owner na linha *Cobrança:* do bloco. Devolve (texto, tem_cobrança)."""
+    """Marca o owner na linha *Cobrança:* (ou 👉) do bloco. Devolve (texto, tem_cobrança)."""
     lines = text.splitlines()
     has_cobranca = False
     for i, line in enumerate(lines):
@@ -2192,12 +2212,190 @@ def _tag_block(fila: str, text: str) -> tuple[str, bool]:
 
 
 _BLOCK_D1_RE = re.compile(rf"\*?\s*({_NUM})\s*%\s*\*?\s*em\s+D\s*[-–]?\s*1", re.IGNORECASE)
-_BLOCK_MES_RE = re.compile(rf"\bm[eê]s\s*({_NUM})\s*%", re.IGNORECASE)
+_BLOCK_MES_RE = re.compile(rf"\bm[eê]s\s*:?\s*\*?\s*({_NUM})\s*%", re.IGNORECASE)
+
+# --- layout do bloco: montado pelo app (não depende do modelo seguir o formato) ---
+_SNUM = r"[-−–]?\s*\d{1,4}(?:[.,]\d+)?"
+_X_D1_AFTER_RE = re.compile(rf"D\s*[-–]?\s*1\s*:?\s*\*?\s*({_NUM})\s*%", re.IGNORECASE)
+_X_N_RE = re.compile(r"\bn\s*=\s*(\d[\d.]*)", re.IGNORECASE)
+_X_VAR_RE = re.compile(rf"([▲▼])\s*({_NUM})")
+_X_META_RE = re.compile(rf"\bmeta\s*:?\s*\*?\s*({_NUM})\s*%", re.IGNORECASE)
+_X_OFENSOR_RE = re.compile(r"maior\s+(?:ofensor|impacto)\s*:?\s*\*?\s*:?\s*(.+)", re.IGNORECASE)
+_X_PP_RE = re.compile(rf"({_SNUM})\s*p\.?\s*p", re.IGNORECASE)
+_X_Q4_RE = re.compile(r"(?:\bQ4\s*:?\s*(\d+))|(?:(\d+)\s*(?:operadores\s*)?no\s*Q4)", re.IGNORECASE)
+
+
+def _num(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("−", "-").replace("–", "-").replace(" ", "").replace("%", "")
+    if text.count(",") == 1 and "." in text:  # 1.240,5
+        text = text.replace(".", "")
+    try:
+        return float(text.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _bfmt(value: float, decimals: int = 1) -> str:
+    return f"{value:.{decimals}f}".replace(".", ",")
+
+
+def _fmt_meta(value: float) -> str:
+    return _bfmt(value, 0) if float(value).is_integer() else _bfmt(value)
+
+
+def _fmt_int(value: float) -> str:
+    return f"{int(round(value)):,}".replace(",", ".")
+
+
+def _block_data_from_json(text: str) -> dict[str, Any] | None:
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _block_data_from_text(text: str) -> dict[str, Any]:
+    """Extrai os números de um bloco em texto livre (quando o modelo não devolve o JSON)."""
+    clean = text.replace("**", "*")
+    data: dict[str, Any] = {}
+    if re.search(r"sem\s+volume", clean, re.IGNORECASE) and not _X_N_RE.search(clean):
+        return {"sem_volume": True}
+    d1 = _BLOCK_D1_RE.search(clean) or _X_D1_AFTER_RE.search(clean)
+    data["d1"] = _num(d1.group(1)) if d1 else None
+    for key, rx in (("n", _X_N_RE), ("meta", _X_META_RE), ("mes", _BLOCK_MES_RE)):
+        m = rx.search(clean)
+        data[key] = _num(m.group(1).replace(".", "") if key == "n" else m.group(1)) if m else None
+    var = _X_VAR_RE.search(clean)
+    if var:
+        data["var"] = (_num(var.group(2)) or 0) * (-1 if var.group(1) == "▼" else 1)
+    for line in clean.splitlines():
+        m = _X_OFENSOR_RE.search(line)
+        if m:
+            rest = m.group(1).strip().strip("*")
+            pp = _X_PP_RE.search(rest)
+            if pp:
+                value = _num(pp.group(1)) or 0
+                data["ofensor_pp"] = -abs(value)
+            name = re.split(r"\s*(?:·|\(|—| - |,\s*tira|\btira\b)", rest, maxsplit=1)[0]
+            data["ofensor"] = name.strip(" *:.")
+            break
+    q4 = _X_Q4_RE.search(clean)
+    if q4:
+        data["q4"] = _num(q4.group(1) or q4.group(2))
+    for q in ("q1", "q2", "q3"):
+        m = re.search(rf"\b{q}\s*:?\s*(\d+)", clean, re.IGNORECASE)
+        if m:
+            data[q] = _num(m.group(1))
+    reinc = re.search(r"(\d+)\s*reincident", clean, re.IGNORECASE)
+    if reinc:
+        data["reincidentes"] = _num(reinc.group(1))
+    cob = re.search(r"cobran[çc]a\s*:?\s*\*?\s*:?\s*(.+?)(?:\s*Plano aqui na thread|$)", clean, re.IGNORECASE)
+    if cob:
+        data["cobranca"] = cob.group(1).strip(" *")
+    pin = re.search(r"📌\s*(.+)", clean)
+    if pin:
+        data["compromisso"] = pin.group(1).split("—")[0].strip(" *")
+    for line in clean.splitlines():
+        if line.strip().startswith("👉") or "cobran" in _norm_text(line)[:12]:
+            questions = re.findall(r"[^.?!—:]*\?", line)
+            if questions:
+                data["pergunta"] = questions[0].strip(" *")
+            break
+    return data
+
+
+def _block_status(data: dict[str, Any]) -> str:
+    if data.get("sem_volume") or data.get("d1") is None:
+        return "sem_volume"
+    if data.get("meta") is None:
+        return "sem_meta"
+    return "abaixo" if data["d1"] < data["meta"] else "ok"
+
+
+def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str]:
+    """(título no canal, corpo na thread). Layout fixo, venha o que vier do modelo."""
+    dd = day.strftime("%d/%m")
+    status = _block_status(data)
+    title = f"*Governança ·* `{fila}` *— {dd}*"
+    if status == "sem_volume":
+        return title + " · sem volume em D-1", ""
+    d1, meta, mes = data["d1"], data.get("meta"), data.get("mes")
+    extra = []
+    if data.get("n") is not None:
+        extra.append(f"n={_fmt_int(data['n'])}")
+    if data.get("var") is not None:
+        extra.append(f"{'▼' if data['var'] < 0 else '▲'} {_bfmt(abs(data['var']))} p.p.")
+    resultado = (f"Mês {_bfmt(mes)}% · " if mes is not None else "") + f"D-1 {_bfmt(d1)}%"
+    if extra:
+        resultado += f" ({', '.join(extra)})"
+    lines = [f"• *Resultado:* {resultado}"]
+    if meta is None:
+        lines.append("• *Meta:* a definir")
+    elif status == "abaixo":
+        lines.append(f"• *Meta {_fmt_meta(meta)}%:* D-1 {_bfmt(meta - d1)} p.p. abaixo")
+    elif d1 == meta:
+        lines.append(f"• *Meta {_fmt_meta(meta)}%:* D-1 na meta")
+    else:
+        lines.append(f"• *Meta {_fmt_meta(meta)}%:* D-1 {_bfmt(d1 - meta)} p.p. acima")
+    if data.get("ofensor"):
+        impacto = str(data["ofensor"]).strip()
+        if data.get("ofensor_pp") is not None:
+            impacto += f" · tira {_bfmt(abs(data['ofensor_pp']))} p.p."
+        lines.append(f"• *Maior impacto:* {impacto}")
+    quads = [(q, data.get(q.lower())) for q in ("Q1", "Q2", "Q3", "Q4")]
+    if any(v is not None for _, v in quads):
+        quad = " · ".join(f"{q} {_fmt_int(v or 0)}" for q, v in quads)
+        if data.get("reincidentes") is not None:
+            n_re = int(data["reincidentes"])
+            quad += f" · {n_re} reincidente" + ("" if n_re == 1 else "s")
+        lines.append(f"• *Quadrantes:* {quad}")
+    compromisso = str(data.get("compromisso") or "").strip()
+    if compromisso:
+        lines.append(f"• *Compromisso:* {compromisso} — qual o status?")
+    if status == "abaixo":
+        cobranca = str(data.get("cobranca") or data.get("pergunta") or "").strip()
+        cobranca = re.split(r"\s*Plano aqui na thread", cobranca, maxsplit=1)[0].strip()
+        if not cobranca:
+            cobranca = f"faltou {_bfmt(meta - d1)} p.p. pra meta — o que está sendo feito pra fechar esse gap?"
+        if not cobranca.endswith("?"):
+            cobranca = cobranca.rstrip(".") + "?"
+        lines.append(f"*Cobrança:* {cobranca} Plano aqui na thread até 14h: *ação · responsável · prazo*.")
+    elif status == "ok":
+        elogio = str(data.get("elogio") or "").strip() or (
+            "na meta, bom trabalho, time." if d1 == meta else "acima da meta, bom trabalho, time.")
+        lines.append(f"*Destaque:* {elogio}")
+    return title, "\n".join(lines)
+
+
+def _prepare_blocks(blocks: list[tuple[str, str]], day: date) -> list[tuple[str, str, str]]:
+    """[(fila, título, corpo)] no layout fixo, ordenado: abaixo da meta (maior gap primeiro), na meta, sem meta, sem volume."""
+    prepared = []
+    for fila, text in blocks:
+        data = _block_data_from_json(text) or _block_data_from_text(text)
+        status = _block_status(data)
+        if status != "sem_volume" or data.get("sem_volume"):
+            title, body = _render_block(fila, data, day)
+        else:  # não deu pra ler número nenhum: título fixo + texto do modelo na thread, sem separadores
+            title = f"*Governança ·* `{fila}` *— {day.strftime('%d/%m')}*"
+            body = "\n".join(l for l in text.splitlines() if l.strip() not in {"---", "***", "• • •"}).strip()
+        gap = (data["meta"] - data["d1"]) if status == "abaixo" else 0
+        order = {"abaixo": 0, "ok": 1, "sem_meta": 2, "sem_volume": 3}[status]
+        prepared.append((order, -gap, fila, title, body))
+    prepared.sort(key=lambda item: (item[0], item[1]))
+    return [(fila, title, body) for _, _, fila, title, body in prepared]
 
 
 def _block_csat(fila: str, text: str) -> dict[str, float] | None:
     """D-1 e mês do bloco: "*93,5%* em D-1 … mês 94,6%" (aceita o formato antigo "Mês X% · D-1 Y%")."""
-    d1 = _BLOCK_D1_RE.search(text or "")
+    d1 = _BLOCK_D1_RE.search(text or "") or _X_D1_AFTER_RE.search(text or "")
     if d1:
         mes = _BLOCK_MES_RE.search(text or "")
         mes_val = _to_float(mes.group(1)) if mes else None
@@ -2246,18 +2444,23 @@ def _run_daily_report(now: datetime | None = None, tenant: Tenant | None = None)
     if _is_error_answer(answer):
         raise ReportGenerationError(answer.strip()[:300] or "resposta vazia")
 
-    blocks = _split_blocks(answer)
+    blocks = _prepare_blocks(_split_blocks(answer, use_headers=True), now.date() - timedelta(days=1))
     if blocks:
         posted: list[dict[str, Any]] = []
         csat: dict[str, dict[str, float]] = {}
-        for fila, text in blocks:
-            tagged, has_cobranca = _tag_block(fila, text)
-            response = slack_app.client.chat_postMessage(channel=tenant.channel, text=tagged)
+        for fila, title, body in blocks:
+            tagged, has_cobranca = _tag_block(fila, body)
+            response = slack_app.client.chat_postMessage(channel=tenant.channel, text=title)
             ts = _resp_get(response, "ts") or (_resp_get(response, "message", {}) or {}).get("ts")
             if not ts:
                 continue
+            if tagged:
+                try:  # detalhe e cobrança dentro da thread do título
+                    slack_app.client.chat_postMessage(channel=tenant.channel, text=tagged, thread_ts=ts)
+                except Exception:
+                    logger.exception("Could not post block detail in thread (%s)", fila)
             posted.append({"fila": fila, "ts": str(ts), "cobranca": has_cobranca})
-            values = _block_csat(fila, text)
+            values = _block_csat(fila, body)
             if values:
                 csat[fila] = values
         if not posted:
@@ -2265,7 +2468,7 @@ def _run_daily_report(now: datetime | None = None, tenant: Tenant | None = None)
         STATE.set(f"report:{tenant.key}:{now.date().isoformat()}", json.dumps(posted, ensure_ascii=False))
         report_ts = posted[0]["ts"]
         if not csat:
-            _alert(f"[{tenant.key}] Blocos sem a linha • *Resultado:* no formato esperado — pré/pós dos compromissos não será calculado hoje.")
+            _alert(f"[{tenant.key}] Não consegui ler o CSAT D-1 dos blocos — pré/pós dos compromissos não será calculado hoje.")
     else:
         # formato antigo: mensagem principal + ===THREAD===
         main, thread = _split_report(answer)
@@ -2385,10 +2588,12 @@ def _mark_token_renewed(day: date) -> date:
     return day + timedelta(days=DATABRICKS_TOKEN_VALIDITY_DAYS)
 
 
-def _run_agent_checks(now: datetime) -> dict[str, tuple[str, str]]:
-    """Testa todos os agentes, grava o status e avisa só nas mudanças."""
+def _run_agent_checks(now: datetime, remind: bool = False) -> dict[str, tuple[str, str]]:
+    """Testa todos os agentes e grava o status. Avisa quando quebra, quando volta e,
+    com remind=True (testes agendados), de novo enquanto continuar parado."""
     results: dict[str, tuple[str, str]] = {}
     broke: list[str] = []
+    still: list[str] = []
     recovered: list[str] = []
     token_fixed = False
     for name, key in _monitored_agents():
@@ -2397,7 +2602,11 @@ def _run_agent_checks(now: datetime) -> dict[str, tuple[str, str]]:
         previous = STATE.get(f"agent_status:{name}")
         STATE.set(f"agent_status:{name}", status)
         if status != "ok" and previous != status:
+            STATE.set(f"agent_down_since:{name}", now.strftime("%d/%m %Hh%M"))
             broke.append(f"• *{name}:* {_STATUS_LABEL[status]} — {detail}")
+        elif status != "ok" and remind:
+            since = STATE.get(f"agent_down_since:{name}") or "?"
+            still.append(f"• *{name}:* {_STATUS_LABEL[status]} desde {since} — {detail}")
         elif status == "ok" and previous and previous != "ok":
             recovered.append(name)
             token_fixed = token_fixed or previous == "token"
@@ -2409,6 +2618,9 @@ def _run_agent_checks(now: datetime) -> dict[str, tuple[str, str]]:
                 text += f"\n⚠️ O token é o mesmo de {', '.join(others)} — eles também devem estar sem acesso aos dados."
             text += "\nPra token: Databricks → Settings → Developer → Access tokens, gere um novo e atualize no Toqan. Depois me manda \"troquei o token\"."
         _alert(text)
+    if still:
+        _alert("Continua parado (ninguém resolveu ainda):\n" + "\n".join(still)
+               + "\nSe for token: confira se trocou em TODOS os agentes no Toqan — é comum esquecer um.")
     if recovered:
         _alert(f"Voltou a funcionar ✅ {', '.join(recovered)}")
     if token_fixed:
@@ -2420,7 +2632,14 @@ def _run_agent_checks(now: datetime) -> dict[str, tuple[str, str]]:
 def _agents_summary(results: dict[str, tuple[str, str]]) -> str:
     lines = ["*Status dos agentes:*"]
     for name, (status, detail) in results.items():
-        lines.append(f"• *{name}:* {_STATUS_LABEL[status]}" + ("" if status == "ok" else f" — {detail}"))
+        note = f" — {detail}" if status != "ok" else (
+            " (respondeu, mas não confirmou a consulta — confira o prompt dele)" if detail.startswith("respondeu (fora") else "")
+        lines.append(f"• *{name}:* {_STATUS_LABEL[status]}{note}")
+    pending = [n for n, (st, _) in results.items() if st == "token"]
+    if pending:
+        lines.append(f"⚠️ Ainda sem acesso: *{', '.join(pending)}*. Faltou trocar o token nele(s) no Toqan?")
+    if len(results) == 1:
+        lines.append("_Só estou testando a Lyra. Pra eu testar cada agente/subagente, preencha MONITORED_AGENTS no Railway._")
     expiry = _token_expiry()
     if expiry:
         lines.append(f"Token do Databricks: vence em {_format_date(expiry)} (lembro você na véspera).")
@@ -2446,6 +2665,39 @@ def _token_reminder_tick(now: datetime) -> None:
     STATE.set(key, str(days_left))
 
 
+_ACCESS_ERROR_RE = re.compile(
+    r"(databricks|consulta|acesso|query|sql|dados).{0,80}(token|401|403|unauthori|expir|permiss|credencia|invalid access)"
+    r"|(token|401|403|unauthori|expir|permiss|credencia|invalid access).{0,80}(databricks|consulta|acesso|query|sql|dados)",
+    re.IGNORECASE | re.DOTALL,
+)
+PASSIVE_CHECK_COOLDOWN = timedelta(hours=1)
+
+
+def _passive_access_check(answer: str) -> None:
+    """Uma conversa voltou com erro de acesso aos dados: testa os agentes na hora (no máx. 1x por hora)."""
+    if not answer or not _ACCESS_ERROR_RE.search(answer[:1500]):
+        return
+    now = _now_brazil()
+    last = STATE.get("passive_check_at")
+    if last:
+        try:
+            if now - datetime.fromisoformat(last) < PASSIVE_CHECK_COOLDOWN:
+                return
+        except ValueError:
+            pass
+    STATE.set("passive_check_at", now.isoformat())
+
+    def run() -> None:
+        try:
+            results = _run_agent_checks(now)
+            if all(st == "ok" for st, _ in results.values()):
+                _alert("Uma conversa voltou com erro de acesso aos dados, mas no teste agora todos responderam. Fico de olho.")
+        except Exception:
+            logger.exception("Passive access check failed")
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def _agent_health_tick(now: datetime) -> None:
     _token_reminder_tick(now)
     today = now.date()
@@ -2457,7 +2709,7 @@ def _agent_health_tick(now: datetime) -> None:
     if STATE.get(key):
         return
     STATE.set(key, "rodando")
-    _run_agent_checks(now)
+    _run_agent_checks(now, remind=True)
     STATE.set(key, "ok")
 
 
@@ -2762,10 +3014,12 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
 
         prompt = f"{_scope_instruction(eps)}\n\n{_inject_mop_context(question, eps)}"
         answer = ask_toqan(prompt, progress_callback=send_progress)
+        _passive_access_check(answer)
         conv_blocks = _split_blocks(answer or "")
         if conv_blocks:
-            for fila, text in conv_blocks:
-                _say(say, _tag_block(fila, text)[0], event, in_thread=True)
+            day = _today_brazil() - timedelta(days=1)
+            for fila, title, body in _prepare_blocks(conv_blocks, _as_date(day)):
+                _say(say, title + ("\n" + _tag_block(fila, body)[0] if body else ""), event, in_thread=True)
             return
         if THREAD_DELIMITER in (answer or ""):
             # report pedido em conversa: principal + detalhe, sem o marcador aparecer
