@@ -1,4 +1,6 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v4.0).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v4.1).
+
+v4.1 — bloco por fila enxuto (3–4 linhas: status, D-1 vs meta, ofensor, cobrança 👉 com owner).
 
 v4.0 — report em BLOCOS POR FILA no canal da EPS (um post por fila, cada um com a sua thread);
 cobrança pelo D-1; owner marcado só quando o D-1 ficou abaixo da meta; compromissos e escalation por fila.
@@ -301,22 +303,19 @@ FILA_BLOCK_RE = re.compile(r"^\s*===\s*FILA\s*:\s*(?P<fila>.+?)\s*===\s*$", re.M
 DAILY_REPORT_PROMPT = (
     "Report diário de CSAT em BLOCOS POR FILA — siga a seção Report diário do seu prompt.\n\n"
     "CONTRATO DE SAÍDA (obrigatório, o app depende disso):\n"
-    "1. Um bloco para CADA fila da lista da EPS (as filas do escopo acima). Ordem: primeiro as filas com D-1 abaixo da meta "
-    "(maior gap primeiro), depois as demais.\n"
-    "2. Antes de cada bloco, uma linha exatamente assim: ===FILA: <nome exato da fila>===\n"
-    "3. Linha 1 do bloco: *Governança · <Fila>* — <dd/mm do D-1>\n"
-    "4. Linha 2, formato exato: • *Resultado:* Mês 62,6% · D-1 63,2% (n=1.839, ▲ 1,9)\n"
-    "5. Depois, uma linha cada: • *Meta <m>%:* D-1 <x,x> p.p. abaixo/acima · • *Maior impacto:* <motivo> · tira <x,x> p.p. "
-    "(D-1; cite o do mês se for outro) · • *Quadrantes:* Q1 <a> · Q2 <b> · Q3 <c> · Q4 <d> · <r> reincidentes · "
-    "• *Compromissos:* só os desta fila que vieram no contexto, perguntando o status.\n"
-    "6. Última linha do bloco: se o D-1 ficou ABAIXO da meta, comece com *Cobrança:* e pergunte o que estão fazendo pra "
-    "reverter, pedindo o plano aqui na thread até 14h no formato *ação · responsável · prazo*. Se o D-1 bateu a meta, "
-    "comece com *Destaque:* reconhecendo o resultado. Meta a definir: *Acompanhamento:* sem cobrança.\n"
-    "7. Fila sem volume em D-1: só as linhas 1 e 2, com 'sem volume em D-1' no lugar dos números.\n"
-    "8. Nunca nome, usuário ou e-mail de operador. Não escreva menções (@) — o app marca o owner da fila.\n"
-    "9. Se qualquer consulta falhar ou voltar vazia: responda SOMENTE uma linha começando com ERRO: e o motivo.\n\n"
-    "Formatação Slack (mrkdwn): negrito com *um asterisco*, bullets com •. Sem tabelas, sem |, sem **duplo asterisco**. "
-    "Frases curtas, tom de gestora."
+    "1. Um bloco para CADA fila da lista da EPS. Ordem: filas com D-1 abaixo da meta primeiro (maior gap primeiro), depois as demais.\n"
+    "2. Antes de cada bloco, uma linha exatamente: ===FILA: <nome exato da fila>===\n"
+    "3. Bloco LIMPO, no máximo 4 linhas, sem bullets, sem separadores:\n"
+    "   Linha 1: <🔴 se D-1 abaixo da meta | 🟢 se na meta ou acima | ⚪ meta a definir> `<Fila>` · <dd/mm do D-1>  (nome da fila em código do Slack, entre crases)\n"
+    "   Linha 2 (formato exato): *<D-1>%* em D-1 (n=<n>, <▲|▼> <var p.p.>) · meta <m>% · mês <mês>%\n"
+    "   Linha 3 (só se 🔴): Maior ofensor: <motivo> (−<x,x> p.p.) · <q> no Q4\n"
+    "   Linha 4: 🔴 → começa com 👉: diga quanto faltou pra meta, pergunte o que está sendo feito e peça o plano aqui na thread "
+    "até 14h no formato *ação · responsável · prazo*. 🟢 → começa com ✅: reconhecimento curto. ⚪ → sem linha 4.\n"
+    "   Compromisso em aberto desta fila (do contexto): troque a linha 3 por 📌 <ação> · prazo <dd/mm> — qual o status?\n"
+    "4. Fila sem volume em D-1: uma linha só: ⚪ `<Fila>` · <dd/mm> · sem volume em D-1\n"
+    "5. Nunca nome, usuário ou e-mail de operador. Não escreva menções (@) — o app marca o owner.\n"
+    "6. Se qualquer consulta falhar ou voltar vazia: responda SOMENTE uma linha começando com ERRO: e o motivo.\n"
+    "Formatação Slack: negrito com *um asterisco*. Sem tabelas, sem |, sem **duplo asterisco**. Tom de gestora, frases curtas."
 )
 REPORT_FAILED_CHANNEL_MESSAGE = (
     "Pessoal, o report de CSAT de hoje não saiu — tive um problema pra consultar os dados. "
@@ -2183,7 +2182,8 @@ def _tag_block(fila: str, text: str) -> tuple[str, bool]:
     lines = text.splitlines()
     has_cobranca = False
     for i, line in enumerate(lines):
-        if _norm_text(line.strip().lstrip("•").strip().strip("*")).startswith("cobranca"):
+        stripped = line.strip()
+        if stripped.startswith("👉") or _norm_text(stripped.lstrip("•").strip().strip("*")).startswith("cobranca"):
             has_cobranca = True
             mentions = [f"<@{uid}>" for uid in _owners_for(fila) if f"<@{uid}>" not in line]
             if mentions:
@@ -2191,8 +2191,18 @@ def _tag_block(fila: str, text: str) -> tuple[str, bool]:
     return "\n".join(lines), has_cobranca
 
 
+_BLOCK_D1_RE = re.compile(rf"\*?\s*({_NUM})\s*%\s*\*?\s*em\s+D\s*[-–]?\s*1", re.IGNORECASE)
+_BLOCK_MES_RE = re.compile(rf"\bm[eê]s\s*({_NUM})\s*%", re.IGNORECASE)
+
+
 def _block_csat(fila: str, text: str) -> dict[str, float] | None:
-    """Mês e D-1 da linha • *Resultado:* Mês X% · D-1 Y% do bloco."""
+    """D-1 e mês do bloco: "*93,5%* em D-1 … mês 94,6%" (aceita o formato antigo "Mês X% · D-1 Y%")."""
+    d1 = _BLOCK_D1_RE.search(text or "")
+    if d1:
+        mes = _BLOCK_MES_RE.search(text or "")
+        mes_val = _to_float(mes.group(1)) if mes else None
+        d1_val = _to_float(d1.group(1))
+        return {"d1": d1_val, "mes": mes_val if mes_val is not None else d1_val}
     parsed = _parse_report_csat(text)
     return next(iter(parsed.values()), None) if parsed else None
 
