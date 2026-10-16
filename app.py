@@ -2967,6 +2967,25 @@ def _say(say: Callable[..., Any], answer: str, event: dict[str, Any], in_thread:
         say(text=answer)
 
 
+ALERT_CHANNEL_IDS = {t for t in _parse_id_list(ALERT_CHANNEL) if t[:1] in {"C", "G"}}
+MONITORING_HELP = ("Aqui eu cuido do monitoramento dos agentes. Pode pedir *status dos agentes* "
+                   "ou avisar *troquei o token* que eu testo todos na hora.")
+
+
+def _monitoring_channel_reply(question: str, say: Callable[..., Any], event: dict[str, Any], in_thread: bool) -> None:
+    """Canal de alerta do time: só comandos de monitoramento (sem dados de EPS)."""
+    if _is_token_renewed_message(question):
+        expiry = _mark_token_renewed(_now_brazil().date())
+        _say(say, f"Anotado ✅ Token novo vale até {_format_date(expiry)}; lembro um dia antes. "
+                  "Vou testar os agentes agora…", event, True)
+        _say(say, _agents_summary(_run_agent_checks(_now_brazil())), event, True)
+    elif _is_data_test_request(question):
+        _say(say, "Testando os agentes, leva uns minutos… ⏳", event, True)
+        _say(say, _agents_summary(_run_agent_checks(_now_brazil())), event, True)
+    else:
+        _say(say, MONITORING_HELP, event, in_thread)
+
+
 def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bool, client: Any = None) -> None:
     """Processa upload de MOP ou repassa a mensagem para o Toqan."""
     event_key = _event_key(event)
@@ -2978,6 +2997,9 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
     question = _strip_mentions(str(event.get("text") or ""))
     try:
         allowed, eps = _event_scope(event)
+        if not allowed and str(event.get("channel") or "") in ALERT_CHANNEL_IDS:
+            _monitoring_channel_reply(question, say, event, in_thread)
+            return
         if not allowed:
             is_im = event.get("channel_type") == "im"
             _say(say, DM_NOT_ALLOWED_MESSAGE if is_im else CHANNEL_NOT_CONFIGURED_MESSAGE, event, in_thread)
