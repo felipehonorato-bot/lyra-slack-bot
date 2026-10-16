@@ -1,4 +1,10 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v3.8).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v4.0).
+
+v4.0 — report em BLOCOS POR FILA no canal da EPS (um post por fila, cada um com a sua thread);
+cobrança pelo D-1; owner marcado só quando o D-1 ficou abaixo da meta; compromissos e escalation por fila.
+
+v3.9 — sem nome de operador no Slack; owners das filas marcados nas cobranças; escalation 5h
+depois do report para quem não respondeu; Excel de operadores (CSAT + quadrante) sob pedido.
 
 v3.8 — "roda o report [da aec|da csu]" na DM: dispara o report na hora (teste manual).
 
@@ -122,6 +128,32 @@ CONSOLIDATED = "Consolidado"
 
 # Células de cada EPS (fonte: Felipe, out/2026). O nome da EPS também é o trecho
 # procurado no e-mail do operador ("aec" em @if-aec..., "csu" em ...csu...).
+# Owners de cada fila (IDs do Slack), marcados nas cobranças do report.
+# Pode ser sobrescrito por FILA_OWNERS="CX Suporte:U1|U2;Madrugada:U3".
+_DEFAULT_FILA_OWNERS: dict[str, list[str]] = {
+    "CX Suporte": ["U09GNBTALNN", "U094HUNCPFS"],
+    "Madrugada": ["U094HUNCPFS"],
+    "CX Review - AeC": ["U076W2160TF"],
+    "CX Review - CSU": ["U05EVUPKF0R"],
+    "CX Super Cliente - AeC": ["U09GNBTALNN"],
+    "CX Super Cliente - CSU": ["U05EVUPKF0R"],
+}
+
+
+def _parse_owners(raw: str) -> dict[str, list[str]]:
+    owners: dict[str, list[str]] = {}
+    for part in raw.split(";"):
+        if ":" in part:
+            fila, ids = part.split(":", 1)
+            ids_list = [i.strip() for i in ids.split("|") if i.strip()]
+            if fila.strip() and ids_list:
+                owners[fila.strip()] = ids_list
+    return owners
+
+
+FILA_OWNERS: dict[str, list[str]] = _parse_owners(os.getenv("FILA_OWNERS", "")) or _DEFAULT_FILA_OWNERS
+ESCALATION_DELAY = timedelta(hours=5)
+
 EPS_CELULAS: dict[str, list[str]] = {
     "AeC": [
         "CX Suporte", "Madrugada", "CX Review - AeC", "CX Super Cliente - AeC",
@@ -265,25 +297,26 @@ HEALTHCHECK_PROMPT = (
 
 THREAD_DELIMITER = "===THREAD==="
 
+FILA_BLOCK_RE = re.compile(r"^\s*===\s*FILA\s*:\s*(?P<fila>.+?)\s*===\s*$", re.MULTILINE)
 DAILY_REPORT_PROMPT = (
-    "Report diário de CSAT — execute o report diário do seu prompt (seção Report diário / Bloco 3). "
-    "Siga a estrutura completa da mensagem principal: compromissos de ontem (se houver), "
-    "Principais resultados por fila (Mês, D-1, n e variação vs D-2), Maior impacto em p.p., "
-    "Cobranças, Status dos compromissos e o fechamento pedindo o plano na thread "
-    "(ação · responsável · prazo até 14h).\n\n"
+    "Report diário de CSAT em BLOCOS POR FILA — siga a seção Report diário do seu prompt.\n\n"
     "CONTRATO DE SAÍDA (obrigatório, o app depende disso):\n"
-    f"1. Escreva a mensagem principal, depois uma linha contendo exatamente {THREAD_DELIMITER}, "
-    "depois o conteúdo da thread.\n"
-    "2. A thread começa com *Resultados de todas as filas:* listando TODAS as filas com volume, "
-    "uma por linha, no formato exato: • *Nome da fila:* Mês 62,6% · D-1 63,2% (n=1.839, ▲ 1,9). "
-    "Depois vêm o Q4 (top 5 por fila) e o detalhe de reincidência.\n"
-    "3. Se qualquer consulta falhar ou voltar vazia, responda SOMENTE uma linha começando com "
-    "ERRO: e o motivo. Não publique números parciais.\n\n"
-    "COMPROMISSOS: use o bloco de contexto acima (se houver) como fonte de verdade. "
-    "Não peça plano novo para compromissos em andamento; cobre os sem resposta e peça plano só "
-    "para ofensores novos.\n"
-    "Formatação Slack (mrkdwn): negrito com *um asterisco*, bullets com •, separadores • • •. "
-    "Sem tabelas, sem |, sem **duplo asterisco**. Escreva como uma pessoa, frases curtas e diretas."
+    "1. Um bloco para CADA fila da lista da EPS (as filas do escopo acima). Ordem: primeiro as filas com D-1 abaixo da meta "
+    "(maior gap primeiro), depois as demais.\n"
+    "2. Antes de cada bloco, uma linha exatamente assim: ===FILA: <nome exato da fila>===\n"
+    "3. Linha 1 do bloco: *Governança · <Fila>* — <dd/mm do D-1>\n"
+    "4. Linha 2, formato exato: • *Resultado:* Mês 62,6% · D-1 63,2% (n=1.839, ▲ 1,9)\n"
+    "5. Depois, uma linha cada: • *Meta <m>%:* D-1 <x,x> p.p. abaixo/acima · • *Maior impacto:* <motivo> · tira <x,x> p.p. "
+    "(D-1; cite o do mês se for outro) · • *Quadrantes:* Q1 <a> · Q2 <b> · Q3 <c> · Q4 <d> · <r> reincidentes · "
+    "• *Compromissos:* só os desta fila que vieram no contexto, perguntando o status.\n"
+    "6. Última linha do bloco: se o D-1 ficou ABAIXO da meta, comece com *Cobrança:* e pergunte o que estão fazendo pra "
+    "reverter, pedindo o plano aqui na thread até 14h no formato *ação · responsável · prazo*. Se o D-1 bateu a meta, "
+    "comece com *Destaque:* reconhecendo o resultado. Meta a definir: *Acompanhamento:* sem cobrança.\n"
+    "7. Fila sem volume em D-1: só as linhas 1 e 2, com 'sem volume em D-1' no lugar dos números.\n"
+    "8. Nunca nome, usuário ou e-mail de operador. Não escreva menções (@) — o app marca o owner da fila.\n"
+    "9. Se qualquer consulta falhar ou voltar vazia: responda SOMENTE uma linha começando com ERRO: e o motivo.\n\n"
+    "Formatação Slack (mrkdwn): negrito com *um asterisco*, bullets com •. Sem tabelas, sem |, sem **duplo asterisco**. "
+    "Frases curtas, tom de gestora."
 )
 REPORT_FAILED_CHANNEL_MESSAGE = (
     "Pessoal, o report de CSAT de hoje não saiu — tive um problema pra consultar os dados. "
@@ -1855,7 +1888,7 @@ def _fetch_thread(channel_id: str, report_ts: str) -> list[dict[str, Any]]:
 
 def _read_report_thread(
     channel_id: str, report_ts: str, phase: str, today: datetime | date | None = None,
-    tenant_key: str = CONSOLIDATED,
+    tenant_key: str = CONSOLIDATED, fila: str = "", register_no_reply: bool = True,
 ) -> dict[str, int]:
     """Lê a thread do report e registra/atualiza compromissos. Levanta exceção em falha.
 
@@ -1869,8 +1902,13 @@ def _read_report_thread(
         for m in messages
         if m.get("ts") == report_ts or m.get("bot_id") or m.get("subtype") == "bot_message"
     )
-    csat = _parse_report_csat(report_text)
-    filas = list(csat)
+    if fila:  # bloco de uma fila só: a fila é conhecida, o CSAT vem da linha Resultado
+        values = _block_csat(fila, report_text)
+        csat = {fila: values} if values else {}
+        filas = [fila]
+    else:
+        csat = _parse_report_csat(report_text)
+        filas = list(csat)
 
     records = _human_thread_message_records(messages, report_ts)
     captured_key = f"captured:{report_ts}"
@@ -1884,7 +1922,7 @@ def _read_report_thread(
     thread_rows = [(n, r) for n, r in _worksheet_rows_with_header(worksheet) if _row_value(r, "Thread") == report_ts]
 
     if not new_records:
-        if phase == "first" and not records and not thread_rows:
+        if phase == "first" and register_no_reply and not records and not thread_rows:
             worksheet.append_row(_sem_resposta_row(report_ts, base, tenant_key), value_input_option="RAW")
         return {"novos": 0, "atualizados": 0}
 
@@ -1897,11 +1935,11 @@ def _read_report_thread(
         action = str(item.get("acao") or "").strip()
         if not action:
             continue
-        fila = _match_fila(str(item.get("fila") or ""), filas) or FILA_GERAL
-        pre = _fmt_pct(csat[fila]["d1"]) if fila in csat else ""
+        item_fila = fila or _match_fila(str(item.get("fila") or ""), filas) or FILA_GERAL
+        pre = _fmt_pct(csat[item_fila]["d1"]) if item_fila in csat else ""
         prazo = str(item.get("prazo") or "a definir").strip() or "a definir"
         row = _commitment_row(
-            fila, action, str(item.get("responsavel") or "").strip(), prazo, pre, report_ts, base, tenant_key
+            item_fila, action, str(item.get("responsavel") or "").strip(), prazo, pre, report_ts, base, tenant_key
         )
         new_rows.append(row)
         if row[COL_DATA_FIM - 1] == "a definir":
@@ -1955,10 +1993,221 @@ def _read_report_thread(
 
 
 # ---------------------------------------------------------------------------
+# Owners das filas, escalation e Excel de operadores
+# ---------------------------------------------------------------------------
+_MENTION_ID_RE = re.compile(r"<@(U[A-Z0-9]+)>")
+_BULLET_FILA_RE = re.compile(r"^\s*[•\-]\s*\*(?P<fila>[^*\n]+?)\s*:?\s*\*")
+
+
+def _owners_for(fila_label: str) -> list[str]:
+    fila = _match_fila(fila_label, list(FILA_OWNERS))
+    return FILA_OWNERS.get(fila, []) if fila else []
+
+
+def _tag_owners(main: str) -> str:
+    """Marca os owners nas linhas da seção Cobranças (cada linha começa com • *Fila:*)."""
+    lines = main.splitlines()
+    in_cobrancas = False
+    for i, line in enumerate(lines):
+        low = _norm_text(line)
+        if "cobrancas" in low and line.strip().startswith("*"):
+            in_cobrancas = True
+            continue
+        if in_cobrancas and line.strip().startswith("*") and not line.strip().startswith(("*•", "•")):
+            in_cobrancas = False  # começou outra seção
+        if not in_cobrancas:
+            continue
+        match = _BULLET_FILA_RE.match(line)
+        if not match:
+            continue
+        mentions = [f"<@{uid}>" for uid in _owners_for(match.group("fila")) if f"<@{uid}>" not in line]
+        if mentions:
+            lines[i] = line.rstrip() + " " + " ".join(mentions)
+    return "\n".join(lines)
+
+
+def _escalation_check(tenant: "Tenant", report_ts: str, today: date) -> str:
+    """5h depois do report: cobra na thread quem foi marcado e não respondeu."""
+    messages = _fetch_thread(tenant.channel, report_ts)
+    parent = next((m for m in messages if m.get("ts") == report_ts), {})
+    tagged = list(dict.fromkeys(_MENTION_ID_RE.findall(str(parent.get("text") or ""))))
+    humans = [m for m in messages if m.get("ts") != report_ts and not m.get("bot_id") and m.get("subtype") != "bot_message"]
+    responders = {str(m.get("user") or "") for m in humans}
+    if tagged:
+        pending = [uid for uid in tagged if uid not in responders]
+        if not pending:
+            return "todos responderam"
+        who = " ".join(f"<@{uid}>" for uid in pending)
+        text = f"{who} algum retorno sobre o plano? Preciso de *ação · responsável · prazo* aqui na thread pra gente acompanhar. 🙏"
+    else:
+        if humans:
+            return "houve resposta"
+        text = "Lideranças, algum retorno sobre o report? Preciso do plano aqui na thread no formato *ação · responsável · prazo*. 🙏"
+    slack_app.client.chat_postMessage(channel=tenant.channel, text=text, thread_ts=report_ts)
+    return "cobrado"
+
+
+_OPERATORS_EXCEL_RE = re.compile(
+    r"\b(excel|planilha|xlsx|arquivo|lista|base|relacao)\b.*\b(operador|operadores|analista|analistas|quadrante|quadrantes|q1|q2|q3|q4|pessoas)\b"
+    r"|\b(operador|operadores|analista|analistas|quadrante|quadrantes|q4)\b.*\b(excel|planilha|xlsx|arquivo)\b"
+)
+OPERATORS_CSV_HEADER = ["email", "fila", "avaliacoes", "promotores", "csat", "meta", "atingimento", "quadrante"]
+
+
+def _is_operators_excel_request(question: str) -> bool:
+    text = _norm_text(question)
+    if re.search(r"\bmop\b", text):  # pedido de MOP tem prioridade
+        return False
+    return bool(_OPERATORS_EXCEL_RE.search(text))
+
+
+def _operators_prompt(eps: str | None) -> str:
+    return (
+        f"{_scope_instruction(eps)}\n\n"
+        "TAREFA INTERNA DO APP — base de operadores para Excel. Não é mensagem para o Slack.\n"
+        "Se você usa subagentes, peça ao subagente de indicadores com "
+        f"'EPS: {eps or 'iFood'}' e 'Pedido: base de operadores (CSV)'.\n"
+        "Período: semana corrente (D-7 a D-1). Só filas da lista oficial da EPS. Só operadores com 5+ avaliações.\n"
+        "Quadrante pelo atingimento = CSAT do operador ÷ meta da fila: Q1 ≥ 100% · Q2 95–99% · Q3 90–94% · Q4 < 90%.\n"
+        "Responda APENAS um CSV separado por ';', sem markdown, com este cabeçalho exato:\n"
+        "email;fila;avaliacoes;promotores;csat;meta;atingimento;quadrante\n"
+        "Números com ponto decimal (csat, meta e atingimento em %, ex.: 72.5). Uma linha por operador.\n"
+        "Última linha: TOTAL;<quantidade de operadores>\n"
+        "Se a consulta falhar: responda só 'ERRO: <motivo>'."
+    )
+
+
+def _parse_operators_csv(answer: str) -> tuple[list[list[str]], int | None]:
+    import csv as _csv
+    text = _strip_json_code_blocks(answer)
+    rows: list[list[str]] = []
+    total: int | None = None
+    header_seen = False
+    for row in _csv.reader(io.StringIO(text), delimiter=";"):
+        cells = [c.strip() for c in row]
+        if not cells or not any(cells):
+            continue
+        if not header_seen:
+            if [c.lower() for c in cells[:len(OPERATORS_CSV_HEADER)]] == OPERATORS_CSV_HEADER:
+                header_seen = True
+            continue
+        if cells[0].upper() == "TOTAL":
+            total = _to_int(cells[1] if len(cells) > 1 else "")
+            continue
+        if len(cells) >= len(OPERATORS_CSV_HEADER) and "@" in cells[0]:
+            rows.append(cells[:len(OPERATORS_CSV_HEADER)])
+    return rows, total
+
+
+def _build_operators_xlsx(rows: list[list[str]], eps: str | None) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    def num(value: str) -> float | str:
+        f = _to_float(value)
+        return f if f is not None else value
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"Operadores {eps}" if eps else "Operadores"
+    header = ["E-mail", "Fila", "Avaliações", "Promotores", "CSAT (%)", "Meta (%)", "Atingimento (%)", "Quadrante"]
+    ws.append(header)
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="EA1D2C")
+    fills = {"Q1": "C6EFCE", "Q2": "E2F0D9", "Q3": "FFF2CC", "Q4": "F8CBAD"}
+    order = {"Q4": 0, "Q3": 1, "Q2": 2, "Q1": 3}
+    rows = sorted(rows, key=lambda r: (order.get(r[7].upper(), 9), _to_float(r[6]) or 0))
+    for r in rows:
+        ws.append([r[0], r[1], num(r[2]), num(r[3]), num(r[4]), num(r[5]), num(r[6]), r[7].upper()])
+        q = r[7].upper()
+        if q in fills:
+            ws.cell(row=ws.max_row, column=8).fill = PatternFill("solid", fgColor=fills[q])
+    for col, width in zip("ABCDEFGH", (38, 26, 11, 11, 10, 10, 15, 11)):
+        ws.column_dimensions[col].width = width
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _send_operators_excel(event: dict[str, Any], client: Any, eps: str | None) -> str | None:
+    """Pede a base ao agente, monta o Excel e posta na thread. Devolve texto se não deu."""
+    answer = ask_toqan(_operators_prompt(eps))
+    if _is_error_answer(answer):
+        return "Não consegui puxar os dados dos operadores agora. Tenta de novo em alguns minutos?"
+    rows, total = _parse_operators_csv(answer)
+    if not rows:
+        return "Não consegui montar a planilha dos operadores agora. Tenta de novo em alguns minutos?"
+    if eps:
+        rows = [r for r in rows if _eps_pattern(eps) in r[0].lower()]  # trava: só e-mails da EPS
+    content = _build_operators_xlsx(rows, eps)
+    who = f" da {eps}" if eps else ""
+    note = ""
+    if total and total > len(rows):
+        note = f" (vieram {len(rows)} de {total} — a lista pode estar incompleta)"
+    stamp = _now_brazil().strftime("%d-%m-%Y")
+    (client or slack_app.client).files_upload_v2(
+        channel=event.get("channel"),
+        thread_ts=event.get("thread_ts") or event.get("ts"),
+        content=content,
+        filename=f"Operadores{('_' + eps) if eps else ''}_{stamp}.xlsx",
+        title=f"Operadores{who} — CSAT e quadrante da semana",
+        initial_comment=f"Segue a planilha dos operadores{who} com CSAT e quadrante da semana 📋{note}",
+    )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Report diário (um por EPS + consolidado opcional)
 # ---------------------------------------------------------------------------
 class ReportGenerationError(RuntimeError):
     """O Toqan não devolveu um report publicável."""
+
+
+def _split_blocks(answer: str) -> list[tuple[str, str]]:
+    """[(fila, texto do bloco)] a partir dos marcadores ===FILA: x===. Vazio se não houver marcador."""
+    marks = list(FILA_BLOCK_RE.finditer(answer or ""))
+    blocks = []
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(answer)
+        text = answer[m.end():end].strip()
+        if text:
+            blocks.append((m.group("fila").strip(), text))
+    return blocks
+
+
+def _tag_block(fila: str, text: str) -> tuple[str, bool]:
+    """Marca o owner na linha *Cobrança:* do bloco. Devolve (texto, tem_cobrança)."""
+    lines = text.splitlines()
+    has_cobranca = False
+    for i, line in enumerate(lines):
+        if _norm_text(line.strip().lstrip("•").strip().strip("*")).startswith("cobranca"):
+            has_cobranca = True
+            mentions = [f"<@{uid}>" for uid in _owners_for(fila) if f"<@{uid}>" not in line]
+            if mentions:
+                lines[i] = line.rstrip() + " " + " ".join(mentions)
+    return "\n".join(lines), has_cobranca
+
+
+def _block_csat(fila: str, text: str) -> dict[str, float] | None:
+    """Mês e D-1 da linha • *Resultado:* Mês X% · D-1 Y% do bloco."""
+    parsed = _parse_report_csat(text)
+    return next(iter(parsed.values()), None) if parsed else None
+
+
+def _report_blocks(value: str) -> list[dict[str, Any]]:
+    """Estado do report: lista de blocos [{fila, ts, cobranca}] (aceita o formato antigo, só o ts)."""
+    if not value:
+        return []
+    if value.startswith("["):
+        try:
+            data = json.loads(value)
+            return [b for b in data if isinstance(b, dict) and b.get("ts")]
+        except json.JSONDecodeError:
+            return []
+    return [{"fila": "", "ts": value, "cobranca": True}]
 
 
 def _report_prompt(tenant: Tenant, compromissos_text: str) -> str:
@@ -1986,26 +2235,44 @@ def _run_daily_report(now: datetime | None = None, tenant: Tenant | None = None)
     answer = ask_toqan(_report_prompt(tenant, compromissos_text))
     if _is_error_answer(answer):
         raise ReportGenerationError(answer.strip()[:300] or "resposta vazia")
-    main, thread = _split_report(answer)
-    if not main:
-        raise ReportGenerationError("mensagem principal vazia")
-    csat = _parse_report_csat(answer)
-    if not csat:
-        _alert(f"[{tenant.key}] Report sem linhas de fila no formato esperado — pré/pós dos compromissos não será calculado hoje.")
-    if not thread:
-        logger.warning("[%s] Report without %s delimiter; posting everything as main message", tenant.key, THREAD_DELIMITER)
 
-    response = slack_app.client.chat_postMessage(channel=tenant.channel, text=main)
-    report_ts = _resp_get(response, "ts") or (_resp_get(response, "message", {}) or {}).get("ts")
-    if not report_ts:
-        raise ReportGenerationError("Slack não devolveu o ts do report")
-    STATE.set(f"report:{tenant.key}:{now.date().isoformat()}", str(report_ts))
-    if thread:
-        try:
-            slack_app.client.chat_postMessage(channel=tenant.channel, text=thread, thread_ts=report_ts)
-        except Exception:
-            logger.exception("Could not post report thread")
-            _alert(f"[{tenant.key}] O report saiu, mas não consegui postar a thread (Q4/filas).")
+    blocks = _split_blocks(answer)
+    if blocks:
+        posted: list[dict[str, Any]] = []
+        csat: dict[str, dict[str, float]] = {}
+        for fila, text in blocks:
+            tagged, has_cobranca = _tag_block(fila, text)
+            response = slack_app.client.chat_postMessage(channel=tenant.channel, text=tagged)
+            ts = _resp_get(response, "ts") or (_resp_get(response, "message", {}) or {}).get("ts")
+            if not ts:
+                continue
+            posted.append({"fila": fila, "ts": str(ts), "cobranca": has_cobranca})
+            values = _block_csat(fila, text)
+            if values:
+                csat[fila] = values
+        if not posted:
+            raise ReportGenerationError("Slack não devolveu o ts de nenhum bloco")
+        STATE.set(f"report:{tenant.key}:{now.date().isoformat()}", json.dumps(posted, ensure_ascii=False))
+        report_ts = posted[0]["ts"]
+        if not csat:
+            _alert(f"[{tenant.key}] Blocos sem a linha • *Resultado:* no formato esperado — pré/pós dos compromissos não será calculado hoje.")
+    else:
+        # formato antigo: mensagem principal + ===THREAD===
+        main, thread = _split_report(answer)
+        if not main:
+            raise ReportGenerationError("mensagem principal vazia")
+        csat = _parse_report_csat(answer)
+        main = _tag_owners(main)
+        response = slack_app.client.chat_postMessage(channel=tenant.channel, text=main)
+        report_ts = _resp_get(response, "ts") or (_resp_get(response, "message", {}) or {}).get("ts")
+        if not report_ts:
+            raise ReportGenerationError("Slack não devolveu o ts do report")
+        STATE.set(f"report:{tenant.key}:{now.date().isoformat()}", str(report_ts))
+        if thread:
+            try:
+                slack_app.client.chat_postMessage(channel=tenant.channel, text=thread, thread_ts=report_ts)
+            except Exception:
+                logger.exception("Could not post report thread")
 
     if google_client is not None and csat:
         try:
@@ -2246,15 +2513,22 @@ def _posted_at(ts: str) -> datetime | None:
         return None
 
 
-def _run_thread_read(tenant: Tenant, report_ts: str, phase: str, state_key: str, today: date) -> None:
-    try:
-        result = _read_report_thread(tenant.channel, report_ts, phase, today, tenant.key)
-        logger.info("[%s] Thread read %s: %s", tenant.key, phase, result)
-        STATE.set(state_key, "ok")
-    except Exception as exc:
-        logger.exception("[%s] Thread read %s failed", tenant.key, phase)
-        STATE.set(state_key, "erro")
-        _alert(f"[{tenant.key}] Falha ao ler a thread do report ({phase}): {type(exc).__name__}: {str(exc)[:200]}")
+def _run_thread_read(tenant: Tenant, report_value: str, phase: str, state_key: str, today: date) -> None:
+    """Lê a thread de cada bloco (fila) do report."""
+    errors = []
+    for block in _report_blocks(report_value):
+        try:
+            result = _read_report_thread(
+                tenant.channel, block["ts"], phase, today, tenant.key,
+                fila=block.get("fila", ""), register_no_reply=bool(block.get("cobranca", True)),
+            )
+            logger.info("[%s] Thread read %s %s: %s", tenant.key, phase, block.get("fila"), result)
+        except Exception as exc:
+            logger.exception("[%s] Thread read %s failed", tenant.key, phase)
+            errors.append(f"{block.get('fila') or 'report'}: {type(exc).__name__}: {str(exc)[:120]}")
+    STATE.set(state_key, "erro" if errors else "ok")
+    if errors:
+        _alert(f"[{tenant.key}] Falha ao ler thread(s) do report ({phase}): " + " | ".join(errors[:3]))
 
 
 def _tenant_tick(tenant: Tenant, now: datetime) -> None:
@@ -2298,10 +2572,28 @@ def _tenant_tick(tenant: Tenant, now: datetime) -> None:
             STATE.set(_skey("report_missed", tenant, today), "1")
             _alert(f"[{tenant.key}] O report de {_format_date(today)} não rodou (app fora do ar na janela 09h–13h?).")
 
+    # 2b) Escalation: 5h depois do report, cobra quem foi marcado e não respondeu
+    blocks = _report_blocks(STATE.get(_skey("report", tenant, today)))
+    if blocks:
+        esc_key = _skey("escalation", tenant, today)
+        posted_at = _posted_at(blocks[0]["ts"]) or now
+        if now >= posted_at + ESCALATION_DELAY and not STATE.get(esc_key):
+            results = []
+            for block in blocks:
+                if not block.get("cobranca", True):
+                    continue
+                try:
+                    results.append(_escalation_check(tenant, block["ts"], today))
+                except Exception as exc:
+                    results.append("erro")
+                    _alert(f"[{tenant.key}] Falha na cobrança de 5h ({block.get('fila')}): {type(exc).__name__}")
+            STATE.set(esc_key, ",".join(results) or "sem cobrança")
+
     # 3) Leituras da thread de hoje
     report_ts = STATE.get(_skey("report", tenant, today))
     if report_ts:
-        posted = _posted_at(report_ts) or now
+        first_block = _report_blocks(report_ts)
+        posted = (_posted_at(first_block[0]["ts"]) if first_block else None) or now
         first_due = max(datetime.combine(today, THREAD_READ_FIRST_TIME, tzinfo=BRAZIL_TIMEZONE),
                         posted + THREAD_READ_FIRST_MIN_DELAY)
         first_key = _skey("read_first", tenant, today)
@@ -2442,6 +2734,13 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             _say(say, _agents_summary(_run_agent_checks(_now_brazil())), event, in_thread)
             return
 
+        if _is_operators_excel_request(question):
+            _say(say, "Vou montar a planilha dos operadores, já te mando aqui. ⏳", event, in_thread=True)
+            problem = _send_operators_excel(event, client, eps)
+            if problem:
+                _say(say, problem, event, in_thread)
+            return
+
         if _is_mop_export_request(question):
             problem = _send_mop_export(event, client, eps)
             if problem:
@@ -2453,6 +2752,18 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
 
         prompt = f"{_scope_instruction(eps)}\n\n{_inject_mop_context(question, eps)}"
         answer = ask_toqan(prompt, progress_callback=send_progress)
+        conv_blocks = _split_blocks(answer or "")
+        if conv_blocks:
+            for fila, text in conv_blocks:
+                _say(say, _tag_block(fila, text)[0], event, in_thread=True)
+            return
+        if THREAD_DELIMITER in (answer or ""):
+            # report pedido em conversa: principal + detalhe, sem o marcador aparecer
+            main, detail = _split_report(answer)
+            _say(say, _tag_owners(main) or EMPTY_ANSWER_MESSAGE, event, in_thread)
+            if detail:
+                _say(say, detail, event, in_thread=True)
+            return
         _say(say, answer or EMPTY_ANSWER_MESSAGE, event, in_thread)
     except MOPChannelNotAllowedError:
         _say(say, MOP_CHANNEL_NOT_ALLOWED_MESSAGE, event, in_thread=True)
