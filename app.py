@@ -1,4 +1,7 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v4.9).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.0).
+
+v5.0 — pergunta de causa: análise de variação primeiro; se a queda vem do efeito mix (mix ≥ 80% da queda e
+       performance estável), responde só a leitura do mix, sem cobrar plano e sem esteira. Filas sem meta: "sem meta".
 
 v4.7 — thread do report em seções D-1 x Mês + Leitura; conversa na thread leva o contexto da fila.
 
@@ -161,7 +164,8 @@ _DEFAULT_FILA_OWNERS: dict[str, list[str]] = {
     "PF Cancelamento": ["@Adriana Ventura da Silva"],
     "PF Super Clientes": ["@Adriana Ventura da Silva"],
     "PF Revisão Manual": ["@Adriana Ventura da Silva"],
-    "CX Denúncia": ["U01V0SAKTCG"],  # Carlos Alexandre da Silva Porto
+    "CX Denúncia": ["U02CL56C46N"],
+    "Fraudes DX": ["U02CL56C46N"],
 }
 
 
@@ -180,6 +184,8 @@ FILA_OWNERS: dict[str, list[str]] = {**_DEFAULT_FILA_OWNERS, **_parse_owners(os.
 
 # TMA planejado por célula (aba PLAN do Excel mensal): tempo único (s) e média de interações.
 # TMA = tempo de atribuição por interação × média de interações por ticket (coluna X da CAPA).
+# Filas que não têm TMA (não aparece no report nem é cobrado)
+NO_TMA_FILAS = {"DX - PF Contestação", "DX - PF Contestação Bloqueio temporário"}
 _DEFAULT_TMA_PLAN: dict[str, tuple[float, float]] = {
     "CX Suporte": (520, 1.8), "Madrugada": (562, 1.89),
     "CX Review - AeC": (620, 2.05), "CX Review - CSU": (620, 2.05),
@@ -2804,6 +2810,8 @@ def _fmt_tempo(seconds: float) -> str:
 
 def _tma_data(fila: str, data: dict[str, Any]) -> dict[str, Any] | None:
     """TMA = tempo por interação × interações por ticket, no D-1 e no mês, contra o plan da célula."""
+    if any(_norm_text(fila) == _norm_text(f) for f in NO_TMA_FILAS):
+        return None
     tpi_d1, int_d1 = _num(data.get("tma_tpi_d1")), _num(data.get("tma_int_d1"))
     if tpi_d1 is None or int_d1 is None:
         return None
@@ -2850,7 +2858,7 @@ def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str]
 
     def csat_vs_meta(value: float) -> str:
         if meta is None:
-            return "⚪ meta a definir"
+            return "⚪ sem meta"
         if value < meta:
             return f"🔴 {_bfmt(meta - value)} p.p. abaixo da meta {_fmt_meta(meta)}%"
         return "🟢 na meta" if value == meta else f"🟢 {_bfmt(value - meta)} p.p. acima da meta {_fmt_meta(meta)}%"
@@ -3166,6 +3174,22 @@ def _variation_prompt(eps: str | None, fila: str, cur: tuple[date, date], ref: t
     )
 
 
+MIX_DOMINANT_SHARE = float(os.environ.get("MIX_DOMINANT_SHARE", "0.8"))  # mix responde por ≥80% da queda
+MIX_PERF_TOLERANCE_PP = 0.2  # performance estável (queda de até 0,2 p.p.)
+
+
+def _mix_dominant(data: dict[str, Any]) -> bool:
+    """Queda explicada pelo efeito mix: mudou o tipo de contato, não o atendimento. Nesse caso não se cobra plano."""
+    c_ref, c_cur = _num(data.get("csat_ref")), _num(data.get("csat_atual"))
+    mix, perf = _num(data.get("mix_pp")), _num(data.get("performance_pp"))
+    if None in (c_ref, c_cur, mix, perf):
+        return False
+    total = c_cur - c_ref
+    if total >= 0 or mix >= 0:
+        return False
+    return abs(mix) >= MIX_DOMINANT_SHARE * abs(total) and perf >= -MIX_PERF_TOLERANCE_PP
+
+
 def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref: str) -> str | None:
     c_ref, c_cur = _num(data.get("csat_ref")), _num(data.get("csat_atual"))
     if c_ref is None or c_cur is None:
@@ -3213,7 +3237,11 @@ def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref
     if leitura:
         lines.append("")
         lines.append(f"💡 {leitura}")
-    if perf is not None:
+    if _mix_dominant(data):
+        lines.append(f"👉 *Leitura:* a queda vem do efeito mix ({sign(mix)} p.p.): chegou mais contato de motivo com CSAT "
+                     "naturalmente menor, e o atendimento de cada motivo se manteve. Não é caso de plano de ação da EPS; "
+                     "é contexto para acompanhar o volume desses motivos.")
+    elif perf is not None:
         quem = (f"o efeito performance ({sign(perf)} p.p.) e os pilares Operador e Tempo da esteira"
                 if perf < 0 else "os pilares Operador e Tempo da esteira (a performance não piorou)")
         lines.append(f"👉 *Da EPS cobrar:* {quem}. Mix e amostra são contexto, não culpa da operação.")
@@ -3977,17 +4005,20 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             block_q = _report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or ""))
             if fila_q or block_q:
                 # esteira (Qualidade) em paralelo com a análise de variação (Indicadores): a pessoa não fica esperando
-                _say(say, "Vou levantar as causas: primeiro a análise da variação (mix de motivos e response rate), "
-                          "e em seguida a esteira de impacto por pilar. Leva alguns minutos ⏳", event, in_thread=True)
-                threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
+                _say(say, "Vou levantar as causas: primeiro a análise da variação (mix de motivos e response rate); "
+                          "se a queda não for só mix, em seguida a esteira de impacto por pilar. Leva alguns minutos ⏳",
+                          event, in_thread=True)
                 fila_v = block_q[1].get("fila") if block_q else fila_q
                 cur, ref, l_cur, l_ref = _variation_periods(question)
                 var_answer = ask_toqan(_variation_prompt(eps, fila_v, cur, ref), progress_callback=send_progress)
-                rendered = None if _is_error_answer(var_answer) else _render_variation(
-                    fila_v, _block_data_from_json(var_answer) or {}, l_cur, l_ref)
+                var_data = {} if _is_error_answer(var_answer) else (_block_data_from_json(var_answer) or {})
+                rendered = _render_variation(fila_v, var_data, l_cur, l_ref) if var_data else None
                 if rendered:
                     _say(say, rendered, event, in_thread=True)
+                    if not _mix_dominant(var_data):
+                        threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
                     return
+                threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
                 extra = ("INFORMAÇÃO INTERNA PARA A LYRA: a esteira de impacto (pilares Operador, Tempo, Política, Parceiro, "
                          "Produto) é postada separadamente pelo app nesta thread. NÃO chame a Lyra Qualidade e NÃO liste pilares: "
                          "chame só a Lyra Indicadores (Pedido: variação do CSAT) e responda a variação (efeito mix x performance "
