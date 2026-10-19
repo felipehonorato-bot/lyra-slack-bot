@@ -1,4 +1,4 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v4.7).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v4.8).
 
 v4.7 — thread do report em seções D-1 x Mês + Leitura; conversa na thread leva o contexto da fila.
 
@@ -386,7 +386,7 @@ DAILY_REPORT_PROMPT = (
     "compromisso = compromisso em aberto DESTA fila no contexto ('<ação> · prazo <dd/mm>') ou vazio.\n"
     "4. cobranca (se CSAT do D-1 abaixo da meta OU TMA do D-1 acima do plan — o plan vem na lista PLAN DE TMA desta mensagem): "
     "UMA frase de analista de CX, assertiva, que conecta os dados — problema do D-1 vs do mês (estrutural ou pontual), "
-    "a dispersão (índice Q4÷Q1 caindo = dispersão aumentou = comportamento operacional) e o TMA (se subiu por mais interações por ticket = não resolveu "
+    "a dispersão (índice Q4÷Q1 com duas casas, ex.: 0,86 → 0,76, nunca em %; caindo = dispersão aumentou = comportamento operacional) e o TMA (se subiu por mais interações por ticket = não resolveu "
     "no primeiro contato; se por tempo por interação = atendimento mais longo) — e termina numa pergunta direta sobre a ação. "
     "Sem 'Plano aqui na thread' (o app completa). elogio (CSAT e TMA no alvo): reconhecimento curto e específico.\n"
     "5. Só isso: nenhum título, texto, bullet, separador (---) ou comentário fora dessas linhas. Números com ponto decimal. "
@@ -2310,6 +2310,93 @@ def _parse_operators_csv(answer: str) -> tuple[list[list[str]], int | None]:
     return rows, total
 
 
+_DATA_EXCEL_RE = re.compile(r"\b(excel|xls|xlsx|planilha|csv|tabela em arquivo|arquivo)\b")
+
+
+def _is_data_excel_request(question: str) -> bool:
+    """Pedido de dados em planilha (ex.: "manda o CSAT por fila em excel"). MOP e operadores têm fluxo próprio."""
+    text = _norm_text(question)
+    asks = re.search(r"\b(manda|mande|envia|envie|gera|gere|gerar|exporta|exporte|exportar|extrai|extraia|"
+                     r"quero|queria|preciso|passa|passe|baixar|tira|tire|monta|monte|montar|coloca|coloque|colocar|pode|consegue|em|numa|num)\b", text)
+    return bool(_DATA_EXCEL_RE.search(text) and asks) and not re.search(r"\bmop\b", text)
+
+
+def _data_excel_prompt(eps: str | None, question: str, context: str) -> str:
+    return (
+        f"{_scope_instruction(eps)}\n\n{context}"
+        "TAREFA INTERNA DO APP — a pessoa pediu os dados em planilha. Busque os dados com o subagente certo "
+        "(Lyra Indicadores para números; Lyra Qualidade para causa raiz/comentários) e responda APENAS:\n"
+        "ARQUIVO: <nome curto do arquivo, sem extensão>\n"
+        "<CSV separado por ';', com cabeçalho em linguagem de negócio (sem nome de coluna técnica), uma linha por registro, "
+        "números com ponto decimal e sem símbolo de %>\n"
+        "Nada além disso (sem markdown, sem comentário). Respeite o escopo da EPS. Nunca dado pessoal de cliente. "
+        "E-mail de operador só se a pessoa pedir lista de operadores, e só da EPS do canal. "
+        "Se não der para consultar, responda só ERRO: <motivo>.\n\n"
+        f"Pedido: {question}"
+    )
+
+
+def _build_data_xlsx(header: list[str], rows: list[list[str]], title: str) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = (title or "Dados")[:31]
+    ws.append(header)
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="EA1D2C")
+    for r in rows:
+        ws.append([(_to_float(v) if _to_float(v) is not None and re.fullmatch(r"-?[\d.,]+", v.strip()) else v) for v in r])
+    for i, name in enumerate(header, start=1):
+        width = max([len(str(name))] + [len(str(r[i - 1])) for r in rows if len(r) >= i]) + 2
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = min(max(width, 10), 50)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _parse_data_csv(answer: str) -> tuple[str, list[str], list[list[str]]] | None:
+    text = _strip_json_code_blocks(answer or "").strip().strip("`")
+    name = "Dados"
+    lines = [l for l in text.splitlines() if l.strip()]
+    if lines and lines[0].upper().startswith("ARQUIVO:"):
+        name = lines.pop(0).split(":", 1)[1].strip() or name
+    lines = [l for l in lines if ";" in l]
+    if len(lines) < 2:
+        return None
+    header = [h.strip() for h in lines[0].split(";")]
+    rows = [[c.strip() for c in l.split(";")] for l in lines[1:]]
+    rows = [r + [""] * (len(header) - len(r)) for r in rows]
+    return name, header, rows
+
+
+def _send_data_excel(event: dict[str, Any], client: Any, eps: str | None, question: str) -> str | None:
+    answer = ask_toqan(_data_excel_prompt(eps, question, _thread_context(event)))
+    if _is_error_answer(answer):
+        return "Não consegui puxar esses dados agora. Tenta de novo em alguns minutos?"
+    parsed = _parse_data_csv(answer)
+    if not parsed:
+        return "Não consegui montar a planilha com esse pedido. Me diz quais colunas você quer (ex.: fila, CSAT, meta, TMA)."
+    name, header, rows = parsed
+    if eps:  # trava: e-mail de operador só da EPS do canal
+        rows = [r for r in rows if not any("@" in c and _eps_pattern(eps) not in c.lower() for c in r)]
+    safe = re.sub(r"[^\w\- ]+", "", name).strip().replace(" ", "_") or "Dados"
+    stamp = _now_brazil().strftime("%d-%m-%Y")
+    (client or slack_app.client).files_upload_v2(
+        channel=event.get("channel"),
+        thread_ts=event.get("thread_ts") or event.get("ts"),
+        content=_build_data_xlsx(header, rows, name),
+        filename=f"{safe}{('_' + eps) if eps else ''}_{stamp}.xlsx",
+        title=name,
+        initial_comment=f"Segue a planilha 📋 ({len(rows)} linha{'s' if len(rows) != 1 else ''})",
+    )
+    return None
+
+
 def _build_operators_xlsx(rows: list[list[str]], eps: str | None) -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill
@@ -2829,7 +2916,7 @@ def _report_prompt(tenant: Tenant, compromissos_text: str) -> str:
     return "\n\n".join(parts)
 
 
-ESTEIRA_ENABLED = os.getenv("ESTEIRA_ENABLED", "1").strip() not in {"0", "false", "não", "nao"}
+ESTEIRA_ENABLED = os.getenv("ESTEIRA_ENABLED", "0").strip() not in {"0", "false", "não", "nao"}
 ESTEIRA_PILARES_EPS = {"operador", "tempo"}
 _ESTEIRA_ORDER = ["Operador", "Tempo", "Política iFood", "Parceiro / logística", "Produto / sistema"]
 
@@ -2846,7 +2933,73 @@ def _esteira_prompt(tenant: Tenant, fila: str, gap: float, day: date) -> str:
     )
 
 
-def _render_esteira(data: dict[str, Any], gap: float) -> str | None:
+# Metas de CSAT por fila (as mesmas do prompt da Lyra Indicadores). Usadas na esteira sob demanda.
+FILA_METAS: dict[str, float] = {
+    "CX Suporte": 70, "Madrugada": 70, "CX Review - AeC": 70, "CX Super Cliente - AeC": 94,
+    "CX Review - CSU": 70, "CX Super Cliente - CSU": 94, "PF Cancelamento": 80, "PF Super Clientes": 88,
+    "PF Revisão Manual": 85, "CX Denúncia": 85,
+}
+ESTEIRA_MIN_GAP_PP = 0.3  # abaixo disso o gap é pequeno demais para dividir em p.p.: mostra só %
+_CAUSE_RE = re.compile(
+    r"\b(por que|porque|pq|motivo|motivos|causa|causas|explica|o que (esta|ta) puxando|de onde vem)\b.*"
+    r"\b(csat|caiu|cai|caindo|piorou|queda|gap|detrator|detratores|ruim|abaixo)\b"
+    r"|\b(csat|gap|detratores)\b.*\b(por que|porque|pq|causa|causas|motivo)\b"
+)
+
+
+def _is_cause_request(question: str) -> bool:
+    return bool(_CAUSE_RE.search(_norm_text(question)))
+
+
+def _fila_in_question(question: str, eps: str | None) -> str | None:
+    candidates = _celulas_of(eps) if eps else [f for cel in EPS_CELULAS.values() for f in cel]
+    text = _norm_text(question)
+    hits = [f for f in candidates if _norm_text(f) in text]
+    if hits:
+        return max(hits, key=len)
+    return _match_fila(question, candidates) if candidates else None
+
+
+def _esteira_on_demand_prompt(eps: str | None, fila: str, day: date, d1_only: bool) -> str:
+    meta = FILA_METAS.get(fila)
+    periodo = f"D-1 {day.strftime('%d/%m')}" if d1_only else f"mês ({day.replace(day=1).strftime('%d/%m')} a {day.strftime('%d/%m')})"
+    return (
+        f"{_scope_instruction(eps)}\n\n"
+        "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Chame o subagente *Lyra Qualidade* com exatamente:\n"
+        f"EPS: {eps or 'iFood'}\nPedido: esteira de impacto\nFila: {fila}\nPeríodo: {periodo}\n"
+        + (f"Meta: {_fmt_meta(meta)}%\nGap: calcule (meta − CSAT da fila no período; 0 se estiver na meta) e devolva no campo \"gap\"\n"
+           if meta is not None else "Gap: 0\n")
+        + "\nDevolva SOMENTE o JSON que ela responder (ou a linha ERRO: que vier), sem comentar."
+    )
+
+
+def _post_esteira_on_demand(event: dict[str, Any], eps: str | None, question: str) -> bool:
+    """Pergunta de causa ('por que o CSAT caiu?'): posta a esteira de impacto da fila na thread. True = postou."""
+    block = _report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or ""))
+    fila = block[1].get("fila") if block else _fila_in_question(question, eps)
+    if not fila:
+        return False
+    text_q = _norm_text(question)
+    d1_only = bool(re.search(r"\b(ontem|d-1|d1|dia anterior)\b", text_q)) and "mes" not in text_q
+    day = _today_brazil().date() - timedelta(days=1)
+    try:
+        answer = ask_toqan(_esteira_on_demand_prompt(eps, fila, day, d1_only))
+        if _is_error_answer(answer):
+            return False
+        data = _block_data_from_json(answer) or {}
+        gap = _num(data.get("gap")) or 0.0
+        text = _render_esteira(data, gap, periodo="do D-1" if d1_only else "do mês", fila=fila)
+        if not text:
+            return False
+        slack_app.client.chat_postMessage(channel=event.get("channel"), text=text,
+                                          thread_ts=event.get("thread_ts") or event.get("ts"))
+        return True
+    except Exception:
+        logger.exception("On-demand esteira failed (%s)", fila)
+        return False
+
+
+def _render_esteira(data: dict[str, Any], gap: float, periodo: str = "do mês", fila: str = "") -> str | None:
     """Esteira de impacto (cascata): gap da meta dividido entre os pilares pela proporção de detratores."""
     pilares = [p for p in (data.get("pilares") or []) if isinstance(p, dict) and (_num(p.get("detratores")) or 0) > 0
                and _norm_text(p.get("pilar")) != _norm_text("Sem causa clara")]
@@ -2856,7 +3009,7 @@ def _render_esteira(data: dict[str, Any], gap: float) -> str | None:
     rank = {_norm_text(n): i for i, n in enumerate(_ESTEIRA_ORDER)}
     pilares.sort(key=lambda p: (-(_num(p.get("detratores")) or 0), rank.get(_norm_text(p.get("pilar")), 99)))
     width = max(len(str(p.get("pilar"))) for p in pilares)
-    has_gap = gap > 0
+    has_gap = gap >= ESTEIRA_MIN_GAP_PP
     rows, eps_pp, eps_pct = [], 0.0, 0.0
     top_share = max((_num(p.get("detratores")) or 0) for p in pilares) / total
     for p in pilares:
@@ -2870,9 +3023,14 @@ def _render_esteira(data: dict[str, Any], gap: float) -> str | None:
             eps_pp += impact
             eps_pct += share
     n_txt = f"{_fmt_int(total)} detratores classificados"
-    head = (f"de onde vem o gap de {_bfmt(gap, 1)} p.p. do mês" if has_gap
-            else "o mês está na meta; peso de cada causa nos detratores")
-    lines = [f"🧱 *Esteira de impacto do mês* — {head} ({n_txt})",
+    alvo = f" · `{fila}`" if fila else ""
+    if has_gap:
+        head = f"de onde vem o gap de {_bfmt(gap, 1)} p.p."
+    elif gap > 0:
+        head = f"gap pequeno ({_bfmt(gap, 1)} p.p.); peso de cada causa nos detratores"
+    else:
+        head = "na meta; peso de cada causa nos detratores"
+    lines = [f"🧱 *Esteira de impacto {periodo}*{alvo} — {head} ({n_txt})",
              "```" + "\n".join(rows) + "```"]
     top = pilares[0]
     if top.get("padrao"):
@@ -3575,10 +3733,22 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
                 _say(say, problem, event, in_thread)
             return
 
+        if _is_data_excel_request(question):
+            _say(say, "Vou montar a planilha, já te mando aqui. ⏳", event, in_thread=True)
+            problem = _send_data_excel(event, client, eps, question)
+            if problem:
+                _say(say, problem, event, in_thread)
+            return
+
         def send_progress(message: str) -> None:
             _say(say, message, event, in_thread=True)
 
-        prompt = f"{_scope_instruction(eps)}\n\n{_thread_context(event)}{_inject_mop_context(question, eps)}"
+        extra = ""
+        if _is_cause_request(question) and _post_esteira_on_demand(event, eps, question):
+            extra = ("INFORMAÇÃO INTERNA PARA A LYRA: a esteira de impacto (pilares Operador, Tempo, Política, Parceiro, Produto) "
+                     "já foi postada nesta thread. NÃO repita os pilares: responda a variação do CSAT (efeito mix x performance "
+                     "e response rate, via Lyra Indicadores) e diga em 1 frase o que é da EPS cobrar.\n\n")
+        prompt = f"{_scope_instruction(eps)}\n\n{_thread_context(event)}{extra}{_inject_mop_context(question, eps)}"
         answer = ask_toqan(prompt, progress_callback=send_progress)
         _passive_access_check(answer)
         conv_blocks = _split_blocks(answer or "")
