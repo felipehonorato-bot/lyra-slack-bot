@@ -1,4 +1,14 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v4.3).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v4.6).
+
+v4.6 — TMA em segundos; dispersão pela régua do Cockpit (CSAT Q4 ÷ Q1); esteira de impacto do mês (Lyra Qualidade
+       v2.0) na thread das filas cobradas; owners por nome; Review e Canarinhos fora; chamados de moedas
+       (Fluxo Owners CX -> #rewards-engine-support-cx).
+
+v4.5 — TMA oficial no report (tempo de atribuição por interação × interações por ticket, vs plan da célula),
+       decomposto em "mais interações" x "tempo por interação"; fila fora do alvo de CSAT OU TMA é cobrada.
+
+v4.4 — report de analista: problema do D-1 x do mês, quadrantes mês x D-1 com dispersão, fila sem CSAT
+       no D-1 fica fora; Lyra lê a thread ao vivo e comenta o plano (feedback de analista) além de registrar.
 
 v4.3 — alarmística dos agentes: teste chega em cada subagente, reaviso enquanto continuar parado,
        teste na hora quando uma conversa volta com erro de acesso, aviso de agente esquecido na troca do token.
@@ -137,7 +147,7 @@ CONSOLIDATED = "Consolidado"
 # Células de cada EPS (fonte: Felipe, out/2026). O nome da EPS também é o trecho
 # procurado no e-mail do operador ("aec" em @if-aec..., "csu" em ...csu...).
 # Owners de cada fila (IDs do Slack), marcados nas cobranças do report.
-# Pode ser sobrescrito por FILA_OWNERS="CX Suporte:U1|U2;Madrugada:U3".
+# Pode ser sobrescrito por FILA_OWNERS="CX Suporte:U1|U2;Madrugada:U3" (aceita também "@Nome Sobrenome").
 _DEFAULT_FILA_OWNERS: dict[str, list[str]] = {
     "CX Suporte": ["U09GNBTALNN", "U094HUNCPFS"],
     "Madrugada": ["U094HUNCPFS"],
@@ -145,6 +155,11 @@ _DEFAULT_FILA_OWNERS: dict[str, list[str]] = {
     "CX Review - CSU": ["U05EVUPKF0R"],
     "CX Super Cliente - AeC": ["U09GNBTALNN"],
     "CX Super Cliente - CSU": ["U05EVUPKF0R"],
+    # por nome: o app procura o usuário no Slack (escopo users:read) e marca o ID certo
+    "PF Cancelamento": ["@Adriana Ventura da Silva"],
+    "PF Super Clientes": ["@Adriana Ventura da Silva"],
+    "PF Revisão Manual": ["@Adriana Ventura da Silva"],
+    "CX Denúncia": ["@Carlos Alexandre da Silva Porto"],
 }
 
 
@@ -159,16 +174,43 @@ def _parse_owners(raw: str) -> dict[str, list[str]]:
     return owners
 
 
-FILA_OWNERS: dict[str, list[str]] = _parse_owners(os.getenv("FILA_OWNERS", "")) or _DEFAULT_FILA_OWNERS
+FILA_OWNERS: dict[str, list[str]] = {**_DEFAULT_FILA_OWNERS, **_parse_owners(os.getenv("FILA_OWNERS", ""))}  # variável complementa/substitui por fila
+
+# TMA planejado por célula (aba PLAN do Excel mensal): tempo único (s) e média de interações.
+# TMA = tempo de atribuição por interação × média de interações por ticket (coluna X da CAPA).
+_DEFAULT_TMA_PLAN: dict[str, tuple[float, float]] = {
+    "CX Suporte": (520, 1.8), "Madrugada": (562, 1.89),
+    "CX Review - AeC": (620, 2.05), "CX Review - CSU": (620, 2.05),
+    "CX Super Cliente - AeC": (725, 1.73), "CX Super Cliente - CSU": (725, 1.73),
+    "PF Cancelamento": (450, 1.23), "PF Super Clientes": (400, 1.23), "PF Revisão Manual": (410, 1.27),
+    "CX Denúncia": (560, 1.0), "Fraudes DX": (585, 1.0),
+}
+
+
+def _parse_tma_plan(raw: str) -> dict[str, tuple[float, float]]:
+    """'CX Suporte:520/1.8;Madrugada:562/1.89' -> {fila: (tempo_unico_s, interacoes)}"""
+    plan: dict[str, tuple[float, float]] = {}
+    for part in raw.split(";"):
+        if ":" not in part or "/" not in part:
+            continue
+        fila, values = part.rsplit(":", 1)
+        tempo, inter = values.split("/", 1)
+        try:
+            plan[fila.strip()] = (float(tempo.replace(",", ".")), float(inter.replace(",", ".")))
+        except ValueError:
+            continue
+    return plan
+
+
+TMA_PLAN: dict[str, tuple[float, float]] = {**_DEFAULT_TMA_PLAN, **_parse_tma_plan(os.getenv("TMA_PLAN", ""))}
 ESCALATION_DELAY = timedelta(hours=5)
 
 EPS_CELULAS: dict[str, list[str]] = {
     "AeC": [
         "CX Suporte", "Madrugada", "CX Review - AeC", "CX Super Cliente - AeC",
-        "Fila desativada 37 - Canarinhos",
     ],
     "CSU": [
-        "Review", "CX Review - CSU", "CX Super Cliente - CSU", "PF Cancelamento",
+        "CX Review - CSU", "CX Super Cliente - CSU", "PF Cancelamento",
         "PF Super Clientes", "PF Revisão Manual", "CX Denúncia", "Fraudes DX",
         "DX - PF Contestação", "DX - PF Contestação Bloqueio temporário",
     ],
@@ -317,21 +359,34 @@ THREAD_DELIMITER = "===THREAD==="
 
 FILA_BLOCK_RE = re.compile(r"^\s*===\s*FILA\s*:\s*(?P<fila>.+?)\s*===\s*$", re.MULTILINE)
 DAILY_REPORT_PROMPT = (
-    "Report diário de CSAT por fila. ESTA TAREFA É DO APP: este contrato vale acima de qualquer layout do seu prompt. "
-    "Você NÃO escreve o texto do Slack — o app monta o layout. Você devolve só os dados.\n\n"
+    "Report diário por fila. ESTA TAREFA É DO APP: este contrato vale acima de qualquer layout do seu prompt. "
+    "Você NÃO escreve o texto do Slack — o app monta o layout. Você devolve só os dados e a frase de cobrança.\n\n"
     "1. Chame o Lyra Indicadores (EPS do escopo, 'Pedido: dados do report diário').\n"
-    "2. Para CADA fila da lista da EPS, escreva exatamente duas linhas:\n"
+    "2. Para CADA fila da EPS que teve avaliação de CSAT no D-1, escreva exatamente duas linhas "
+    "(fila sem avaliação no D-1 fica de fora — não escreva nada sobre ela):\n"
     "===FILA: <nome exato da fila>===\n"
-    '{"d1": 74.5, "n": 51, "var": 24.5, "meta": 85, "mes": 69.3, "ofensor": "item impróprio para consumo", '
-    '"ofensor_pp": -3.3, "q1": 7, "q2": 2, "q3": 0, "q4": 7, "reincidentes": 0, "compromisso": "", '
-    '"cobranca": "Q4 com 7 operadores e item impróprio puxando 3,3 p.p. — o que está sendo feito pra fechar esse gap?", "elogio": ""}\n'
-    "3. Campos: d1 = CSAT D-1 em %; n = avaliações em D-1; var = variação do D-1 vs dia anterior em p.p. (negativo se caiu); "
-    "meta em % (null se não definida); mes = CSAT do mês em %; ofensor = motivo de maior impacto negativo no D-1 "
-    "(texto curto, linguagem de gestão, sem nome de coluna); ofensor_pp = impacto em p.p. (negativo); q1..q4 = operadores em cada quadrante; "
-    "reincidentes = operadores reincidentes no Q4; compromisso = se houver compromisso em aberto DESTA fila no contexto, "
-    "'<ação> · prazo <dd/mm>', senão vazio; cobranca = UMA frase de cobrança pelo D-1, citando o que pesou e terminando em pergunta "
-    "(só se D-1 abaixo da meta; sem 'Plano aqui na thread', o app completa); elogio = reconhecimento curto (só se na meta ou acima).\n"
-    '4. Fila sem volume em D-1: {"sem_volume": true}.\n'
+    '{"d1": 91.7, "n": 399, "var": -0.2, "meta": 94, "mes": 93.9, '
+    '"ofensor": "pedido atrasado", "ofensor_pp": -2.8, "ofensor_mes": "pedido atrasado", "ofensor_mes_pp": -1.9, '
+    '"quad_mes": {"q1": 39, "q2": 46, "q3": 12, "q4": 14}, "quad_d1": {"q1": 20, "q2": 18, "q3": 9, "q4": 16}, '
+    '"disp_mes": {"q1": 98.5, "q4": 78.0}, "disp_d1": {"q1": 97.0, "q4": 62.0}, '
+    '"reincidentes": 3, "tma_tpi_d1": 379.6, "tma_int_d1": 1.92, "tma_tpi_mes": 368.4, "tma_int_mes": 1.90, "tma_tratados_d1": 2650, '
+    '"compromisso": "", '
+    '"cobranca": "Pedido atrasado tira 2,8 p.p. no D-1 e já é o problema do mês, e a dispersão aumentou — o que muda hoje na tratativa de atraso?", '
+    '"elogio": ""}\n'
+    "3. Campos: d1 = CSAT D-1 em %; n = avaliações no D-1; var = variação do D-1 vs dia anterior em p.p. (negativo se caiu); "
+    "meta em % (null se não definida); mes = CSAT do mês em %; ofensor / ofensor_pp = motivo de maior impacto negativo no D-1 "
+    "e o impacto em p.p. (negativo); ofensor_mes / ofensor_mes_pp = o mesmo no mês; "
+    "quad_mes / quad_d1 = quantidade de operadores em cada quadrante no mês e no D-1; "
+    "disp_mes / disp_d1 = CSAT (%) dos operadores do Q1 e do Q4 no mês e no D-1 (dispersão = Q4 ÷ Q1, régua do Cockpit); "
+    "reincidentes = operadores reincidentes no Q4; "
+    "tma_tpi_d1 / tma_tpi_mes = tempo de atribuição por interação em SEGUNDOS; tma_int_d1 / tma_int_mes = média de interações por ticket; "
+    "tma_tratados_d1 = interações tratadas no D-1 (copie do bloco TMA POR FILA do Indicadores; o app calcula o TMA e compara com o plan); "
+    "compromisso = compromisso em aberto DESTA fila no contexto ('<ação> · prazo <dd/mm>') ou vazio.\n"
+    "4. cobranca (se CSAT do D-1 abaixo da meta OU TMA do D-1 acima do plan — o plan vem na lista PLAN DE TMA desta mensagem): "
+    "UMA frase de analista de CX, assertiva, que conecta os dados — problema do D-1 vs do mês (estrutural ou pontual), "
+    "a dispersão (índice Q4÷Q1 caindo = dispersão aumentou = comportamento operacional) e o TMA (se subiu por mais interações por ticket = não resolveu "
+    "no primeiro contato; se por tempo por interação = atendimento mais longo) — e termina numa pergunta direta sobre a ação. "
+    "Sem 'Plano aqui na thread' (o app completa). elogio (CSAT e TMA no alvo): reconhecimento curto e específico.\n"
     "5. Só isso: nenhum título, texto, bullet, separador (---) ou comentário fora dessas linhas. Números com ponto decimal. "
     "Nunca nome, usuário ou e-mail de operador. Não escreva menções (@).\n"
     "6. Se qualquer consulta falhar ou voltar vazia: responda SOMENTE uma linha começando com ERRO: e o motivo."
@@ -1805,7 +1860,7 @@ def _strip_json_code_blocks(answer: str) -> str:
     return match.group(1).strip() if match else text
 
 
-def _parse_extraction(answer: str) -> dict[str, list[dict[str, Any]]] | None:
+def _parse_extraction(answer: str) -> dict[str, Any] | None:
     text = _strip_json_code_blocks(answer)
     parsed: Any = None
     try:
@@ -1818,11 +1873,12 @@ def _parse_extraction(answer: str) -> dict[str, list[dict[str, Any]]] | None:
             except json.JSONDecodeError:
                 parsed = None
     if isinstance(parsed, list):
-        return {"novos": [i for i in parsed if isinstance(i, dict)], "atualizacoes": []}
+        return {"novos": [i for i in parsed if isinstance(i, dict)], "atualizacoes": [], "feedback": ""}
     if isinstance(parsed, dict):
         return {
             "novos": [i for i in (parsed.get("novos") or []) if isinstance(i, dict)],
             "atualizacoes": [i for i in (parsed.get("atualizacoes") or []) if isinstance(i, dict)],
+            "feedback": str(parsed.get("feedback") or "").strip(),
         }
     return None
 
@@ -1832,7 +1888,8 @@ def _extract_commitments_via_toqan(
     filas: list[str],
     existing: list[tuple[int, dict[str, str]]],
     today: datetime | date,
-) -> dict[str, list[dict[str, Any]]]:
+    context: str = "",
+) -> dict[str, Any]:
     """Pede ao Toqan os compromissos novos e as atualizações dos já registrados."""
     base = _as_date(today)
     weekday = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"][base.weekday()]
@@ -1849,10 +1906,13 @@ def _extract_commitments_via_toqan(
         f"Hoje é {_format_date(base)} ({weekday}).\n"
         f"Filas do report: {', '.join(filas) if filas else '(não identificadas)'}\n"
         f"Compromissos já registrados nesta thread:\n{existing_lines}\n\n"
+        + (f"Report desta fila (o que foi cobrado):\n{context[:1500]}\n\n" if context else "")
+        +
         "Mensagens novas da liderança:\n" + "\n---\n".join(messages) + "\n\n"
         "Formato de saída:\n"
         '{"novos":[{"fila":"...","acao":"...","responsavel":"...","prazo":"dd/mm/aaaa ou a definir"}],'
-        '"atualizacoes":[{"linha":12,"acao":"...","responsavel":"...","prazo":"dd/mm/aaaa"}]}\n\n'
+        '"atualizacoes":[{"linha":12,"acao":"...","responsavel":"...","prazo":"dd/mm/aaaa"}],'
+        '"feedback":"..."}\n\n'
         "Regras:\n"
         "- novos: planos de ação novos. fila = exatamente um nome da lista de filas; se não der pra saber, use \"Geral\".\n"
         "- atualizacoes: quando a mensagem completa ou corrige um compromisso já registrado (ex.: informa o prazo "
@@ -1861,7 +1921,14 @@ def _extract_commitments_via_toqan(
         "\"fim do mês\" = último dia do mês). Sem prazo → \"a definir\".\n"
         "- responsavel: quem executa; se não mencionado, \"Liderança\".\n"
         "- Status de compromisso (\"concluído\", \"em andamento\") não é compromisso novo.\n"
-        '- Não invente. Sem plano nem atualização → {"novos":[],"atualizacoes":[]}'
+        '- Não invente. Sem plano nem atualização → {"novos":[],"atualizacoes":[],"feedback":"..."}\n'
+        "- feedback: sua avaliação de analista de CX sobre o que a liderança respondeu, para postar na thread "
+        "(1 a 3 frases, tom de colega exigente e respeitoso, formatação Slack com *um asterisco*). Compare com o report: "
+        "a ação ataca o problema cobrado (motivo de maior impacto, dispersão/Q4)? É concreta (o quê, para quem, quando)? "
+        "Tem responsável, prazo e como medir o efeito? Se o plano é bom, reconheça em uma frase e diga o que vai acompanhar. "
+        "Se é genérico (\"treinamento\", \"acompanhar\", \"alinhar\") ou não ataca a causa, aponte o que falta e faça UMA pergunta objetiva. "
+        "Se a mensagem não é plano nem status (ex.: só \"ok\", \"vamos ver\"), peça o plano no formato ação · responsável · prazo. "
+        "Nunca cite nome de operador. Vazio só se a mensagem não tiver relação com o report."
     )
     answer = ask_toqan(prompt)
     parsed = _parse_extraction(answer)
@@ -1869,7 +1936,7 @@ def _extract_commitments_via_toqan(
         logger.warning("Commitment extraction was not JSON; keeping raw message as commitment")
         raw = " / ".join(m.strip() for m in messages if m.strip())[:200]
         return {"novos": [{"fila": FILA_GERAL, "acao": raw, "responsavel": "Liderança", "prazo": "a definir"}],
-                "atualizacoes": []}
+                "atualizacoes": [], "feedback": ""}
     return parsed
 
 
@@ -1903,7 +1970,25 @@ def _fetch_thread(channel_id: str, report_ts: str) -> list[dict[str, Any]]:
     return messages
 
 
+_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock(report_ts: str) -> threading.Lock:
+    with _THREAD_LOCKS_GUARD:
+        return _THREAD_LOCKS.setdefault(report_ts, threading.Lock())
+
+
 def _read_report_thread(
+    channel_id: str, report_ts: str, phase: str, today: datetime | date | None = None,
+    tenant_key: str = CONSOLIDATED, fila: str = "", register_no_reply: bool = True,
+) -> dict[str, int]:
+    """Lê a thread (uma leitura por vez por thread: agendada e ao vivo não se atropelam)."""
+    with _thread_lock(report_ts):
+        return _read_report_thread_locked(channel_id, report_ts, phase, today, tenant_key, fila, register_no_reply)
+
+
+def _read_report_thread_locked(
     channel_id: str, report_ts: str, phase: str, today: datetime | date | None = None,
     tenant_key: str = CONSOLIDATED, fila: str = "", register_no_reply: bool = True,
 ) -> dict[str, int]:
@@ -1943,7 +2028,8 @@ def _read_report_thread(
             worksheet.append_row(_sem_resposta_row(report_ts, base, tenant_key), value_input_option="RAW")
         return {"novos": 0, "atualizados": 0}
 
-    extraction = _extract_commitments_via_toqan([text for _, text in new_records], filas, thread_rows, base)
+    extraction = _extract_commitments_via_toqan([text for _, text in new_records], filas, thread_rows, base,
+                                                context=report_text)
 
     # novos
     new_rows: list[list[str]] = []
@@ -1996,13 +2082,19 @@ def _read_report_thread(
 
     STATE.set(captured_key, ",".join(sorted(captured | {t for t, _ in new_records})))
 
-    if new_rows or updated:
-        parts = []
-        if new_rows:
-            parts.append(f"{len(new_rows)} novo(s) compromisso(s)")
-        if updated:
-            parts.append(f"{updated} atualizado(s)")
-        text = f"Registrado: {' e '.join(parts)} ✅"
+    feedback = str(extraction.get("feedback") or "").strip()
+    if new_rows or updated or feedback:
+        chunks = []
+        if feedback:
+            chunks.append(feedback)
+        if new_rows or updated:
+            parts = []
+            if new_rows:
+                parts.append(f"{len(new_rows)} novo(s) compromisso(s)")
+            if updated:
+                parts.append(f"{updated} atualizado(s)")
+            chunks.append(f"Registrado: {' e '.join(parts)} ✅")
+        text = "\n\n".join(chunks)
         if missing_deadline:
             text += "\nQual o prazo para:\n" + "\n".join(f"• {a[:120]}" for a in missing_deadline)
         slack_app.client.chat_postMessage(channel=channel_id, text=text, thread_ts=report_ts)
@@ -2014,6 +2106,58 @@ def _read_report_thread(
 # ---------------------------------------------------------------------------
 _MENTION_ID_RE = re.compile(r"<@(U[A-Z0-9]+)>")
 _BULLET_FILA_RE = re.compile(r"^\s*[•\-]\s*\*(?P<fila>[^*\n]+?)\s*:?\s*\*")
+
+
+_SLACK_USERS_CACHE: dict[str, Any] = {"at": None, "by_name": {}}
+_UNRESOLVED_OWNERS_ALERTED: set[str] = set()
+
+
+def _slack_users_by_name() -> dict[str, list[str]]:
+    """{nome normalizado: [IDs]} a partir do Slack (real_name e display_name). Cache de 6h."""
+    at = _SLACK_USERS_CACHE["at"]
+    if at and _now_brazil() - at < timedelta(hours=6):
+        return _SLACK_USERS_CACHE["by_name"]
+    by_name: dict[str, list[str]] = {}
+    try:
+        cursor = None
+        for _ in range(50):
+            kwargs: dict[str, Any] = {"limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = slack_app.client.users_list(**kwargs)
+            for u in _resp_get(resp, "members", []) or []:
+                if u.get("deleted") or u.get("is_bot"):
+                    continue
+                prof = u.get("profile") or {}
+                for name in {u.get("real_name"), prof.get("real_name"), prof.get("display_name")}:
+                    if name:
+                        by_name.setdefault(_norm_text(name), [])
+                        if u["id"] not in by_name[_norm_text(name)]:
+                            by_name[_norm_text(name)].append(u["id"])
+            cursor = (_resp_get(resp, "response_metadata", {}) or {}).get("next_cursor")
+            if not cursor:
+                break
+    except Exception:
+        logger.warning("Could not list Slack users (falta o escopo users:read?)", exc_info=True)
+        return _SLACK_USERS_CACHE["by_name"]
+    _SLACK_USERS_CACHE.update(at=_now_brazil(), by_name=by_name)
+    return by_name
+
+
+def _owner_mention(owner: str) -> str:
+    """'U123' → <@U123>; '@Nome Sobrenome' → <@ID> achado no Slack (ou o nome em texto, com alerta)."""
+    owner = owner.strip()
+    if re.fullmatch(r"[UW][A-Z0-9]{6,}", owner):
+        return f"<@{owner}>"
+    name = owner.lstrip("@").strip()
+    ids = _slack_users_by_name().get(_norm_text(name), [])
+    if len(ids) == 1:
+        return f"<@{ids[0]}>"
+    if name not in _UNRESOLVED_OWNERS_ALERTED:
+        _UNRESOLVED_OWNERS_ALERTED.add(name)
+        motivo = "mais de uma pessoa com esse nome" if ids else "não achei no Slack"
+        _alert(f"Owner '{name}': {motivo}. Coloque o ID do Slack em FILA_OWNERS. Por enquanto vai o nome em texto.")
+    return f"@{name}"
 
 
 def _owners_for(fila_label: str) -> list[str]:
@@ -2037,7 +2181,7 @@ def _tag_owners(main: str) -> str:
         match = _BULLET_FILA_RE.match(line)
         if not match:
             continue
-        mentions = [f"<@{uid}>" for uid in _owners_for(match.group("fila")) if f"<@{uid}>" not in line]
+        mentions = [m for m in (_owner_mention(o) for o in _owners_for(match.group("fila"))) if m and m not in line]
         if mentions:
             lines[i] = line.rstrip() + " " + " ".join(mentions)
     return "\n".join(lines)
@@ -2211,7 +2355,7 @@ def _tag_block(fila: str, text: str) -> tuple[str, bool]:
         stripped = line.strip()
         if stripped.startswith("👉") or _norm_text(stripped.lstrip("•").strip().strip("*")).startswith("cobranca"):
             has_cobranca = True
-            mentions = [f"<@{uid}>" for uid in _owners_for(fila) if f"<@{uid}>" not in line]
+            mentions = [m for m in (_owner_mention(o) for o in _owners_for(fila)) if m and m not in line]
             if mentions:
                 lines[i] = line.rstrip() + " " + " ".join(mentions)
     return "\n".join(lines), has_cobranca
@@ -2290,8 +2434,14 @@ def _block_data_from_text(text: str) -> dict[str, Any]:
             if pp:
                 value = _num(pp.group(1)) or 0
                 data["ofensor_pp"] = -abs(value)
-            name = re.split(r"\s*(?:·|\(|—| - |,\s*tira|\btira\b)", rest, maxsplit=1)[0]
-            data["ofensor"] = name.strip(" *:.")
+            name = re.split(r"\s*(?:·|\(|—| - |,\s*tira|\btira\b|\|)", rest, maxsplit=1)[0]
+            data["ofensor"] = re.sub(r"^D\s*-\s*1\s*:?\s*", "", name.strip(" *:."), flags=re.IGNORECASE)
+            mes_part = re.search(r"\|\s*m[eê]s\s*:?\s*(.+)", rest, re.IGNORECASE)
+            if mes_part:
+                data["ofensor_mes"] = re.split(r"\s*(?:·|\(|—|\btira\b)", mes_part.group(1), maxsplit=1)[0].strip(" *:.")
+                pp_mes = _X_PP_RE.search(mes_part.group(1))
+                if pp_mes:
+                    data["ofensor_mes_pp"] = -abs(_num(pp_mes.group(1)) or 0)
             break
     q4 = _X_Q4_RE.search(clean)
     if q4:
@@ -2326,77 +2476,256 @@ def _block_status(data: dict[str, Any]) -> str:
     return "abaixo" if data["d1"] < data["meta"] else "ok"
 
 
-def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str]:
-    """(título no canal, corpo na thread). Layout fixo, venha o que vier do modelo."""
-    dd = day.strftime("%d/%m")
+QUAD_KEYS = ("q1", "q2", "q3", "q4")
+DISPERSION_ALERT_PP = 5.0  # variação de Q3+Q4 (p.p. dos operadores) que conta como mudança de dispersão
+
+
+def _quad(data: dict[str, Any], key: str) -> dict[str, float] | None:
+    """Quantidade de operadores por quadrante ({q1..q4}) no mês ou no D-1."""
+    raw = data.get(key)
+    if key == "quad_mes" and not isinstance(raw, dict) and any(data.get(q) is not None for q in QUAD_KEYS):
+        raw = {q: data.get(q) for q in QUAD_KEYS}  # formato antigo: q1..q4 soltos
+    if not isinstance(raw, dict):
+        return None
+    values = {q: _num(raw.get(q)) or 0.0 for q in QUAD_KEYS}
+    return values if sum(values.values()) > 0 else None
+
+
+def _quad_shares(quad: dict[str, float]) -> dict[str, float]:
+    total = sum(quad.values())
+    return {q: 100.0 * v / total for q, v in quad.items()}
+
+
+def _quad_line(label: str, quad: dict[str, float]) -> str:
+    shares = _quad_shares(quad)
+    parts = " · ".join(f"{q.upper()} {round(shares[q]):d}%" for q in QUAD_KEYS)
+    return f"`{label} │ {parts}`"
+
+
+DISPERSION_ALERT = 0.05  # variação do índice (CSAT Q4 ÷ CSAT Q1) que conta como mudança
+
+
+def _disp_index(data: dict[str, Any], key: str) -> float | None:
+    """Dispersão (régua do Cockpit) = CSAT dos operadores do Q4 ÷ CSAT dos operadores do Q1. Perto de 1 = homogêneo."""
+    raw = data.get(key)
+    if not isinstance(raw, dict):
+        return None
+    q1, q4 = _num(raw.get("q1")), _num(raw.get("q4"))
+    if not q1 or q4 is None:
+        return None
+    return q4 / q1
+
+
+def _dispersion(data: dict[str, Any]) -> tuple[str, float, float] | None:
+    """('aumentou' | 'diminuiu' | 'estável', índice mês, índice D-1). Índice caindo = dispersão aumentando."""
+    mes, d1 = _disp_index(data, "disp_mes"), _disp_index(data, "disp_d1")
+    if mes is None or d1 is None:
+        return None
+    delta = d1 - mes
+    trend = "aumentou" if delta <= -DISPERSION_ALERT else "diminuiu" if delta >= DISPERSION_ALERT else "estável"
+    return trend, mes, d1
+
+
+def _same_reason(a: Any, b: Any) -> bool:
+    na, nb = _norm_text(a), _norm_text(b)
+    return bool(na) and bool(nb) and (na == nb or na in nb or nb in na)
+
+
+def _fmt_tempo(seconds: float) -> str:
+    """Tempos sempre em segundos (preferência do time), ex.: 802 s."""
+    return f"{_fmt_int(seconds)} s"
+
+
+def _tma_data(fila: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    """TMA = tempo por interação × interações por ticket, no D-1 e no mês, contra o plan da célula."""
+    tpi_d1, int_d1 = _num(data.get("tma_tpi_d1")), _num(data.get("tma_int_d1"))
+    if tpi_d1 is None or int_d1 is None:
+        return None
+    tpi_mes, int_mes = _num(data.get("tma_tpi_mes")), _num(data.get("tma_int_mes"))
+    plan_key = next((k for k in TMA_PLAN if _norm_text(k) == _norm_text(fila)), None)  # nome exato: "Review" ≠ "CX Review - AeC"
+    plan = TMA_PLAN.get(plan_key) if plan_key else None
+    out: dict[str, Any] = {
+        "d1": tpi_d1 * int_d1, "tpi_d1": tpi_d1, "int_d1": int_d1,
+        "mes": (tpi_mes * int_mes) if tpi_mes is not None and int_mes is not None else None,
+        "tratados": _num(data.get("tma_tratados_d1")),
+        "plan": None,
+    }
+    if plan:
+        tempo_unico, inter_plan = plan
+        out.update(plan=tempo_unico, int_plan=inter_plan, tpi_plan=tempo_unico / inter_plan if inter_plan else None)
+    return out
+
+
+def _tma_status(tma: dict[str, Any] | None) -> str:
+    if not tma:
+        return "sem_dado"
+    if tma.get("plan") is None:
+        return "sem_plan"
+    return "acima" if tma["d1"] > tma["plan"] else "ok"
+
+
+def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str] | None:
+    """(título no canal, corpo na thread). None = fila sem CSAT no D-1 (não entra no report)."""
     status = _block_status(data)
-    title = f"*Governança ·* `{fila}` *— {dd}*"
     if status == "sem_volume":
-        return title + " · sem volume em D-1", ""
+        return None
+    dd = day.strftime("%d/%m")
     d1, meta, mes = data["d1"], data.get("meta"), data.get("mes")
+    tma = _tma_data(fila, data)
+    tstatus = _tma_status(tma)
+    off = status == "abaixo" or tstatus == "acima"
+    has_target = meta is not None or tstatus in {"ok", "acima"}
+    emoji = "🔴" if off else ("🟢" if has_target else "⚪")
+    title = f"{emoji} *Governança ·* `{fila}` *— {dd}* · CSAT {_bfmt(d1)}%" + (
+        f" (meta {_fmt_meta(meta)}%)" if meta is not None else "")
+    if tma:
+        title += f" · TMA {_fmt_tempo(tma['d1'])}" + (f" (plan {_fmt_tempo(tma['plan'])})" if tma.get("plan") else "")
+
+    lines: list[str] = []
+    # CSAT
     extra = []
     if data.get("n") is not None:
         extra.append(f"n={_fmt_int(data['n'])}")
     if data.get("var") is not None:
-        extra.append(f"{'▼' if data['var'] < 0 else '▲'} {_bfmt(abs(data['var']))} p.p.")
-    resultado = (f"Mês {_bfmt(mes)}% · " if mes is not None else "") + f"D-1 {_bfmt(d1)}%"
-    if extra:
-        resultado += f" ({', '.join(extra)})"
-    lines = [f"• *Resultado:* {resultado}"]
+        extra.append(f"{'▼' if data['var'] < 0 else '▲'} {_bfmt(abs(data['var']))} p.p. vs dia anterior")
+    resultado = f"D-1 *{_bfmt(d1)}%*" + (f" ({' · '.join(extra)})" if extra else "")
+    if mes is not None:
+        resultado += f" · Mês {_bfmt(mes)}%"
+    lines.append(f"📊 *CSAT:* {resultado}")
     if meta is None:
-        lines.append("• *Meta:* a definir")
+        lines.append("🎯 *Meta:* a definir")
     elif status == "abaixo":
-        lines.append(f"• *Meta {_fmt_meta(meta)}%:* D-1 {_bfmt(meta - d1)} p.p. abaixo")
+        lines.append(f"🎯 *Meta {_fmt_meta(meta)}%:* D-1 {_bfmt(meta - d1)} p.p. abaixo")
     elif d1 == meta:
-        lines.append(f"• *Meta {_fmt_meta(meta)}%:* D-1 na meta")
+        lines.append(f"🎯 *Meta {_fmt_meta(meta)}%:* D-1 na meta")
     else:
-        lines.append(f"• *Meta {_fmt_meta(meta)}%:* D-1 {_bfmt(d1 - meta)} p.p. acima")
-    if data.get("ofensor"):
-        impacto = str(data["ofensor"]).strip()
-        if data.get("ofensor_pp") is not None:
-            impacto += f" · tira {_bfmt(abs(data['ofensor_pp']))} p.p."
-        lines.append(f"• *Maior impacto:* {impacto}")
-    quads = [(q, data.get(q.lower())) for q in ("Q1", "Q2", "Q3", "Q4")]
-    if any(v is not None for _, v in quads):
-        quad = " · ".join(f"{q} {_fmt_int(v or 0)}" for q, v in quads)
-        if data.get("reincidentes") is not None:
-            n_re = int(data["reincidentes"])
-            quad += f" · {n_re} reincidente" + ("" if n_re == 1 else "s")
-        lines.append(f"• *Quadrantes:* {quad}")
+        lines.append(f"🎯 *Meta {_fmt_meta(meta)}%:* D-1 {_bfmt(d1 - meta)} p.p. acima")
+
+    # TMA
+    if tma:
+        tline = f"D-1 *{_fmt_tempo(tma['d1'])}*"
+        if tma.get("tratados") is not None:
+            tline += f" ({_fmt_int(tma['tratados'])} tratados)"
+        if tma.get("mes") is not None:
+            tline += f" · Mês {_fmt_tempo(tma['mes'])}"
+        if tma.get("plan") is not None:
+            diff = tma["d1"] - tma["plan"]
+            tline += f" · Plan {_fmt_tempo(tma['plan'])} → " + (
+                f"{_fmt_tempo(diff)} acima do plan" if diff > 0 else
+                "no plan" if abs(diff) < 1 else f"{_fmt_tempo(-diff)} abaixo do plan")
+        lines.append("")
+        lines.append(f"⏱️ *TMA:* {tline}")
+        if tstatus == "acima" and tma.get("tpi_plan") and tma.get("int_plan"):
+            r_int = tma["int_d1"] / tma["int_plan"]
+            r_tpi = tma["tpi_d1"] / tma["tpi_plan"]
+            detail = (f"{_bfmt(tma['int_d1'], 2)} interações por ticket vs {_bfmt(tma['int_plan'], 2)} do plan · "
+                      f"tempo por interação {_fmt_tempo(tma['tpi_d1'])} vs {_fmt_tempo(tma['tpi_plan'])}")
+            if r_int >= r_tpi:
+                lines.append(f"↳ Puxado por *mais interações por ticket*: {detail}. Cliente voltando mais = "
+                             "não resolveu no primeiro contato.")
+            else:
+                lines.append(f"↳ Puxado por *tempo por interação*: {detail}. Atendimento mais longo = "
+                             "condução, procedimento ou ferramenta.")
+        elif tstatus == "sem_plan":
+            lines.append("↳ Plan de TMA a definir para esta fila.")
+
+    # Problema do D-1 x problema do mês
+    def problema(name_key: str, pp_key: str) -> str:
+        text = str(data.get(name_key) or "").strip()
+        if text and data.get(pp_key) is not None:
+            text += f" · tira {_bfmt(abs(_num(data[pp_key]) or 0))} p.p."
+        return text
+    p_d1, p_mes = problema("ofensor", "ofensor_pp"), problema("ofensor_mes", "ofensor_mes_pp")
+    if p_d1 or p_mes:
+        lines.append("")
+        if p_d1:
+            lines.append(f"🔍 *Problema do D-1 (CSAT):* {p_d1}")
+        if p_mes:
+            lines.append(f"🗓️ *Problema do mês (CSAT):* {p_mes}")
+        if p_d1 and p_mes:
+            if _same_reason(data.get("ofensor"), data.get("ofensor_mes")):
+                lines.append("↳ Mesmo problema no D-1 e no mês: é estrutural, não pontual.")
+            else:
+                lines.append("↳ O problema do D-1 é diferente do mês: vale entender o que mudou ontem.")
+
+    # Quadrantes e dispersão
+    quad_mes, quad_d1 = _quad(data, "quad_mes"), _quad(data, "quad_d1")
+    if quad_mes or quad_d1:
+        lines.append("")
+        lines.append("👥 *Quadrantes de CSAT* (% dos operadores)")
+        if quad_mes:
+            lines.append(_quad_line("Mês", quad_mes))
+        if quad_d1:
+            lines.append(_quad_line("D-1", quad_d1))
+        disp = _dispersion(data)
+        reinc = data.get("reincidentes")
+        reinc_txt = ""
+        if reinc is not None:
+            n_re = int(_num(reinc) or 0)
+            reinc_txt = f" {n_re} reincidente{'s' if n_re != 1 else ''} no Q4."
+        if disp:
+            trend, idx_mes, idx_d1 = disp
+            change = f"índice Q4÷Q1 foi de {_bfmt(idx_mes, 2)} no mês para {_bfmt(idx_d1, 2)} no D-1"
+            if trend == "aumentou":
+                lines.append(f"↳ 📈 *Dispersão aumentou:* {change} — piora no comportamento operacional.{reinc_txt}")
+            elif trend == "diminuiu":
+                lines.append(f"↳ 📉 *Dispersão diminuiu:* {change} — operação mais homogênea.{reinc_txt}")
+            else:
+                lines.append(f"↳ Dispersão estável: {change}.{reinc_txt}")
+        elif reinc_txt:
+            lines.append(f"↳{reinc_txt}")
+
+    # Compromisso e cobrança / destaque
     compromisso = str(data.get("compromisso") or "").strip()
+    if compromisso or off or has_target:
+        lines.append("")
     if compromisso:
-        lines.append(f"• *Compromisso:* {compromisso} — qual o status?")
-    if status == "abaixo":
+        lines.append(f"📌 *Compromisso em aberto:* {compromisso} — qual o status?")
+    if off:
         cobranca = str(data.get("cobranca") or data.get("pergunta") or "").strip()
         cobranca = re.split(r"\s*Plano aqui na thread", cobranca, maxsplit=1)[0].strip()
         if not cobranca:
-            cobranca = f"faltou {_bfmt(meta - d1)} p.p. pra meta — o que está sendo feito pra fechar esse gap?"
+            gaps = []
+            if status == "abaixo":
+                gaps.append(f"CSAT {_bfmt(meta - d1)} p.p. abaixo da meta")
+            if tstatus == "acima":
+                gaps.append(f"TMA {_fmt_tempo(tma['d1'] - tma['plan'])} acima do plan")
+            cobranca = f"{' e '.join(gaps)} no D-1 — o que está sendo feito pra corrigir?"
         if not cobranca.endswith("?"):
             cobranca = cobranca.rstrip(".") + "?"
-        lines.append(f"*Cobrança:* {cobranca} Plano aqui na thread até 14h: *ação · responsável · prazo*.")
-    elif status == "ok":
-        elogio = str(data.get("elogio") or "").strip() or (
-            "na meta, bom trabalho, time." if d1 == meta else "acima da meta, bom trabalho, time.")
-        lines.append(f"*Destaque:* {elogio}")
-    return title, "\n".join(lines)
+        lines.append(f"👉 *Cobrança:* {cobranca} Plano aqui na thread até 14h: *ação · responsável · prazo*.")
+    elif has_target:
+        elogio = str(data.get("elogio") or "").strip() or "CSAT e TMA dentro do esperado, bom trabalho, time."
+        lines.append(f"✅ *Destaque:* {elogio}")
+    return title, "\n".join(lines).strip()
+
+
+_LAST_BLOCK_DATA: dict[str, dict[str, Any]] = {}
 
 
 def _prepare_blocks(blocks: list[tuple[str, str]], day: date) -> list[tuple[str, str, str]]:
-    """[(fila, título, corpo)] no layout fixo, ordenado: abaixo da meta (maior gap primeiro), na meta, sem meta, sem volume."""
+    """[(fila, título, corpo)] no layout fixo. Filas sem CSAT no D-1 ficam fora.
+    Ordem: fora do alvo (maior gap de CSAT, depois maior excesso de TMA), no alvo, sem meta."""
     prepared = []
     for fila, text in blocks:
         data = _block_data_from_json(text) or _block_data_from_text(text)
         status = _block_status(data)
-        if status != "sem_volume" or data.get("sem_volume"):
-            title, body = _render_block(fila, data, day)
-        else:  # não deu pra ler número nenhum: título fixo + texto do modelo na thread, sem separadores
-            title = f"*Governança ·* `{fila}` *— {day.strftime('%d/%m')}*"
-            body = "\n".join(l for l in text.splitlines() if l.strip() not in {"---", "***", "• • •"}).strip()
-        gap = (data["meta"] - data["d1"]) if status == "abaixo" else 0
-        order = {"abaixo": 0, "ok": 1, "sem_meta": 2, "sem_volume": 3}[status]
-        prepared.append((order, -gap, fila, title, body))
-    prepared.sort(key=lambda item: (item[0], item[1]))
-    return [(fila, title, body) for _, _, fila, title, body in prepared]
+        if status == "sem_volume":
+            continue
+        rendered = _render_block(fila, data, day)
+        if rendered is None:
+            continue
+        title, body = rendered
+        _LAST_BLOCK_DATA[fila] = data
+        tma = _tma_data(fila, data)
+        tstatus = _tma_status(tma)
+        csat_gap = (data["meta"] - data["d1"]) if status == "abaixo" else 0.0
+        tma_excess = (tma["d1"] / tma["plan"] - 1) if tstatus == "acima" else 0.0
+        off = status == "abaixo" or tstatus == "acima"
+        order = 0 if off else (1 if (data.get("meta") is not None or tstatus == "ok") else 2)
+        prepared.append((order, -csat_gap, -tma_excess, fila, title, body))
+    prepared.sort(key=lambda item: item[:3])
+    return [(fila, title, body) for *_, fila, title, body in prepared]
 
 
 def _block_csat(fila: str, text: str) -> dict[str, float] | None:
@@ -2435,8 +2764,97 @@ def _report_prompt(tenant: Tenant, compromissos_text: str) -> str:
     parts = [scope]
     if compromissos_text:
         parts.append(compromissos_text)
+    filas_tenant = _celulas_of(tenant.eps) if tenant.eps else list(TMA_PLAN)
+    plan_lines = [f"- {f}: {_fmt_tempo(TMA_PLAN[f][0])}" for f in filas_tenant if f in TMA_PLAN]
+    if plan_lines:
+        parts.append("PLAN DE TMA (TMA acima do plan = fora do alvo):\n" + "\n".join(plan_lines))
     parts.append(DAILY_REPORT_PROMPT)
     return "\n\n".join(parts)
+
+
+ESTEIRA_ENABLED = os.getenv("ESTEIRA_ENABLED", "1").strip() not in {"0", "false", "não", "nao"}
+ESTEIRA_PILARES_EPS = {"operador", "tempo"}
+_ESTEIRA_ORDER = ["Operador", "Tempo", "Política iFood", "Parceiro / logística", "Produto / sistema"]
+
+
+def _esteira_prompt(tenant: Tenant, fila: str, gap: float, day: date) -> str:
+    """Esteira do mês consolidado (dia 1 até D-1)."""
+    return (
+        f"{_scope_instruction(tenant.eps)}\n\n"
+        "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Chame o subagente *Lyra Qualidade* com exatamente:\n"
+        f"EPS: {tenant.eps or 'iFood'}\nPedido: esteira de impacto\nFila: {fila}\n"
+        f"Período: mês ({day.replace(day=1).strftime('%d/%m')} a {day.strftime('%d/%m')})\n"
+        f"Gap: {_bfmt(gap, 2)} p.p.\n\n"
+        "Devolva SOMENTE o JSON que ela responder (ou a linha ERRO: que vier), sem comentar."
+    )
+
+
+def _render_esteira(data: dict[str, Any], gap: float) -> str | None:
+    """Esteira de impacto (cascata): gap da meta dividido entre os pilares pela proporção de detratores."""
+    pilares = [p for p in (data.get("pilares") or []) if isinstance(p, dict) and (_num(p.get("detratores")) or 0) > 0
+               and _norm_text(p.get("pilar")) != _norm_text("Sem causa clara")]
+    total = sum(_num(p.get("detratores")) or 0 for p in pilares)
+    if not pilares or total <= 0:
+        return None
+    rank = {_norm_text(n): i for i, n in enumerate(_ESTEIRA_ORDER)}
+    pilares.sort(key=lambda p: (-(_num(p.get("detratores")) or 0), rank.get(_norm_text(p.get("pilar")), 99)))
+    width = max(len(str(p.get("pilar"))) for p in pilares)
+    has_gap = gap > 0
+    rows, eps_pp, eps_pct = [], 0.0, 0.0
+    top_share = max((_num(p.get("detratores")) or 0) for p in pilares) / total
+    for p in pilares:
+        share = (_num(p.get("detratores")) or 0) / total
+        impact = gap * share
+        filled = max(1, round(share / top_share * 10))  # maior pilar = barra cheia
+        bar = "█" * filled + "░" * (10 - filled)
+        rows.append(f"{str(p.get('pilar')).ljust(width)}  {bar}  " + (f"{_bfmt(impact, 2)} p.p.  " if has_gap else "")
+                    + f"{round(share * 100):d}%")
+        if any(_norm_text(p.get("pilar")).startswith(k) for k in ESTEIRA_PILARES_EPS):
+            eps_pp += impact
+            eps_pct += share
+    n_txt = f"{_fmt_int(total)} detratores classificados"
+    head = (f"de onde vem o gap de {_bfmt(gap, 1)} p.p. do mês" if has_gap
+            else "o mês está na meta; peso de cada causa nos detratores")
+    lines = [f"🧱 *Esteira de impacto do mês* — {head} ({n_txt})",
+             "```" + "\n".join(rows) + "```"]
+    top = pilares[0]
+    if top.get("padrao"):
+        lines.append(f"↳ *{top.get('pilar')}* é o maior pilar: {str(top['padrao']).strip().rstrip('.')}.")
+    leitura = str(data.get("leitura") or "").strip()
+    if leitura:
+        lines.append(f"↳ {leitura}")
+    tempos = data.get("tempos") or {}
+    d_fr, p_fr = _num(tempos.get("primeira_resposta_detratores_s")), _num(tempos.get("primeira_resposta_promotores_s"))
+    if d_fr is not None and p_fr:
+        lines.append(f"⏱️ Primeira resposta: detratores {_fmt_tempo(d_fr)} x promotores {_fmt_tempo(p_fr)}"
+                     + (f" ({_bfmt(d_fr / p_fr, 1)}x)" if p_fr else ""))
+    if eps_pct > 0:
+        parte = f"{_bfmt(eps_pp, 2)} p.p. do gap ({round(eps_pct * 100):d}%)" if has_gap else f"{round(eps_pct * 100):d}% dos detratores"
+        lines.append(f"👉 *Da EPS (Operador + Tempo): {parte}.* "
+                     "É isso que o plano precisa atacar. Política, parceiro e produto viram insumo para o iFood.")
+    return "\n".join(lines)
+
+
+def _post_esteiras(tenant: Tenant, posted: list[dict[str, Any]], day: date) -> None:
+    """Depois do report: para cada fila com CSAT do D-1 abaixo da meta, posta na thread a esteira do mês consolidado
+    (gap = meta − CSAT do mês; mês na meta = só o peso de cada causa)."""
+    for block in posted:
+        data = _LAST_BLOCK_DATA.get(block.get("fila", ""), {})
+        d1, meta, mes = _num(data.get("d1")), _num(data.get("meta")), _num(data.get("mes"))
+        if not block.get("cobranca") or d1 is None or meta is None or d1 >= meta:
+            continue
+        gap = max(0.0, meta - mes) if mes is not None else meta - d1
+        try:
+            answer = ask_toqan(_esteira_prompt(tenant, block["fila"], gap, day))
+            if _is_error_answer(answer):
+                logger.warning("[%s] Esteira %s: %s", tenant.key, block["fila"], answer[:200])
+                continue
+            parsed = _block_data_from_json(answer)
+            text = _render_esteira(parsed or {}, gap)
+            if text:
+                slack_app.client.chat_postMessage(channel=tenant.channel, thread_ts=block["ts"], text=text)
+        except Exception:
+            logger.exception("[%s] Esteira de impacto failed (%s)", tenant.key, block.get("fila"))
 
 
 def _run_daily_report(now: datetime | None = None, tenant: Tenant | None = None) -> str:
@@ -2472,6 +2890,9 @@ def _run_daily_report(now: datetime | None = None, tenant: Tenant | None = None)
         if not posted:
             raise ReportGenerationError("Slack não devolveu o ts de nenhum bloco")
         STATE.set(f"report:{tenant.key}:{now.date().isoformat()}", json.dumps(posted, ensure_ascii=False))
+        if ESTEIRA_ENABLED:
+            threading.Thread(target=_post_esteiras, args=(tenant, list(posted), now.date() - timedelta(days=1)),
+                             daemon=True).start()
         report_ts = posted[0]["ts"]
         if not csat:
             _alert(f"[{tenant.key}] Não consegui ler o CSAT D-1 dos blocos — pré/pós dos compromissos não será calculado hoje.")
@@ -3122,6 +3543,10 @@ def _dispatch(event: dict[str, Any], say: Callable[..., Any], client: Any, ack: 
 
 @slack_app.event("app_mention")
 def handle_app_mention(event, say, client, ack):
+    if OWNERS_FLOW_CHANNEL and event.get("channel") == OWNERS_FLOW_CHANNEL:
+        _route_chamados_event(event)  # marcar a Lyra no fluxo de chamados = complemento do chamado
+        ack()
+        return
     if MOP_FLOW_CHANNEL and event.get("channel") == MOP_FLOW_CHANNEL:
         # No canal do fluxo a Lyra só processa o Excel do MOP; não conversa ali.
         ack()
@@ -3131,8 +3556,372 @@ def handle_app_mention(event, say, client, ack):
     _dispatch(event, say, client, ack)
 
 
+LIVE_REPLY_DELAY_SECONDS = int(os.getenv("LIVE_REPLY_DELAY_SECONDS", "60"))
+_LIVE_PENDING: set[str] = set()
+_LIVE_LOCK = threading.Lock()
+_BOT_USER_ID: str | None = None
+
+
+def _bot_user_id() -> str:
+    global _BOT_USER_ID
+    if _BOT_USER_ID is None:
+        try:
+            _BOT_USER_ID = str(_resp_get(slack_app.client.auth_test(), "user_id") or "")
+        except Exception:
+            _BOT_USER_ID = ""
+    return _BOT_USER_ID
+
+
+def _report_block_for(channel: str, thread_ts: str) -> tuple[Tenant, dict[str, Any], date] | None:
+    """Bloco do report (de hoje ou de ontem) cuja thread recebeu a mensagem."""
+    today = _today_brazil().date()
+    for tenant in TENANTS:
+        if tenant.channel != channel:
+            continue
+        for day in (today, today - timedelta(days=1)):
+            for block in _report_blocks(STATE.get(_skey("report", tenant, day))):
+                if block.get("ts") == thread_ts:
+                    return tenant, block, day
+    return None
+
+
+def _maybe_live_thread_reply(event: dict[str, Any]) -> None:
+    """Resposta na thread de um bloco do report: a Lyra lê, registra e comenta o plano (sem esperar 11h/18h)."""
+    thread_ts = str(event.get("thread_ts") or "")
+    if not thread_ts or thread_ts == str(event.get("ts") or "") or event.get("subtype") not in (None, "file_share"):
+        return
+    bot = _bot_user_id()
+    if bot and f"<@{bot}>" in str(event.get("text") or ""):
+        return  # marcou a Lyra: a conversa é tratada pela menção
+    found = _report_block_for(str(event.get("channel") or ""), thread_ts)
+    if not found:
+        return
+    tenant, block, day = found
+    with _LIVE_LOCK:
+        if thread_ts in _LIVE_PENDING:
+            return  # já tem leitura agendada: junta as mensagens seguidas numa resposta só
+        _LIVE_PENDING.add(thread_ts)
+
+    def run() -> None:
+        try:
+            time.sleep(LIVE_REPLY_DELAY_SECONDS)
+            with _LIVE_LOCK:
+                _LIVE_PENDING.discard(thread_ts)
+            _read_report_thread(tenant.channel, thread_ts, "live", _today_brazil(), tenant.key,
+                                fila=block.get("fila", ""), register_no_reply=False)
+        except Exception:
+            logger.exception("[%s] Live thread read failed", tenant.key)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+
+# ---------------------------------------------------------------------------
+# Chamados de moedas: Fluxo Owners CX -> #rewards-engine-support-cx
+# ---------------------------------------------------------------------------
+# A operação abre pelo "Fluxo Owners CX" (OWNERS_FLOW_CHANNEL). Quando o tópico é Moedas, a Lyra
+# confere os dados mínimos, pede o que faltar na thread e abre o chamado no canal do Rewards
+# (REWARDS_CHANNEL): pelo webhook do fluxo "Rewards Engine CX Support" (REWARDS_WEBHOOK_URL) ou,
+# sem webhook, postando o chamado direto no canal. Depois devolve o retorno do Rewards na thread de origem.
+OWNERS_FLOW_CHANNEL = os.getenv("OWNERS_FLOW_CHANNEL", "").strip()
+REWARDS_CHANNEL = os.getenv("REWARDS_CHANNEL", "C08M93FKB63").strip()
+REWARDS_WEBHOOK_URL = os.getenv("REWARDS_WEBHOOK_URL", "").strip()
+REWARDS_PROBLEM_TYPES = [t.strip() for t in os.getenv(
+    "REWARDS_PROBLEM_TYPES", "Missão concluída, mas moedas não creditadas").split(";") if t.strip()]
+CHAMADOS_WORKSHEET_TITLE = "Chamados Moedas"
+CHAMADOS_HEADERS = ["Data", "Ticket SF", "ID do Cliente", "ID do Pedido", "Missão", "Tipo de problema",
+                    "Prioridade", "Segmento", "Título", "Solicitante", "Status", "Aberto em", "Finalizado em",
+                    "Thread origem", "Thread Rewards"]
+_FIELD_LINE_RE = re.compile(r"^\s*\*(?P<label>[^*]+?)\*\s*:?\s*(?P<value>.*)$")
+_UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
+_EMOJI_CODE_RE = re.compile(r":[a-z0-9_+\-]+:")
+_CHAMADOS_LOCK = threading.Lock()
+
+
+def _parse_flow_fields(text: str) -> dict[str, str]:
+    """Campos do fluxo: '*Rótulo:* valor' ou '*Rótulo*' com o valor nas linhas seguintes."""
+    fields: dict[str, str] = {}
+    current = None
+    for raw in str(text or "").splitlines():
+        line = raw.rstrip()
+        m = _FIELD_LINE_RE.match(line)
+        if m:
+            current = _norm_text(m.group("label").split("(")[0].strip().rstrip(":"))
+            fields[current] = m.group("value").strip()
+            continue
+        if current is not None and line.strip():
+            fields[current] = (fields[current] + "\n" + line.strip()).strip()
+    return {k: _EMOJI_CODE_RE.sub("", v).strip() for k, v in fields.items()}
+
+
+def _flow_value(fields: dict[str, str], *labels: str) -> str:
+    for label in labels:
+        for key, value in fields.items():
+            if key.startswith(_norm_text(label)):
+                value = value.strip()
+                return "" if value in {".", "-", "—"} else value
+    return ""
+
+
+def _is_moedas_flow(fields: dict[str, str], parent_fields: dict[str, str]) -> bool:
+    topic = " ".join([_flow_value(fields, "tipo"), _flow_value(parent_fields, "topico"), _flow_value(fields, "topico")])
+    return "moeda" in _norm_text(topic)
+
+
+def _chamado_from_flow(fields: dict[str, str], parent_fields: dict[str, str], parent_text: str) -> dict[str, str]:
+    ids = _MENTION_ID_RE.findall(parent_text or "")
+    return {
+        "ticket": re.sub(r"\D", "", _flow_value(fields, "ticket sf", "ticket", "numero do ticket")),
+        "cliente": _flow_value(fields, "id do cliente"),
+        "pedido": _flow_value(fields, "id do pedido"),
+        "missao": _flow_value(fields, "id ou nome da missao", "missao"),
+        "segmento": _flow_value(fields, "qual segmento", "segmento"),
+        "prioridade": _flow_value(fields, "prioridade") or _flow_value(parent_fields, "prioridade"),
+        "titulo": _flow_value(fields, "titulo") or _flow_value(parent_fields, "titulo"),
+        "descricao": _MENTION_RE.sub("", _flow_value(fields, "descricao", "descreva o problema")).strip(),
+        "solicitante": ids[0] if ids else "",
+    }
+
+
+def _triage_chamado(chamado: dict[str, str], extra_replies: list[str]) -> dict[str, Any]:
+    """Classifica o tipo de problema, acha a missão e lista o que falta (via Toqan, JSON)."""
+    prompt = (
+        "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Responda APENAS com JSON válido.\n\n"
+        "Você faz a triagem de um chamado de MOEDAS (Rewards) aberto pela operação de atendimento iFood, "
+        "antes de ele ir para o time de Rewards.\n"
+        f"Chamado: {json.dumps(chamado, ensure_ascii=False)}\n"
+        + (f"Complementos que a operação mandou na thread:\n" + "\n---\n".join(extra_replies) + "\n" if extra_replies else "")
+        + f"Tipos de problema aceitos pelo Rewards: {json.dumps(REWARDS_PROBLEM_TYPES, ensure_ascii=False)}\n\n"
+        'Formato: {"tipo_problema":"...","missao":"...","faltando":["..."],"descricao_rewards":"...","pergunta":"..."}\n'
+        "Regras:\n"
+        "- tipo_problema: o tipo da lista que melhor descreve; se nenhum servir, 'Outro: <resumo curto>'.\n"
+        "- missao: ID ou nome da missão citado no chamado ou nos complementos; vazio se não houver.\n"
+        "- faltando: dados mínimos que o Rewards exige e que NÃO estão no chamado nem nos complementos: "
+        "número do ticket, ID do cliente (UUID), o que aconteceu, quando ocorreu, onde ocorreu (tela/fluxo do app), "
+        "e a missão quando o problema é de missão. Não peça o que já está lá. Evidência (print) é opcional.\n"
+        "- descricao_rewards: descrição limpa para o Rewards (o que, quando, como, onde), juntando chamado e complementos, "
+        "sem saudação e sem dados pessoais além dos IDs.\n"
+        "- pergunta: se faltar algo, UMA mensagem curta e educada pedindo exatamente o que falta; senão vazio."
+    )
+    parsed: Any = None
+    try:
+        parsed = json.loads(_strip_json_code_blocks(ask_toqan(prompt)))
+    except Exception:
+        logger.warning("Triage was not JSON", exc_info=True)
+    if not isinstance(parsed, dict):
+        parsed = {}
+    faltando = [str(f) for f in (parsed.get("faltando") or []) if str(f).strip()]
+    if not chamado.get("ticket"):
+        faltando.insert(0, "número do ticket")
+    if not _UUID_RE.search(chamado.get("cliente", "")):
+        faltando.insert(0, "ID do cliente (UUID)")
+    return {
+        "tipo_problema": str(parsed.get("tipo_problema") or "").strip() or (REWARDS_PROBLEM_TYPES[0] if REWARDS_PROBLEM_TYPES else ""),
+        "missao": str(parsed.get("missao") or chamado.get("missao") or "").strip(),
+        "faltando": list(dict.fromkeys(faltando)),
+        "descricao": str(parsed.get("descricao_rewards") or chamado.get("descricao") or "").strip(),
+        "pergunta": str(parsed.get("pergunta") or "").strip(),
+    }
+
+
+def _download_slack_bytes(file_info: dict[str, Any]) -> bytes | None:
+    url = file_info.get("url_private_download") or file_info.get("url_private")
+    token = os.getenv("SLACK_BOT_TOKEN")
+    if not url or not token:
+        return None
+    try:
+        req = urllib.request.Request(str(url), headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return response.read() or None
+    except Exception:
+        logger.warning("Could not download evidence file", exc_info=True)
+        return None
+
+
+def _post_rewards_chamado(chamado: dict[str, str], triage: dict[str, Any], origin_link: str) -> str | None:
+    """Abre o chamado no Rewards. Devolve o ts da mensagem do chamado no canal (quando acha)."""
+    payload = {
+        "numero_ticket": chamado["ticket"], "id_cliente": chamado["cliente"], "id_pedido": chamado.get("pedido", ""),
+        "missao": triage["missao"], "descricao": triage["descricao"], "tipo_problema": triage["tipo_problema"],
+        "solicitante": chamado.get("solicitante", ""), "origem": origin_link,
+    }
+    if REWARDS_WEBHOOK_URL:
+        req = urllib.request.Request(REWARDS_WEBHOOK_URL, data=json.dumps(payload).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as response:
+            response.read()
+        # o fluxo posta sozinho: procura a mensagem pelo número do ticket
+        for _ in range(6):
+            time.sleep(5)
+            try:
+                hist = slack_app.client.conversations_history(channel=REWARDS_CHANNEL, limit=20)
+                for m in _resp_get(hist, "messages", []) or []:
+                    if chamado["ticket"] and chamado["ticket"] in str(m.get("text") or ""):
+                        return str(m.get("ts"))
+            except Exception:
+                logger.warning("Could not read Rewards channel history", exc_info=True)
+                break
+        return None
+    solicitante = f"<@{chamado['solicitante']}>" if chamado.get("solicitante") else "operação"
+    text = "\n".join(line for line in [
+        "*Chamado de moedas* (aberto pela Lyra a partir do Fluxo Owners CX)",
+        f"*Solicitante:* {solicitante}",
+        f"*Número do Ticket:* {chamado['ticket']}",
+        f"*ID do Cliente:* {chamado['cliente']}",
+        f"*ID do Pedido:* {chamado['pedido']}" if chamado.get("pedido") else "",
+        f"*Missão:* {triage['missao']}" if triage.get("missao") else "",
+        f"*Tipo de problema:* {triage['tipo_problema']}",
+        f"*Prioridade:* {chamado['prioridade']}" if chamado.get("prioridade") else "",
+        f"*Descreva o problema:* {triage['descricao']}",
+        f"<{origin_link}|Chamado de origem>" if origin_link else "",
+    ] if line)
+    resp = slack_app.client.chat_postMessage(channel=REWARDS_CHANNEL, text=text)
+    return str(_resp_get(resp, "ts") or "") or None
+
+
+def _permalink(channel: str, ts: str) -> str:
+    try:
+        return str(_resp_get(slack_app.client.chat_getPermalink(channel=channel, message_ts=ts), "permalink") or "")
+    except Exception:
+        return ""
+
+
+def _chamados_ws() -> Any | None:
+    google_client = _safe_google_client()
+    if google_client is None:
+        return None
+    try:
+        return _ensure_worksheet(_open_spreadsheet(google_client), CHAMADOS_WORKSHEET_TITLE, CHAMADOS_HEADERS)
+    except Exception:
+        logger.warning("Could not open Chamados worksheet", exc_info=True)
+        return None
+
+
+def _handle_owners_flow(channel: str, thread_ts: str) -> None:
+    """Lê o chamado do Fluxo Owners CX (mensagem + thread) e, se for de moedas, faz triagem e abre no Rewards."""
+    key = f"chamado:{thread_ts}"
+    with _CHAMADOS_LOCK:
+        state = STATE.get(key)
+        if state in {"aberto", "processando", "fora"}:
+            return
+        STATE.set(key, "processando")
+    try:
+        messages = _fetch_thread(channel, thread_ts)
+        parent = next((m for m in messages if m.get("ts") == thread_ts), {})
+        parent_text = str(parent.get("text") or "")
+        flow_msgs = [m for m in messages if m.get("bot_id") or m.get("subtype") == "bot_message"]
+        details = next((m for m in flow_msgs if m.get("ts") != thread_ts and "descri" in _norm_text(m.get("text"))), None)
+        if details is None:
+            STATE.set(key, state or "")
+            return  # o fluxo ainda não postou os detalhes na thread
+        fields = _parse_flow_fields(str(details.get("text") or ""))
+        parent_fields = _parse_flow_fields(parent_text)
+        if not _is_moedas_flow(fields, parent_fields):
+            STATE.set(key, "fora")
+            return
+        bot = _bot_user_id()
+        replies = [str(m.get("text") or "") for m in messages
+                   if m.get("ts") != thread_ts and not (m.get("bot_id") or m.get("subtype") == "bot_message")
+                   and m.get("user") != bot]
+        chamado = _chamado_from_flow(fields, parent_fields, parent_text)
+        triage = _triage_chamado(chamado, replies)
+        if triage["faltando"]:
+            if state != "aguardando":
+                quem = f"<@{chamado['solicitante']}> " if chamado.get("solicitante") else ""
+                pergunta = triage["pergunta"] or ("Pra eu abrir o chamado no time de Rewards, me manda aqui: "
+                                                 + ", ".join(triage["faltando"]) + ".")
+                slack_app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f"{quem}{pergunta}")
+            STATE.set(key, "aguardando")
+            return
+        origin = _permalink(channel, thread_ts)
+        rewards_ts = _post_rewards_chamado(chamado, triage, origin)
+        files = [f for m in messages for f in (m.get("files") or []) if isinstance(f, dict)]
+        if rewards_ts and files:
+            for f in files[:10]:
+                content = _download_slack_bytes(f)
+                if content:
+                    try:
+                        slack_app.client.files_upload_v2(channel=REWARDS_CHANNEL, thread_ts=rewards_ts, content=content,
+                                                         filename=f.get("name") or "evidencia.png", title="Evidência")
+                    except Exception:
+                        logger.warning("Could not upload evidence", exc_info=True)
+        link = _permalink(REWARDS_CHANNEL, rewards_ts) if rewards_ts else ""
+        slack_app.client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=("Chamado aberto no time de Rewards ✅" + (f" <{link}|ver chamado>" if link else f" (<#{REWARDS_CHANNEL}>)")
+                  + f"\n*Tipo:* {triage['tipo_problema']}" + (f" · *Missão:* {triage['missao']}" if triage["missao"] else "")
+                  + "\nTe aviso aqui quando o Rewards responder."))
+        STATE.set(key, "aberto")
+        if rewards_ts:
+            STATE.set(f"rewards:{rewards_ts}", json.dumps({"channel": channel, "ts": thread_ts}))
+        ws = _chamados_ws()
+        if ws is not None:
+            now = _now_brazil()
+            ws.append_row([_format_date(now), chamado["ticket"], chamado["cliente"], chamado.get("pedido", ""),
+                           triage["missao"], triage["tipo_problema"], chamado.get("prioridade", ""),
+                           chamado.get("segmento", ""), chamado.get("titulo", ""), chamado.get("solicitante", ""),
+                           "aberto", now.strftime("%d/%m/%Y %H:%M"), "", thread_ts, rewards_ts or ""],
+                          value_input_option="RAW")
+    except Exception as exc:
+        logger.exception("Owners flow handling failed")
+        STATE.set(key, "")
+        _alert(f"Falha ao abrir chamado de moedas ({thread_ts}): {type(exc).__name__}: {str(exc)[:150]}")
+
+
+def _handle_rewards_reply(event: dict[str, Any]) -> None:
+    """Resposta no chamado do Rewards: devolve na thread de origem (Fluxo Owners CX)."""
+    thread_ts = str(event.get("thread_ts") or "")
+    origin_raw = STATE.get(f"rewards:{thread_ts}") if thread_ts else ""
+    if not origin_raw or event.get("user") == _bot_user_id():
+        return
+    try:
+        origin = json.loads(origin_raw)
+    except json.JSONDecodeError:
+        return
+    text = _MENTION_RE.sub("", str(event.get("text") or "")).strip()
+    if not text:
+        return
+    finished = "solicitacao foi finalizada" in _norm_text(text)
+    is_flow = bool(event.get("bot_id") or event.get("subtype") == "bot_message")
+    if is_flow and not finished:
+        return  # avisos automáticos do fluxo (início de atendimento etc.)
+    msg = "✅ O time de Rewards finalizou o chamado." if finished else f"💬 *Retorno do time de Rewards:*\n{text[:1500]}"
+    slack_app.client.chat_postMessage(channel=origin["channel"], thread_ts=origin["ts"], text=msg)
+    if finished:
+        ws = _chamados_ws()
+        if ws is not None:
+            try:
+                for n, row in _worksheet_rows_with_header(ws):
+                    if _row_value(row, "Thread Rewards") == thread_ts:
+                        ws.update_cell(n, CHAMADOS_HEADERS.index("Status") + 1, "finalizado")
+                        ws.update_cell(n, CHAMADOS_HEADERS.index("Finalizado em") + 1, _now_brazil().strftime("%d/%m/%Y %H:%M"))
+            except Exception:
+                logger.warning("Could not update Chamados row", exc_info=True)
+
+
+def _route_chamados_event(event: dict[str, Any]) -> bool:
+    """Eventos dos canais de chamados. True = já tratado."""
+    channel = str(event.get("channel") or "")
+    if OWNERS_FLOW_CHANNEL and channel == OWNERS_FLOW_CHANNEL:
+        root = str(event.get("thread_ts") or event.get("ts") or "")
+        if event.get("user") != _bot_user_id() and root:
+            # espera o fluxo postar os detalhes na thread e junta mensagens seguidas
+            def run() -> None:
+                time.sleep(LIVE_REPLY_DELAY_SECONDS if event.get("thread_ts") and not event.get("bot_id") else 5)
+                _handle_owners_flow(channel, root)
+            threading.Thread(target=run, daemon=True).start()
+        return True
+    if REWARDS_CHANNEL and channel == REWARDS_CHANNEL and event.get("thread_ts"):
+        threading.Thread(target=_handle_rewards_reply, args=(event,), daemon=True).start()
+        return True
+    return False
+
+
 @slack_app.event("message")
 def handle_message(event, say, client, ack):
+    if _route_chamados_event(event):
+        ack()
+        return
     # Canal do fluxo "Reportar Oráculo": Excel de MOP é lido sem precisar marcar a Lyra
     # (inclui arquivo postado pela própria mensagem do fluxo).
     if MOP_FLOW_CHANNEL and event.get("channel") == MOP_FLOW_CHANNEL:
@@ -3150,6 +3939,11 @@ def handle_message(event, say, client, ack):
         _dispatch(event, say, client, ack)
     else:
         ack()
+        if not is_im:
+            try:
+                _maybe_live_thread_reply(event)
+            except Exception:
+                logger.exception("Live thread check failed")
 
 
 # ---------------------------------------------------------------------------
