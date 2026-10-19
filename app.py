@@ -648,9 +648,10 @@ def _clean_answer(answer: str) -> str:
     return _THINK_RE.sub("", answer).strip()
 
 
-def ask_toqan(prompt: str, progress_callback: Callable[[str], Any] | None = None) -> str:
+def ask_toqan(prompt: str, progress_callback: Callable[[str], Any] | None = None,
+              max_attempts: int = MAX_POLL_ATTEMPTS) -> str:
     conversation_id, request_id = create_conversation(prompt)
-    return get_answer(conversation_id, request_id, progress_callback=progress_callback)
+    return get_answer(conversation_id, request_id, progress_callback=progress_callback, max_attempts=max_attempts)
 
 
 def _strip_mentions(text: str) -> str:
@@ -2939,6 +2940,7 @@ FILA_METAS: dict[str, float] = {
     "CX Review - CSU": 70, "CX Super Cliente - CSU": 94, "PF Cancelamento": 80, "PF Super Clientes": 88,
     "PF Revisão Manual": 85, "CX Denúncia": 85,
 }
+ESTEIRA_MAX_POLLS = 72  # 12 min: a esteira não pode segurar a conversa
 ESTEIRA_MIN_GAP_PP = 0.3  # abaixo disso o gap é pequeno demais para dividir em p.p.: mostra só %
 _CAUSE_RE = re.compile(
     r"\b(por que|porque|pq|motivo|motivos|causa|causas|explica|o que (esta|ta) puxando|de onde vem)\b.*"
@@ -2983,7 +2985,7 @@ def _post_esteira_on_demand(event: dict[str, Any], eps: str | None, question: st
     d1_only = bool(re.search(r"\b(ontem|d-1|d1|dia anterior)\b", text_q)) and "mes" not in text_q
     day = _today_brazil().date() - timedelta(days=1)
     try:
-        answer = ask_toqan(_esteira_on_demand_prompt(eps, fila, day, d1_only))
+        answer = ask_toqan(_esteira_on_demand_prompt(eps, fila, day, d1_only), max_attempts=ESTEIRA_MAX_POLLS)
         if _is_error_answer(answer):
             return False
         data = _block_data_from_json(answer) or {}
@@ -3744,10 +3746,18 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             _say(say, message, event, in_thread=True)
 
         extra = ""
-        if _is_cause_request(question) and _post_esteira_on_demand(event, eps, question):
-            extra = ("INFORMAÇÃO INTERNA PARA A LYRA: a esteira de impacto (pilares Operador, Tempo, Política, Parceiro, Produto) "
-                     "já foi postada nesta thread. NÃO repita os pilares: responda a variação do CSAT (efeito mix x performance "
-                     "e response rate, via Lyra Indicadores) e diga em 1 frase o que é da EPS cobrar.\n\n")
+        if _is_cause_request(question):
+            fila_q = _fila_in_question(question, eps)
+            block_q = _report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or ""))
+            if fila_q or block_q:
+                # esteira (Qualidade) em paralelo com a análise de variação (Indicadores): a pessoa não fica esperando
+                _say(say, "Vou levantar as causas: primeiro a análise da variação (mix de motivos e response rate), "
+                          "e em seguida a esteira de impacto por pilar. Leva alguns minutos ⏳", event, in_thread=True)
+                threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
+                extra = ("INFORMAÇÃO INTERNA PARA A LYRA: a esteira de impacto (pilares Operador, Tempo, Política, Parceiro, "
+                         "Produto) é postada separadamente pelo app nesta thread. NÃO chame a Lyra Qualidade e NÃO liste pilares: "
+                         "chame só a Lyra Indicadores (Pedido: variação do CSAT) e responda a variação (efeito mix x performance "
+                         "e response rate). Feche com 1 frase sobre o que é da EPS cobrar.\n\n")
         prompt = f"{_scope_instruction(eps)}\n\n{_thread_context(event)}{extra}{_inject_mop_context(question, eps)}"
         answer = ask_toqan(prompt, progress_callback=send_progress)
         _passive_access_check(answer)
