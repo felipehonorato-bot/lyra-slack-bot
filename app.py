@@ -1,4 +1,4 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v4.8).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v4.9).
 
 v4.7 — thread do report em seções D-1 x Mês + Leitura; conversa na thread leva o contexto da fila.
 
@@ -2311,6 +2311,134 @@ def _parse_operators_csv(answer: str) -> tuple[list[list[str]], int | None]:
     return rows, total
 
 
+# --- Gráficos sob pedido (PNG montado pelo app; a Lyra só traz os dados) -------------
+_CHART_RE = re.compile(r"\b(grafico|graficos|chart|plota|plotar|plote|visualizacao|visual)\b")
+CHART_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]  # ordem fixa (paleta validada para daltonismo)
+
+
+def _is_chart_request(question: str) -> bool:
+    text = _norm_text(question)
+    return bool(_CHART_RE.search(text)) and not re.search(r"\b(o que|como funciona|consegue gerar)\b.*\?$", text)
+
+
+def _chart_prompt(eps: str | None, question: str, context: str) -> str:
+    return (
+        f"{_scope_instruction(eps)}\n\n{context}"
+        "TAREFA INTERNA DO APP — a pessoa pediu um gráfico. Busque os dados com o subagente certo (TMA sempre pelo SQL "
+        "oficial da Lyra Indicadores) e devolva APENAS JSON válido:\n"
+        '{"titulo": "TMA por célula — D-1 x mês (s)", "tipo": "barra", "unidade": "s", '
+        '"categorias": ["CX Suporte", "Madrugada"], '
+        '"series": [{"nome": "D-1", "valores": [526, 689]}, {"nome": "Mês", "valores": [724, 672]}], '
+        '"referencia": {"nome": "meta", "valor": null}, "nota": "1 frase factual com o principal destaque"}\n'
+        "Regras: tipo = \"barra\" (comparar categorias) ou \"linha\" (evolução no tempo, categorias = datas dd/mm em ordem). "
+        "No máximo 4 séries e 20 categorias. unidade = \"%\", \"s\" ou \"\". Números com ponto decimal. "
+        "referencia só quando houver UMA meta/plan comum a todas as categorias; senão null. Respeite o escopo da EPS. "
+        "Se não der para consultar: só ERRO: <motivo>.\n\n"
+        f"Pedido: {question}"
+    )
+
+
+def _build_chart_png(spec: dict[str, Any]) -> bytes | None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker
+
+    cats = [str(c) for c in (spec.get("categorias") or [])][:20]
+    series = [s_ for s_ in (spec.get("series") or []) if isinstance(s_, dict)][:4]
+    if not cats or not series:
+        return None
+    unit = str(spec.get("unidade") or "")
+    fmt = (lambda v: f"{v:.1f}%".replace(".", ",")) if unit == "%" else \
+          (lambda v: f"{_fmt_int(v)} s") if unit == "s" else (lambda v: _bfmt(v, 1))
+    vals = [[(_num(v) if _num(v) is not None else float("nan")) for v in (s_.get("valores") or [])][:len(cats)] for s_ in series]
+    vals = [v + [float("nan")] * (len(cats) - len(v)) for v in vals]
+    ink, muted, grid = "#2b2b29", "#6b6a64", "#e6e5e0"
+    plt.rcParams.update({"font.size": 10, "axes.edgecolor": grid, "axes.labelcolor": muted,
+                         "xtick.color": muted, "ytick.color": muted, "text.color": ink})
+    kind = str(spec.get("tipo") or "barra").lower()
+    horizontal = kind != "linha"
+    height = max(3.2, 0.42 * len(cats) * (1 + 0.35 * (len(series) - 1)) + 1.2) if horizontal else 4.2
+    fig, ax = plt.subplots(figsize=(9, height), dpi=150)
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    if horizontal:
+        n = len(series)
+        bar_h = 0.8 / n
+        order = list(range(len(cats)))[::-1]  # primeira categoria no topo
+        for i, (s_, v) in enumerate(zip(series, vals)):
+            ys = [o + (n - 1 - i) * bar_h - 0.4 + bar_h / 2 for o in order]
+            ax.barh(ys, v, height=bar_h * 0.9, color=CHART_COLORS[i], label=str(s_.get("nome") or ""), zorder=2)
+            for y, x in zip(ys, v):  # rótulo de dados em todas as barras
+                if x == x:
+                    ax.text(x, y, " " + fmt(x), va="center", ha="left", fontsize=7.5 if n > 1 else 8.5, color=ink)
+        ax.set_yticks(order)
+        ax.set_yticklabels(cats)
+        ax.xaxis.grid(True, color=grid, linewidth=0.8, zorder=0)
+        ax.spines["left"].set_visible(False)
+        ax.tick_params(axis="y", length=0)
+        ref = spec.get("referencia") or {}
+        if isinstance(ref, dict) and _num(ref.get("valor")) is not None:
+            ax.axvline(_num(ref["valor"]), color=muted, linestyle=(0, (4, 3)), linewidth=1, zorder=3)
+            ax.text(_num(ref["valor"]), len(cats) - 0.45, f" {ref.get('nome') or 'meta'} {fmt(_num(ref['valor']))}",
+                    fontsize=8, color=muted, va="bottom")
+        right = max([x for v in vals for x in v if x == x] or [1])
+        ax.set_xlim(0, right * 1.15)
+    else:
+        for i, (s_, v) in enumerate(zip(series, vals)):
+            ax.plot(cats, v, color=CHART_COLORS[i], linewidth=2, marker="o", markersize=5,
+                    label=str(s_.get("nome") or ""), zorder=3)
+            for j, y in enumerate(v):  # rótulo de dados em todos os pontos: acima nos picos, abaixo nos vales
+                if y != y:
+                    continue
+                neigh = [v[k] for k in (j - 1, j + 1) if 0 <= k < len(v) and v[k] == v[k]]
+                below = bool(neigh) and y < sum(neigh) / len(neigh)
+                if len(series) > 1:
+                    below = i % 2 == 1
+                ax.annotate(fmt(y), (j, y), textcoords="offset points", xytext=(0, -13 if below else 8), ha="center",
+                            fontsize=7 if len(cats) > 12 else 8, color=ink,
+                            bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="none", alpha=0.85))
+        ax.yaxis.grid(True, color=grid, linewidth=0.8, zorder=0)
+        ref = spec.get("referencia") or {}
+        if isinstance(ref, dict) and _num(ref.get("valor")) is not None:
+            ax.axhline(_num(ref["valor"]), color=muted, linestyle=(0, (4, 3)), linewidth=1)
+            ax.annotate(f"{ref.get('nome') or 'meta'} {fmt(_num(ref['valor']))}", (1, _num(ref["valor"])),
+                        xycoords=("axes fraction", "data"), xytext=(4, 0), textcoords="offset points",
+                        fontsize=8, color=muted, va="center", ha="left")
+        if len(cats) > 10:
+            plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+        ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: _bfmt(v, 1)))
+    if len(series) > 1:
+        ax.legend(frameon=False, loc="lower right" if horizontal else "best", fontsize=9)
+    ax.set_title(str(spec.get("titulo") or ""), loc="left", fontsize=12, color=ink, pad=12)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor="white")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _send_chart(event: dict[str, Any], client: Any, eps: str | None, question: str,
+                send_progress: Callable[[str], Any] | None = None) -> str | None:
+    answer = ask_toqan(_chart_prompt(eps, question, _thread_context(event)), progress_callback=send_progress)
+    if _is_error_answer(answer):
+        return "Não consegui puxar esses dados agora. Tenta de novo em alguns minutos?"
+    spec = _block_data_from_json(answer) or {}
+    png = _build_chart_png(spec)
+    if not png:
+        return "Não consegui montar o gráfico com esse pedido. Me diz o indicador, o período e o recorte (ex.: TMA por célula, D-1 x mês)."
+    nota = str(spec.get("nota") or "").strip()
+    title = str(spec.get("titulo") or "Gráfico")
+    (client or slack_app.client).files_upload_v2(
+        channel=event.get("channel"), thread_ts=event.get("thread_ts") or event.get("ts"),
+        content=png, filename=re.sub(r"[^\w\-]+", "_", title)[:60] + ".png", title=title,
+        initial_comment=(f"📊 {nota}" if nota else "📊 Segue o gráfico."),
+    )
+    return None
+
+
 _DATA_EXCEL_RE = re.compile(r"\b(excel|xls|xlsx|planilha|csv|tabela em arquivo|arquivo)\b")
 
 
@@ -2999,6 +3127,97 @@ def _post_esteira_on_demand(event: dict[str, Any], eps: str | None, question: st
     except Exception:
         logger.exception("On-demand esteira failed (%s)", fila)
         return False
+
+
+def _variation_periods(question: str) -> tuple[tuple[date, date], tuple[date, date], str, str]:
+    """(período atual, referência, rótulo atual, rótulo referência). Padrão: mês até D-1 x mês anterior até o mesmo dia."""
+    d1 = _today_brazil().date() - timedelta(days=1)
+    text = _norm_text(question)
+    fmt = lambda a, b: f"{a.strftime('%d/%m')}–{b.strftime('%d/%m')}" if a != b else a.strftime("%d/%m")
+    if re.search(r"\b(ontem|d-1|d1|dia anterior)\b", text):
+        ref = (d1.replace(day=1), d1 - timedelta(days=1)) if d1.day > 1 else (d1 - timedelta(days=7), d1 - timedelta(days=1))
+        return (d1, d1), ref, f"D-1 ({fmt(d1, d1)})", f"mês até D-2 ({fmt(*ref)})"
+    if re.search(r"\bsemana\b", text):
+        cur = (d1 - timedelta(days=6), d1)
+        ref = (d1 - timedelta(days=13), d1 - timedelta(days=7))
+        return cur, ref, f"últimos 7 dias ({fmt(*cur)})", f"7 dias anteriores ({fmt(*ref)})"
+    cur = (d1.replace(day=1), d1)
+    prev_end = d1.replace(day=1) - timedelta(days=1)
+    ref_end = prev_end.replace(day=min(d1.day, prev_end.day))
+    ref = (prev_end.replace(day=1), ref_end)
+    return cur, ref, f"este mês ({fmt(*cur)})", f"mês anterior ({fmt(*ref)})"
+
+
+def _variation_prompt(eps: str | None, fila: str, cur: tuple[date, date], ref: tuple[date, date]) -> str:
+    iso = lambda d: d.isoformat()
+    return (
+        f"{_scope_instruction(eps)}\n\n"
+        "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Chame a *Lyra Indicadores* com:\n"
+        f"EPS: {eps or 'iFood'}\nPedido: variação do CSAT\nFila: {fila}\n"
+        f"Período atual: {iso(cur[0])} a {iso(cur[1])}\nReferência: {iso(ref[0])} a {iso(ref[1])}\n\n"
+        "Use EXATAMENTE esses dois períodos e as fórmulas da seção 7.2 dela (efeito mix e efeito performance por motivo "
+        "de contato; response rate). Devolva APENAS JSON válido:\n"
+        '{"csat_ref": 94.8, "csat_atual": 93.7, "n_ref": 4120, "n_atual": 3980, "mix_pp": -0.8, "performance_pp": -0.3, '
+        '"top_mix": [{"motivo": "pedido atrasado", "share_ref": 18.0, "share_atual": 26.0, "csat_ref": 85.8, "efeito_pp": -0.7}], '
+        '"top_performance": [{"motivo": "cobrança não reconhecida", "csat_ref": 92.0, "csat_atual": 88.0, "share_atual": 9.0, "efeito_pp": -0.36}], '
+        '"rr_ref": 27.1, "rr_atual": 26.9, '
+        '"leitura": "1 frase factual sobre o que os números mostram, sem afirmar nada que eles não mostrem"}\n'
+        "Percentuais em %, p.p. com sinal. Até 3 motivos em cada lista. Se a consulta falhar: só ERRO: <motivo>."
+    )
+
+
+def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref: str) -> str | None:
+    c_ref, c_cur = _num(data.get("csat_ref")), _num(data.get("csat_atual"))
+    if c_ref is None or c_cur is None:
+        return None
+    total = c_cur - c_ref
+    mix, perf = _num(data.get("mix_pp")), _num(data.get("performance_pp"))
+    sign = lambda v: ("+" if v > 0 else "−" if v < 0 else "") + _bfmt(abs(v), 2 if abs(v) < 0.1 else 1)
+    arrow = "📉" if total < 0 else "📈" if total > 0 else "➖"
+    lines = [f"{arrow} *Variação do CSAT ·* `{fila}` — {label_ref} → {label_cur}"]
+    n_txt = ""
+    if data.get("n_ref") is not None and data.get("n_atual") is not None:
+        n_txt = f" · n {_fmt_int(_num(data['n_ref']) or 0)} → {_fmt_int(_num(data['n_atual']) or 0)}"
+    lines.append(f"CSAT *{_bfmt(c_ref)}% → {_bfmt(c_cur)}%* ({sign(total)} p.p.){n_txt}")
+    if mix is not None:
+        lines.append("")
+        lines.append(f"🔀 *Efeito mix: {sign(mix)} p.p.* — mudou o tipo de contato que chegou")
+        for m in (data.get("top_mix") or [])[:3]:
+            if not isinstance(m, dict):
+                continue
+            part = f"• {m.get('motivo')}: {_bfmt(_num(m.get('share_ref')) or 0)}% → {_bfmt(_num(m.get('share_atual')) or 0)}% das avaliações"
+            if m.get("csat_ref") is not None:
+                part += f" (CSAT {_bfmt(_num(m['csat_ref']) or 0)}%)"
+            if m.get("efeito_pp") is not None:
+                part += f" · {sign(_num(m['efeito_pp']) or 0)} p.p."
+            lines.append(part)
+    if perf is not None:
+        lines.append("")
+        lines.append(f"🎯 *Efeito performance: {sign(perf)} p.p.* — mudou o atendimento do mesmo motivo")
+        for m in (data.get("top_performance") or [])[:3]:
+            if not isinstance(m, dict):
+                continue
+            part = f"• {m.get('motivo')}: CSAT {_bfmt(_num(m.get('csat_ref')) or 0)}% → {_bfmt(_num(m.get('csat_atual')) or 0)}%"
+            if m.get("efeito_pp") is not None:
+                part += f" · {sign(_num(m['efeito_pp']) or 0)} p.p."
+            lines.append(part)
+    if mix is not None and perf is not None and abs((mix + perf) - total) > 0.3:
+        lines.append(f"⚠️ Mix + performance ({sign(mix + perf)} p.p.) não fecham com a variação ({sign(total)} p.p.): vou revisar a conta.")
+    rr_ref, rr_cur = _num(data.get("rr_ref")), _num(data.get("rr_atual"))
+    if rr_ref is not None and rr_cur is not None:
+        d = rr_cur - rr_ref
+        note = "mudou a amostra: parte da variação pode ser de quem respondeu" if abs(d) >= 3 else "estável, não distorce a leitura"
+        lines.append("")
+        lines.append(f"📨 *Response rate:* {_bfmt(rr_ref)}% → {_bfmt(rr_cur)}% ({sign(d)} p.p.) — {note}")
+    leitura = str(data.get("leitura") or "").strip()
+    if leitura:
+        lines.append("")
+        lines.append(f"💡 {leitura}")
+    if perf is not None:
+        quem = (f"o efeito performance ({sign(perf)} p.p.) e os pilares Operador e Tempo da esteira"
+                if perf < 0 else "os pilares Operador e Tempo da esteira (a performance não piorou)")
+        lines.append(f"👉 *Da EPS cobrar:* {quem}. Mix e amostra são contexto, não culpa da operação.")
+    return "\n".join(lines)
 
 
 def _render_esteira(data: dict[str, Any], gap: float, periodo: str = "do mês", fila: str = "") -> str | None:
@@ -3735,6 +3954,13 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
                 _say(say, problem, event, in_thread)
             return
 
+        if _is_chart_request(question):
+            _say(say, "Vou montar o gráfico, já te mando aqui. ⏳", event, in_thread=True)
+            problem = _send_chart(event, client, eps, question, send_progress=lambda m: _say(say, m, event, in_thread=True))
+            if problem:
+                _say(say, problem, event, in_thread)
+            return
+
         if _is_data_excel_request(question):
             _say(say, "Vou montar a planilha, já te mando aqui. ⏳", event, in_thread=True)
             problem = _send_data_excel(event, client, eps, question)
@@ -3754,6 +3980,14 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
                 _say(say, "Vou levantar as causas: primeiro a análise da variação (mix de motivos e response rate), "
                           "e em seguida a esteira de impacto por pilar. Leva alguns minutos ⏳", event, in_thread=True)
                 threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
+                fila_v = block_q[1].get("fila") if block_q else fila_q
+                cur, ref, l_cur, l_ref = _variation_periods(question)
+                var_answer = ask_toqan(_variation_prompt(eps, fila_v, cur, ref), progress_callback=send_progress)
+                rendered = None if _is_error_answer(var_answer) else _render_variation(
+                    fila_v, _block_data_from_json(var_answer) or {}, l_cur, l_ref)
+                if rendered:
+                    _say(say, rendered, event, in_thread=True)
+                    return
                 extra = ("INFORMAÇÃO INTERNA PARA A LYRA: a esteira de impacto (pilares Operador, Tempo, Política, Parceiro, "
                          "Produto) é postada separadamente pelo app nesta thread. NÃO chame a Lyra Qualidade e NÃO liste pilares: "
                          "chame só a Lyra Indicadores (Pedido: variação do CSAT) e responda a variação (efeito mix x performance "
