@@ -1,4 +1,6 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.7).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.8).
+
+v5.8 — EPS_EXTRA_CHANNELS: canais extras de conversa com recorte de uma EPS (sem report).
 
 v5.7 — controles em print (Volume, Produtividade): a Lyra lê a imagem (upload no Toqan), confere pelos totais do
        próprio print e cobra (fila acumulando, gente sobrando/faltando, logado sem produção, equipe abaixo da célula);
@@ -268,6 +270,16 @@ TENANTS = _build_tenants()
 # canal -> EPS do canal (None = visão completa)
 CHANNEL_SCOPE: dict[str, str | None] = {t.channel: t.eps for t in TENANTS}
 CHANNEL_SCOPE.update({channel: None for channel in INTERNAL_CHANNELS})
+# Canais extras de conversa com recorte de uma EPS (ex.: teste com alguém da EPS): a Lyra responde quando marcada,
+# só com dados daquela EPS; report e rotinas continuam no canal principal (EPS_CHANNELS).
+# Formato: "AeC:C111,AeC:C222,CSU:C333" (pode repetir a EPS).
+EPS_EXTRA_CHANNELS: list[tuple[str, str]] = [
+    (part.split(":", 1)[0].strip(), part.split(":", 1)[1].strip())
+    for part in os.getenv("EPS_EXTRA_CHANNELS", "").split(",") if ":" in part and part.split(":", 1)[1].strip()
+]
+for _eps, _channel in EPS_EXTRA_CHANNELS:
+    _known = next((key for key in EPS_CELULAS if key.casefold() == _eps.casefold()), _eps)
+    CHANNEL_SCOPE.setdefault(_channel, _known)
 
 DM_NOT_ALLOWED_MESSAGE = "Por aqui eu não consigo responder. Me chama no canal da sua EPS que eu te ajudo por lá. 🙂"
 CHANNEL_NOT_CONFIGURED_MESSAGE = "Ainda não estou configurada para responder neste canal."
