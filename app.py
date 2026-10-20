@@ -4159,7 +4159,9 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             return
         if not allowed:
             is_im = event.get("channel_type") == "im"
-            _say(say, DM_NOT_ALLOWED_MESSAGE if is_im else CHANNEL_NOT_CONFIGURED_MESSAGE, event, in_thread)
+            _say(say, DM_NOT_ALLOWED_MESSAGE if is_im else
+                 f"{CHANNEL_NOT_CONFIGURED_MESSAGE} (canal `{event.get('channel')}`)", event, in_thread)
+            logger.warning("Channel not configured: %s (scopes: %s)", event.get("channel"), sorted(CHANNEL_SCOPE))
             return
         mop_answer = _process_mop_upload(event, client, eps)
         if mop_answer is not None:
