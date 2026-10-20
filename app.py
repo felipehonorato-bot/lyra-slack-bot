@@ -1,4 +1,24 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.0).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.7).
+
+v5.7 — controles em print (Volume, Produtividade): a Lyra lê a imagem (upload no Toqan), confere pelos totais do
+       próprio print e cobra (fila acumulando, gente sobrando/faltando, logado sem produção, equipe abaixo da célula);
+       se não conseguir ler, diz que o print não está legível. Review: CSAT informado x promotoras/detratoras.
+
+v5.6 — status de hora em hora em modo teste (STATUS_SHADOW=1): lê o canal real e responde no canal de testes da EPS;
+       cobra quando o CSAT piora com o mesmo próximo passo; NRT sem dados não é cobrado.
+
+v5.5 — sugestão de plano: Lyra consulta a Conhecimento (política/matriz), causa só a do dado, sem régua inventada;
+       o app tira da resposta promessa de planilha/arquivo que ele não gerou.
+
+v5.4 — fila com ação em andamento para o mesmo problema: cobra status e efeito, não ação nova; prazo vencido: resultado
+       ou novo plano. Problema diferente da ação: pede plano para o problema novo.
+
+v5.3 — mensagens montadas pelo app (thread do report, variação, esteira) saem com divisória entre as seções.
+
+v5.2 — lê o status de hora em hora das EPSs (STATUS_CHANNELS) e cobra: CSAT/SLA fora da meta da fila, justificativa
+       repetida, próximo passo genérico, previsão sem prazo. Causa do iFood fica só no registro (não cobra SLA).
+
+v5.1 — dúvida de processo/política/agente: o app manda a Lyra chamar a Lyra Conhecimento (sem busca externa nem chute).
 
 v5.0 — pergunta de causa: análise de variação primeiro; se a queda vem do efeito mix (mix ≥ 80% da queda e
        performance estável), responde só a leitura do mix, sem cobrar plano e sem esteira. Filas sem meta: "sem meta".
@@ -378,7 +398,7 @@ DAILY_REPORT_PROMPT = (
     '"quad_mes": {"q1": 39, "q2": 46, "q3": 12, "q4": 14}, "quad_d1": {"q1": 20, "q2": 18, "q3": 9, "q4": 16}, '
     '"disp_mes": {"q1": 98.5, "q4": 78.0}, "disp_d1": {"q1": 97.0, "q4": 62.0}, '
     '"reincidentes": 3, "tma_tpi_d1": 379.6, "tma_int_d1": 1.92, "tma_tpi_mes": 368.4, "tma_int_mes": 1.90, "tma_tratados_d1": 2650, '
-    '"compromisso": "", '
+    '"compromisso": "", "compromisso_cobre": null, '
     '"cobranca": "Pedido atrasado tira 2,8 p.p. no D-1 e já é o problema do mês, e a dispersão aumentou — o que muda hoje na tratativa de atraso?", '
     '"elogio": ""}\n'
     "3. Campos: d1 = CSAT D-1 em %; n = avaliações no D-1; var = variação do D-1 vs dia anterior em p.p. (negativo se caiu); "
@@ -389,11 +409,16 @@ DAILY_REPORT_PROMPT = (
     "reincidentes = operadores reincidentes no Q4; "
     "tma_tpi_d1 / tma_tpi_mes = tempo de atribuição por interação em SEGUNDOS; tma_int_d1 / tma_int_mes = média de interações por ticket; "
     "tma_tratados_d1 = interações tratadas no D-1 (copie do bloco TMA POR FILA do Indicadores; o app calcula o TMA e compara com o plan); "
-    "compromisso = compromisso em aberto DESTA fila no contexto ('<ação> · prazo <dd/mm>') ou vazio.\n"
+    "compromisso = compromisso em aberto DESTA fila no contexto ('<ação> · prazo <dd/mm>') ou vazio; "
+    "compromisso_cobre = true se essa ação ataca o problema de hoje (mesmo indicador/causa), false se o problema de hoje é outro, null se não há compromisso.\n"
     "4. cobranca (se CSAT do D-1 abaixo da meta OU TMA do D-1 acima do plan — o plan vem na lista PLAN DE TMA desta mensagem): "
     "UMA frase de analista de CX, assertiva, que conecta os dados — problema do D-1 vs do mês (estrutural ou pontual), "
     "a dispersão (índice Q4÷Q1 com duas casas, ex.: 0,86 → 0,76, nunca em %; caindo = dispersão aumentou = comportamento operacional) e o TMA (se subiu por mais interações por ticket = não resolveu "
     "no primeiro contato; se por tempo por interação = atendimento mais longo) — e termina numa pergunta direta sobre a ação. "
+    "NÃO repita o valor do TMA nem do CSAT na cobrança (o app já mostra os números exatos nas seções acima; diga só "
+    "'acima do plan' / 'abaixo da meta'). Interações por ticket são interações, não reaberturas. "
+    "Se há compromisso em aberto que ataca o problema (compromisso_cobre true), NÃO peça ação nova: a pergunta é sobre o status "
+    "e o efeito da ação que já está rodando (ex.: 'a ação X está segurando o problema?'). Se o problema de hoje é outro, peça a ação para ele. "
     "Sem 'Plano aqui na thread' (o app completa). elogio (CSAT e TMA no alvo): reconhecimento curto e específico.\n"
     "5. Só isso: nenhum título, texto, bullet, separador (---) ou comentário fora dessas linhas. Números com ponto decimal. "
     "Nunca nome, usuário ou e-mail de operador. Não escreva menções (@).\n"
@@ -578,14 +603,15 @@ def _require_toqan_key() -> str:
     return api_key
 
 
-def _toqan_request(method: str, payload: dict[str, str], api_key: str | None = None) -> dict[str, Any]:
+def _toqan_request(method: str, payload: dict[str, Any], api_key: str | None = None,
+                   http_method: str | None = None) -> dict[str, Any]:
     """Make one authenticated JSON request to the Toqan Agent API (chave da Lyra por padrão)."""
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url=f"{TOQAN_BASE_URL}/{method}",
         data=body,
         headers={"X-Api-Key": api_key or _require_toqan_key(), "Content-Type": "application/json"},
-        method="POST" if method == "create_conversation" else "GET",
+        method=http_method or ("POST" if method in {"create_conversation", "continue_conversation"} else "GET"),
     )
     try:
         with urllib.request.urlopen(req, timeout=TOQAN_TIMEOUT_SECONDS) as response:
@@ -648,6 +674,51 @@ def get_answer(
         if attempt < max_attempts - 1:
             time.sleep(POLL_INTERVAL_SECONDS)
     raise ToqanAPIError("Toqan answer polling timed out")
+
+
+TOQAN_UPLOAD_URL = os.getenv("TOQAN_UPLOAD_URL", f"{TOQAN_BASE_URL}/upload_file")
+
+
+def toqan_upload_file(content: bytes, filename: str, mimetype: str = "application/octet-stream") -> str:
+    """Sobe um arquivo (ex.: print do Slack) para o Toqan e devolve o file_id."""
+    boundary = f"----lyra{int(time.time() * 1000)}"
+    safe_name = re.sub(r"[^\w.\-]", "_", filename or "arquivo")
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{safe_name}\"\r\n"
+            f"Content-Type: {mimetype}\r\n\r\n").encode("utf-8") + content + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    req = urllib.request.Request(TOQAN_UPLOAD_URL, data=body, method="PUT", headers={
+        "X-Api-Key": _require_toqan_key(), "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=TOQAN_TIMEOUT_SECONDS) as response:
+            data = json.loads(response.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        raise ToqanAPIError(f"Toqan upload HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        raise ToqanAPIError(f"Toqan upload failed: {exc}") from exc
+    file_id = data.get("file_id") or data.get("id") if isinstance(data, dict) else None
+    if not file_id:
+        raise ToqanAPIError("Toqan upload did not return file_id")
+    return str(file_id)
+
+
+def ask_toqan_with_files(prompt: str, file_ids: list[str], max_attempts: int = MAX_POLL_ATTEMPTS) -> str:
+    """Pergunta com arquivos anexados (private_user_files). Se a criação com arquivo não for aceita,
+    abre a conversa e manda o pedido com os arquivos no continue_conversation."""
+    files = [{"id": fid} for fid in file_ids]
+    try:
+        data = _toqan_request("create_conversation", {"user_message": prompt, "private_user_files": files})
+        conversation_id, request_id = data.get("conversation_id"), data.get("request_id")
+        if conversation_id and request_id:
+            return get_answer(str(conversation_id), str(request_id), max_attempts=max_attempts)
+    except ToqanAPIError:
+        logger.info("create_conversation with files not accepted; trying continue_conversation")
+    conversation_id, request_id = create_conversation("Vou te mandar imagens para ler. Responda só: OK.")
+    get_answer(conversation_id, request_id, max_attempts=30)
+    data = _toqan_request("continue_conversation", {"conversation_id": conversation_id, "user_message": prompt,
+                                                    "private_user_files": files})
+    request_id = data.get("request_id")
+    if not request_id:
+        raise ToqanAPIError("continue_conversation did not return request_id")
+    return get_answer(conversation_id, str(request_id), max_attempts=max_attempts)
 
 
 def _clean_answer(answer: str) -> str:
@@ -2725,7 +2796,7 @@ def _block_data_from_text(text: str) -> dict[str, Any]:
     reinc = re.search(r"(\d+)\s*reincident", clean, re.IGNORECASE)
     if reinc:
         data["reincidentes"] = _num(reinc.group(1))
-    cob = re.search(r"cobran[çc]a\s*:?\s*\*?\s*:?\s*(.+?)(?:\s*Plano aqui na thread|$)", clean, re.IGNORECASE)
+    cob = re.search(r"cobran[çc]a\s*:?\s*\*?\s*:?\s*(.+?)(?:\s*(?:Plano|Status|O prazo da ação) |$)", clean, re.IGNORECASE)
     if cob:
         data["cobranca"] = cob.group(1).strip(" *")
     pin = re.search(r"📌\s*(.+)", clean)
@@ -2957,24 +3028,45 @@ def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str]
         lines.extend(f"↳ {t}" for t in leitura)
 
     # ---- Compromisso e cobrança / destaque
+    # Ação já rodando para o mesmo problema: cobra status e efeito, não ação nova (prazo vencido: resultado ou novo plano).
     compromisso = str(data.get("compromisso") or "").strip()
+    cobre = bool(compromisso) and data.get("compromisso_cobre") is not False
+    vencido = False
+    pm = re.search(r"prazo\s*(\d{1,2})/(\d{1,2})", compromisso)
+    if pm:
+        try:
+            prazo = date(day.year, int(pm.group(2)), int(pm.group(1)))
+            if prazo.month == 12 and day.month == 1:
+                prazo = prazo.replace(year=day.year - 1)
+            vencido = prazo <= day  # venceu até o D-1
+        except ValueError:
+            pass
     if compromisso or off or has_target:
         lines.append("")
     if compromisso:
-        lines.append(f"📌 *Compromisso em aberto:* {compromisso} — qual o status?")
+        label = "📌 *Ação com prazo vencido:*" if vencido else "📌 *Ação em andamento:*"
+        lines.append(f"{label} {compromisso}" + ("" if off and cobre else " — qual o status?"))
     if off:
         cobranca = str(data.get("cobranca") or data.get("pergunta") or "").strip()
-        cobranca = re.split(r"\s*Plano aqui na thread", cobranca, maxsplit=1)[0].strip()
+        cobranca = re.split(r"\s*(Plano|Status) aqui na thread", cobranca, maxsplit=1)[0].strip()
         if not cobranca:
             gaps = []
             if status == "abaixo":
                 gaps.append(f"CSAT {_bfmt(meta - d1)} p.p. abaixo da meta")
             if tstatus == "acima":
                 gaps.append(f"TMA {_fmt_tempo(tma['d1'] - tma['plan'])} acima do plan")
-            cobranca = f"{' e '.join(gaps)} no D-1 — o que está sendo feito pra corrigir?"
+            cobranca = (f"{' e '.join(gaps)} no D-1 — a ação em andamento está segurando o problema?" if cobre
+                        else f"{' e '.join(gaps)} no D-1 — o que está sendo feito pra corrigir?")
         if not cobranca.endswith("?"):
             cobranca = cobranca.rstrip(".") + "?"
-        lines.append(f"👉 *Cobrança:* {cobranca} Plano aqui na thread até 14h: *ação · responsável · prazo*.")
+        if cobre and not vencido:
+            suffix = "Status aqui na thread até 14h: *o que já foi feito · efeito até agora · próximo passo*."
+        elif cobre:
+            suffix = ("O prazo da ação venceu: foi feita e qual o resultado? Se não resolveu, novo plano aqui na thread "
+                      "até 14h: *ação · responsável · prazo*.")
+        else:
+            suffix = "Plano aqui na thread até 14h: *ação · responsável · prazo*."
+        lines.append(f"👉 *Cobrança:* {cobranca} {suffix}")
     elif has_target:
         elogio = str(data.get("elogio") or "").strip() or "CSAT e TMA dentro do esperado, bom trabalho, time."
         lines.append(f"✅ *Destaque:* {elogio}")
@@ -3085,6 +3177,67 @@ _CAUSE_RE = re.compile(
 )
 
 
+_KNOWLEDGE_RE = re.compile(
+    r"\b(clube|assinatura|estorno|estornar|reembolso|reembolsar|cobranca (duplicada|nao reconhecida)|ype|recolhimento|"
+    r"cnl|m111|cliente nao localizado|voucher|cupom|retratacao|bko|backoffice|oraculo|rosie|will|wills|nexus|clubia|"
+    r"agentforce|matriz de decisao|platina|vip|gold|silver|bronze|off-target|super cliente|pos-entrega|pos entrega|"
+    r"item faltante|item errado|eta|allocating|one hub|politica|processo|fluxo de atendimento|pode cancelar|pode estornar)\b"
+)
+
+
+_DATA_WORDS_RE = re.compile(r"\b(csat|tma|tmi|nps|meta|plan|report|volume|quadrante|dispersao|operadores|ranking|"
+                            r"grafico|planilha|excel|response rate|reabertura|sla|mop|span)\b")
+
+
+def _is_knowledge_question(question: str) -> bool:
+    """Dúvida de processo/política/agente de IA: a resposta vem da Lyra Conhecimento, não de dado nem de chute."""
+    text = _norm_text(question)
+    if _DATA_WORDS_RE.search(text):  # "CSAT da Super Cliente", "TMA do VIP": é dado, não processo
+        return False
+    return bool(_KNOWLEDGE_RE.search(text)) and not _is_cause_request(question)
+
+
+KNOWLEDGE_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA: esta é uma dúvida de processo, política ou agente de IA. Chame o subagente "
+    "*Lyra Conhecimento* com `Pedido: <a pergunta, completa>` (uma chamada por pergunta, se houver mais de uma) e "
+    "responda com o que ela devolver. NÃO use outra busca nem conhecimento geral (CDC, \"geralmente\", outras empresas). "
+    "Se ela devolver NÃO SEI, diga que isso não está na sua base, que a referência é o One Hub (Matriz CX) e que vai "
+    "confirmar com o time.\n\n"
+)
+
+
+_PLAN_RE = re.compile(r"\b(sugir\w*|sugere|sugestao|sugestoes|monta|monte|montar|cria|crie|criar|estrutur\w*|propo\w*|"
+                      r"me ajuda|ajuda a|ideia|ideias|o que (eu )?(faco|fazer|podemos fazer))\b.*\b(acao|acoes|plano|planos)\b"
+                      r"|\b(acao|acoes|plano)\b.*\b(sugir\w*|sugere|sugestao|ideia)")
+
+
+def _is_plan_request(question: str) -> bool:
+    return bool(_PLAN_RE.search(_norm_text(question)))
+
+
+PLAN_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA: pedido de sugestão de plano de ação. Antes de responder, chame a *Lyra Conhecimento* "
+    "com `Pedido: quais fluxos e políticas valem para <o motivo/problema da fila> e o que é decisão da operação x do iFood` "
+    "e siga as regras de plano do seu prompt: nenhum passo de compensação/voucher/cupom/estorno/cancelamento fora da matriz "
+    "de decisão; causa só a que o dado mostra (use a Leitura do report desta thread); número no recorte certo (fila x motivo); "
+    "interações por ticket não é reabertura nem FCR; régua nova só como 'sugestão a validar'; não diga que tem/segue planilha "
+    "ou arquivo; nada de sanção ou RH. No máximo 3 ações (o quê · quem · prazo · como medir), curtas.\n\n"
+)
+
+_FILE_WORDS_RE = re.compile(r"(planilha|arquivo|excel|\.xlsx|\.csv|\.pdf|\.pptx|anexo)", re.IGNORECASE)
+_FILE_PROMISE_RE = re.compile(r"\b(tem uma|tenho uma|segue|seguem|anexei|anexo|te mandei|te enviei|enviei|mandei|"
+                              r"deixei|preparei|montei|gerei|disponivel|baixar|se quiser)\b")
+
+
+def _strip_file_promises(answer: str) -> str:
+    """O modelo às vezes diz que 'tem uma planilha' que ninguém gerou: quem manda arquivo é o app. Tira essas linhas."""
+    if not answer:
+        return answer
+    kept = [line for line in answer.split("\n")
+            if not (_FILE_WORDS_RE.search(line) and _FILE_PROMISE_RE.search(_norm_text(line)))]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip() if len(kept) != len(answer.split("\n")) else answer
+
+
 def _is_cause_request(question: str) -> bool:
     return bool(_CAUSE_RE.search(_norm_text(question)))
 
@@ -3129,8 +3282,7 @@ def _post_esteira_on_demand(event: dict[str, Any], eps: str | None, question: st
         text = _render_esteira(data, gap, periodo="do D-1" if d1_only else "do mês", fila=fila)
         if not text:
             return False
-        slack_app.client.chat_postMessage(channel=event.get("channel"), text=text,
-                                          thread_ts=event.get("thread_ts") or event.get("ts"))
+        _post_sections(str(event.get("channel") or ""), text, thread_ts=event.get("thread_ts") or event.get("ts"))
         return True
     except Exception:
         logger.exception("On-demand esteira failed (%s)", fila)
@@ -3317,7 +3469,7 @@ def _post_esteiras(tenant: Tenant, posted: list[dict[str, Any]], day: date) -> N
             parsed = _block_data_from_json(answer)
             text = _render_esteira(parsed or {}, gap)
             if text:
-                slack_app.client.chat_postMessage(channel=tenant.channel, thread_ts=block["ts"], text=text)
+                _post_sections(tenant.channel, text, thread_ts=block["ts"])
             else:
                 problems.append(f"{block['fila']}: a Lyra Qualidade não devolveu os pilares ({answer.strip()[:120]!r})")
         except Exception as exc:
@@ -3350,7 +3502,7 @@ def _run_daily_report(now: datetime | None = None, tenant: Tenant | None = None)
                 continue
             if tagged:
                 try:  # detalhe e cobrança dentro da thread do título
-                    slack_app.client.chat_postMessage(channel=tenant.channel, text=tagged, thread_ts=ts)
+                    _post_sections(tenant.channel, tagged, thread_ts=ts)
                 except Exception:
                     logger.exception("Could not post block detail in thread (%s)", fila)
             posted.append({"fila": fila, "ts": str(ts), "cobranca": has_cobranca})
@@ -3851,6 +4003,58 @@ def _start_scheduler() -> None:
 # ---------------------------------------------------------------------------
 # Slack events
 # ---------------------------------------------------------------------------
+SLACK_SECTION_MAX = 2900
+
+
+def _section_blocks(text: str) -> list[dict[str, Any]] | None:
+    """Mensagem montada pelo app em seções (separadas por linha em branco) -> Block Kit com divisória entre elas.
+    None = uma seção só (vai como texto normal)."""
+    parts = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    if len(parts) < 2:
+        return None
+    blocks: list[dict[str, Any]] = []
+    for i, part in enumerate(parts):
+        if i:
+            blocks.append({"type": "divider"})
+        chunk = ""
+        for line in part.split("\n"):
+            if chunk and len(chunk) + len(line) + 1 > SLACK_SECTION_MAX:
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
+                chunk = ""
+            chunk = f"{chunk}\n{line}" if chunk else line[:SLACK_SECTION_MAX]
+        if chunk:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
+    return blocks if len(blocks) <= 50 else None
+
+
+def _post_sections(channel: str, text: str, thread_ts: str | None = None) -> Any:
+    """Posta com divisórias entre as seções (D-1 | Mês | Leitura | Cobrança…). Se o Slack recusar os blocos, vai como texto."""
+    kwargs: dict[str, Any] = {"channel": channel, "text": text}
+    if thread_ts:
+        kwargs["thread_ts"] = thread_ts
+    blocks = _section_blocks(text)
+    if blocks:
+        try:
+            return slack_app.client.chat_postMessage(**kwargs, blocks=blocks)
+        except Exception:
+            logger.warning("Blocks rejected; posting as plain text", exc_info=True)
+    return slack_app.client.chat_postMessage(**kwargs)
+
+
+def _say_sections(say: Callable[..., Any], answer: str, event: dict[str, Any], in_thread: bool = True) -> None:
+    kwargs: dict[str, Any] = {"text": answer}
+    if in_thread:
+        kwargs["thread_ts"] = event.get("thread_ts") or event.get("ts")
+    blocks = _section_blocks(answer)
+    if blocks:
+        try:
+            say(**kwargs, blocks=blocks)
+            return
+        except Exception:
+            logger.warning("Blocks rejected; replying as plain text", exc_info=True)
+    say(**kwargs)
+
+
 def _say(say: Callable[..., Any], answer: str, event: dict[str, Any], in_thread: bool) -> None:
     if in_thread:
         say(text=answer, thread_ts=event.get("thread_ts") or event.get("ts"))
@@ -4014,7 +4218,7 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
                 var_data = {} if _is_error_answer(var_answer) else (_block_data_from_json(var_answer) or {})
                 rendered = _render_variation(fila_v, var_data, l_cur, l_ref) if var_data else None
                 if rendered:
-                    _say(say, rendered, event, in_thread=True)
+                    _say_sections(say, rendered, event)
                     if not _mix_dominant(var_data):
                         threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
                     return
@@ -4023,14 +4227,19 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
                          "Produto) é postada separadamente pelo app nesta thread. NÃO chame a Lyra Qualidade e NÃO liste pilares: "
                          "chame só a Lyra Indicadores (Pedido: variação do CSAT) e responda a variação (efeito mix x performance "
                          "e response rate). Feche com 1 frase sobre o que é da EPS cobrar.\n\n")
+        if not extra and _is_plan_request(question):
+            extra = PLAN_INSTRUCTION
+        elif not extra and _is_knowledge_question(question):
+            extra = KNOWLEDGE_INSTRUCTION
         prompt = f"{_scope_instruction(eps)}\n\n{_thread_context(event)}{extra}{_inject_mop_context(question, eps)}"
         answer = ask_toqan(prompt, progress_callback=send_progress)
         _passive_access_check(answer)
+        answer = _strip_file_promises(answer)
         conv_blocks = _split_blocks(answer or "")
         if conv_blocks:
             day = _today_brazil() - timedelta(days=1)
             for fila, title, body in _prepare_blocks(conv_blocks, _as_date(day)):
-                _say(say, title + ("\n" + _tag_block(fila, body)[0] if body else ""), event, in_thread=True)
+                _say_sections(say, title + ("\n\n" + _tag_block(fila, body)[0] if body else ""), event)
             return
         if THREAD_DELIMITER in (answer or ""):
             # report pedido em conversa: principal + detalhe, sem o marcador aparecer
@@ -4173,6 +4382,512 @@ def _maybe_live_thread_reply(event: dict[str, Any]) -> None:
     threading.Thread(target=run, daemon=True).start()
 
 
+
+# ---------------------------------------------------------------------------
+# Status de hora em hora das EPSs ("Controle de SLA ..." nos canais de indicadores)
+# ---------------------------------------------------------------------------
+# A EPS posta na thread "Status atual na última hora - HH:MM - CSAT x% - SLA y%" + motivo, próximos passos e
+# previsão. A Lyra lê, compara com a meta da fila e cobra só quando há o que cobrar: CSAT (ou SLA) fora da meta,
+# justificativa copiada hora após hora, próximo passo genérico ou previsão sem prazo. Causa do lado do iFood
+# (cupom, Rosie, sistema) fica só no registro da EPS: não vira cobrança de SLA.
+STATUS_CHANNELS = _parse_channel_map(os.getenv("STATUS_CHANNELS", ""))  # "CSU:C0...,AeC:C0..."
+_STATUS_CHANNEL_EPS = {channel: eps for eps, channel in STATUS_CHANNELS.items()}
+STATUS_REPLY_DELAY_SECONDS = int(os.getenv("STATUS_REPLY_DELAY_SECONDS", "90"))
+# Fase de testes: lê o canal real da EPS, mas responde no canal de testes da EPS (EPS_CHANNELS), sem marcar ninguém.
+# STATUS_SHADOW=0 = responde na própria thread da EPS, marcando quem postou.
+STATUS_SHADOW = os.getenv("STATUS_SHADOW", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+STATUS_REPEAT_LIMIT = 3  # mesma justificativa em 3 status seguidos = cobrar atualização real
+STATUS_RERAISE_EVERY = 4  # CSAT/SLA fora da meta e justificativa repetida só voltam a ser cobrados a cada 4 status
+
+
+def _parse_sla_metas(raw: str) -> dict[str, float]:
+    """'CX Super Cliente - CSU:90,CX Review - CSU:85' -> {fila: 90.0, ...}"""
+    result: dict[str, float] = {}
+    for part in raw.split(","):
+        if ":" in part:
+            fila, value = part.rsplit(":", 1)
+            num = _num(value)
+            if fila.strip() and num is not None:
+                result[fila.strip()] = num
+    return result
+
+
+SLA_METAS = _parse_sla_metas(os.getenv("SLA_METAS", ""))
+_STATUS_RE = re.compile(
+    r"s?tatus atual na [uú]ltima hora\s*[-–:]?\s*(\d{1,2})(?:[:h](\d{2}))?\s*h?\s*[-–:]?\s*CSAT\s*:?\s*([\d.,]+)\s*%?"
+    r"(?:\s*[-–|·/]?\s*SLA\s*:?\s*([\d.,]+)\s*%?)?", re.IGNORECASE)
+_STATUS_FIELDS = {
+    "motivo": re.compile(r"motivo da n[aã]o entrega\s*(?:\(\s*se\s*:?\s*houver\s*\))?\s*[:\-–]?\s*(.*)", re.IGNORECASE),
+    "passos": re.compile(r"pr[oó]ximos passos(?: para resolu[cç][aã]o)?\s*[:\-–]?\s*(.*)", re.IGNORECASE),
+    "previsao": re.compile(r"previs[aã]o de conclus[aã]o\s*[:\-–]?\s*(.*)", re.IGNORECASE),
+}
+_IFOOD_SIDE_RE = re.compile(r"\b(cupom|cupons|rosie|sistema|sistemico|sistemica|instabilidade|ifood|fora do ar|bug|"
+                            r"ferramenta|oraculo|salesforce|lentidao|indisponibilidade)\b")
+_NO_DATA_STATUS_RE = re.compile(r"\b(sem dados|nrt|dados nao carregad\w*|nao carregou|parcial .* repetida|"
+                                r"painel fora|dashboard fora|relatorio fora|base nao atualiz\w*)\b")
+STATUS_DROP_PP = 2.0  # CSAT caiu ≥ 2 p.p. de um status pro outro com o mesmo próximo passo
+_GENERIC_STEP_RE = re.compile(r"\b(captacao\w*|captar|acompanhamento|monitoramento|em andamento|na meta|"
+                              r"tentativas? de reversao|reversao|tratativa|alinhamento|reforco|seguimos|atencao)\b")
+_DEADLINE_RE = re.compile(r"\d{1,2}\s*(h\b|:\d{2})|\d{1,2}/\d{1,2}|\bate (as|o fim|amanha)\b")
+_STATUS_FILA_ALIASES = (("super cliente", "CX Super Cliente"), ("vip", "CX Super Cliente"), ("review", "CX Review"),
+                        ("denuncia", "CX Denúncia"), ("madrugada", "Madrugada"), ("suporte", "CX Suporte"))
+_STATUS_PENDING: set[str] = set()
+
+
+def _status_fila(title: str, eps: str) -> str | None:
+    """Fila do título da thread ("Controle de SLA CX VIP - 08/10/26" -> CX Super Cliente - CSU)."""
+    celulas = _celulas_of(eps)
+    text = _norm_text(title)
+    exact = [f for f in celulas if _norm_text(f) in text]
+    if exact:
+        return max(exact, key=len)
+    for alias, base in _STATUS_FILA_ALIASES:
+        if re.search(rf"\b{alias}\b", text):
+            hit = next((f for f in celulas if _norm_text(f).startswith(_norm_text(base))), None)
+            if hit:
+                return hit
+    return None
+
+
+# Formato "bloco" (ex.: Controle de SLA/CSAT Review da CSU): "20/10 – 9h:00 / CSAT: 87,05% / Promotoras: 14 /
+# Detratoras: 6 / SLA Primeira Resposta: 100% / Volume da fila: 0 / Cenário atual: ... / Ações em andamento: * ..."
+_BLOCK_HEAD_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*[–\-—]\s*(\d{1,2})\s*h\s*:?\s*(\d{2})?", re.IGNORECASE)
+_BLOCK_CSAT_RE = re.compile(r"\bCSAT\s*:\s*([\d.,]+)\s*%", re.IGNORECASE)
+_BLOCK_FIELDS = {
+    "promotoras": re.compile(r"promotor\w*\s*:\s*(\d+)", re.IGNORECASE),
+    "detratoras": re.compile(r"detrator\w*\s*:\s*(\d+)", re.IGNORECASE),
+    "sla": re.compile(r"SLA\s*(?:de\s*)?(?:primeira|1[ªa°º]?)\s*resposta\s*:\s*([\d.,]+)\s*%", re.IGNORECASE),
+    "volume": re.compile(r"volume da fila\s*:\s*(\d+)", re.IGNORECASE),
+}
+STATUS_CSAT_CHECK_PP = 1.5  # CSAT informado x promotoras ÷ (promotoras + detratoras)
+
+
+def _looks_like_status(text: str) -> bool:
+    raw = str(text or "")
+    return bool(_STATUS_RE.search(raw) or (_BLOCK_CSAT_RE.search(raw) and (_BLOCK_HEAD_RE.search(raw)
+                                                                          or re.search(r"cen[aá]rio atual", raw, re.I))))
+
+
+def _parse_block_status(raw: str) -> dict[str, Any] | None:
+    cm = _BLOCK_CSAT_RE.search(raw)
+    if not cm or not _looks_like_status(raw):
+        return None
+    hm = _BLOCK_HEAD_RE.search(raw)
+    status: dict[str, Any] = {"hora": f"{int(hm.group(1)):02d}:{hm.group(2) or '00'}" if hm else "--:--",
+                              "csat": _num(cm.group(1)), "formato": "bloco", "previsao": None}
+    for key, rx in _BLOCK_FIELDS.items():
+        fm = rx.search(raw)
+        status[key] = _num(fm.group(1)) if fm else None
+    cen = re.search(r"cen[aá]rio atual\s*:?\s*\n*\s*([^\n]+)", raw, re.IGNORECASE)
+    status["motivo"] = cen.group(1).strip() if cen else ""
+    acoes = re.split(r"a[cç][oõ]es em andamento\s*:?", raw, maxsplit=1, flags=re.IGNORECASE)
+    items = []
+    if len(acoes) > 1:
+        for line in acoes[1].split("\n"):
+            line = re.sub(r"^[\s*•\-–]+", "", line).strip()
+            if line and not re.match(r"\d+\s*anexos?$", line, re.IGNORECASE):
+                items.append(line)
+    status["acoes"] = items
+    status["passos"] = " | ".join(items)
+    return status
+
+
+def _parse_status(text: str) -> dict[str, Any] | None:
+    raw = re.sub(r"\s*\(editado\)\s*", " ", str(text or ""))
+    m = _STATUS_RE.search(raw)
+    if not m:
+        return _parse_block_status(raw)
+    status: dict[str, Any] = {
+        "hora": f"{int(m.group(1)):02d}:{m.group(2) or '00'}",
+        "csat": _num(m.group(3)), "sla": _num(m.group(4)) if m.group(4) else None,
+    }
+    for key, rx in _STATUS_FIELDS.items():
+        fm = rx.search(raw)
+        status[key] = re.sub(r"^[•\-\s]+|[\s.]+$", "", fm.group(1)).strip() if fm else ""
+    return status
+
+
+def _status_issues(statuses: list[dict[str, Any]], fila: str) -> tuple[list[tuple[str, str]], dict[str, Any]]:
+    """Pontos a cobrar no status mais recente: [(tipo, texto)]."""
+    last = statuses[-1]
+    meta, sla_meta = FILA_METAS.get(fila), SLA_METAS.get(fila)
+    ifood_side = bool(_IFOOD_SIDE_RE.search(_norm_text(last.get("motivo"))))
+
+    def csat_off(s: dict[str, Any]) -> bool:
+        return meta is not None and s.get("csat") is not None and s["csat"] < meta
+
+    def sla_off(s: dict[str, Any]) -> bool:
+        return sla_meta is not None and s.get("sla") is not None and s["sla"] < sla_meta
+
+    issues: list[tuple[str, str]] = []
+    prom, detr = last.get("promotoras"), last.get("detratoras")
+    if last.get("csat") is not None and prom is not None and detr is not None and prom + detr >= 5:
+        calc = prom / (prom + detr) * 100
+        if abs(calc - last["csat"]) > STATUS_CSAT_CHECK_PP:
+            issues.append(("dados", f"O CSAT informado ({_bfmt(last['csat'])}%) não bate com {int(prom)} promotoras e "
+                                    f"{int(detr)} detratoras, que dão {_bfmt(calc)}%. Qual é o recorte de cada número?"))
+    if not (csat_off(last) or sla_off(last)):
+        return issues, last
+    if _NO_DATA_STATUS_RE.search(_norm_text(last.get("motivo"))):
+        return issues, last  # sem dado novo (NRT fora): número repetido não é cobrança da EPS
+    if csat_off(last):
+        streak = 0
+        for s in reversed(statuses):
+            if not csat_off(s):
+                break
+            streak += 1
+        quando = f"há {streak} status seguidos" if streak > 1 else "neste status"
+        issues.append(("csat", f"CSAT {_bfmt(last['csat'])}% contra a meta de {_fmt_meta(meta)}% da fila, abaixo {quando}. "
+                               "O que está sendo feito pra recuperar e com qual efeito esperado?"))
+    if sla_off(last) and not ifood_side:
+        issues.append(("sla", f"SLA {_bfmt(last['sla'])}% contra a meta de {_fmt_meta(sla_meta)}%. Qual a causa e a ação?"))
+    if len(statuses) > 1:
+        prev = statuses[-2]
+        if (csat_off(last) and prev.get("csat") is not None and last.get("csat") is not None
+                and prev["csat"] - last["csat"] >= STATUS_DROP_PP
+                and _norm_text(prev.get("passos")) == _norm_text(last.get("passos")) and last.get("passos")):
+            issues.append(("piorou", f"O CSAT caiu de {_bfmt(prev['csat'])}% para {_bfmt(last['csat'])}% e o próximo passo "
+                                     "continua o mesmo. O que muda no plano a partir de agora?"))
+    key = lambda s: (_norm_text(s.get("motivo")), _norm_text(s.get("passos")))
+    repeat = 0
+    for s in reversed(statuses):
+        if key(s) != key(last) or not key(last)[0]:
+            break
+        repeat += 1
+    if repeat >= STATUS_REPEAT_LIMIT and (repeat - STATUS_REPEAT_LIMIT) % STATUS_RERAISE_EVERY == 0:
+        issues.append(("repeat", f"A justificativa e os próximos passos são os mesmos há {repeat} status. "
+                                 "O que mudou de uma hora pra outra: o que foi feito e qual o resultado?"))
+    if last.get("acoes"):  # formato bloco: avalia ação por ação, cita só o título da vaga
+        vagas = [a.split(":", 1)[0].strip() for a in last["acoes"]
+                 if _GENERIC_STEP_RE.search(_norm_text(a)) and not re.search(r"\d", a)]
+        if vagas:
+            issues.append(("passos", "Ações sem dono nem prazo: " + ", ".join(f"\"{v}\"" for v in vagas[:3])
+                                     + ". O que exatamente, com quem e até quando?"))
+    else:
+        passos = _norm_text(last.get("passos"))
+        if passos and _GENERIC_STEP_RE.search(passos) and not re.search(r"\d", passos):
+            issues.append(("passos", f"\"{last['passos']}\" não diz o que vai ser feito. Qual a ação, com quem e até que horas?"))
+    previsao = _norm_text(last.get("previsao"))
+    if last.get("previsao") is None and last.get("formato") == "bloco":
+        pass  # o formato bloco não tem campo de previsão
+    elif not previsao or not _DEADLINE_RE.search(previsao):
+        txt = f"\"{last['previsao']}\" não é prazo" if last.get("previsao") else "Sem previsão de conclusão"
+        issues.append(("prazo", f"{txt}: até que horas a fila volta pra meta?"))
+    return issues, last
+
+
+def _read_status_thread(channel: str, thread_ts: str, eps: str) -> str | None:
+    """Lê a thread de status e, se houver o que cobrar, responde. Devolve o texto postado (ou None)."""
+    messages = _fetch_thread(channel, thread_ts)
+    if not messages:
+        return None
+    fila = _status_fila(str(messages[0].get("text") or ""), eps)
+    if not fila:
+        return None
+    bot = _bot_user_id()
+    statuses: list[dict[str, Any]] = []
+    for m in messages[1:]:
+        if m.get("bot_id") or (bot and m.get("user") == bot):
+            continue
+        for chunk in re.split(r"(?=s?tatus atual na [uú]ltima hora)", str(m.get("text") or ""), flags=re.IGNORECASE):
+            parsed = _parse_status(chunk)
+            if parsed:
+                parsed["user"] = m.get("user")
+                statuses.append(parsed)
+    if not statuses:
+        return None
+    issues, last = _status_issues(statuses, fila)
+    skey = f"status:{channel}:{thread_ts}"
+    try:
+        raised = json.loads(STATE.get(skey) or "{}")
+    except ValueError:
+        raised = {}
+    idx = len(statuses)
+    if raised.get("_last_idx") == idx:
+        return None  # este status já foi lido
+    field = {"passos": "passos", "prazo": "previsao"}
+    new: list[tuple[str, str]] = []
+    for kind, txt in issues:
+        prev = raised.get(kind) if isinstance(raised.get(kind), dict) else None
+        if kind in field:  # mesmo texto genérico de novo já é coberto pela cobrança de justificativa repetida
+            ok = prev is None or prev.get("txt") != _norm_text(last.get(field[kind]))
+        elif kind == "repeat":
+            ok = True  # _status_issues só devolve no 3º, 7º, 11º status iguais
+        else:
+            ok = prev is None or idx - int(prev.get("idx", -99)) >= STATUS_RERAISE_EVERY
+        if ok:
+            new.append((kind, txt))
+            raised[kind] = {"idx": idx, "txt": _norm_text(last.get(field.get(kind, ""), ""))}
+    raised["_last_idx"] = idx
+    STATE.set(skey, json.dumps(raised))
+    if not new:
+        return None
+    head = f"👀 *{fila} · status das {last['hora']}* — CSAT {_bfmt(last['csat'])}%"
+    if last.get("sla") is not None:
+        head += f" · SLA {_bfmt(last['sla'])}%"
+    return _post_status_reply(channel, thread_ts, eps, str(messages[0].get("text") or ""), head,
+                              [txt for _, txt in new], last.get("user"))
+
+
+def _post_status_reply(channel: str, thread_ts: str, eps: str, thread_title: str, head: str,
+                       bullets: list[str], user: str | None) -> str:
+    """Responde a um controle da EPS. Fase de testes (STATUS_SHADOW): vai para o canal de testes da EPS, numa
+    thread por controle, sem marcar ninguém; senão, na própria thread da EPS marcando quem postou."""
+    lines = [f"• {b}" for b in bullets]
+    test_channel = EPS_CHANNELS.get(eps) if STATUS_SHADOW else None
+    if test_channel:
+        text = head + ("\n\n" + "\n".join(lines) if lines else "")
+        parent_key = f"status_shadow:{channel}:{thread_ts}"
+        parent_ts = STATE.get(parent_key)
+        if not parent_ts:
+            link = _permalink(channel, thread_ts)
+            title = re.sub(r"[`*_]", "", thread_title).strip()[:120]
+            intro = (f"🧪 *Teste · {eps}* — o que eu cobraria em _{title}_"
+                     + (f" (<{link}|thread original>)" if link else "") + ". Nada foi postado no canal da EPS.")
+            resp = slack_app.client.chat_postMessage(channel=test_channel, text=intro)
+            parent_ts = str(_resp_get(resp, "ts") or "")
+            if parent_ts:
+                STATE.set(parent_key, parent_ts)
+        _post_sections(test_channel, text, thread_ts=parent_ts or None)
+        return text
+    who = f"<@{user}> " if user else ""
+    text = head + "\n\n" + "\n".join(lines + [f"{who}me responde aqui na thread."])
+    _post_sections(channel, text, thread_ts=thread_ts)
+    return text
+
+
+# --- Controles em print (Volume, Produtividade): a Lyra lê a imagem e cobra; se não der pra ler, avisa -----------
+PRINT_CONTROLS = (("volume", re.compile(r"\bvolume\b")), ("produtividade", re.compile(r"\bprodutividade\b")))
+PRINT_MAX_POLLS = 36  # 6 min
+VOL_BACKLOG_RATIO = float(os.getenv("VOL_BACKLOG_RATIO", "0.8"))  # produção < 80% da entrada = fila acumulando
+HC_SHORT_RATIO = 0.9   # logados < 90% do projetado com volume no projetado ou acima
+HC_EXCESS_RATIO = 1.2  # logados ≥ 120% do projetado (e +2 pessoas) com volume abaixo
+PROD_TEAM_RATIO = float(os.getenv("PROD_TEAM_RATIO", "0.7"))  # equipe < 70% da média da célula na mesma hora
+_PRINT_PENDING: set[str] = set()
+
+
+def _print_control_kind(title: str) -> str | None:
+    text = _norm_text(title)
+    return next((kind for kind, rx in PRINT_CONTROLS if rx.search(text)), None)
+
+
+def _image_files(message: dict[str, Any]) -> list[dict[str, Any]]:
+    return [f for f in (message.get("files") or []) if isinstance(f, dict)
+            and str(f.get("mimetype") or "").startswith("image/")]
+
+
+def _print_prompt(kind: str) -> str:
+    common = (
+        "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. NÃO chame subagentes e NÃO consulte dados: só LEIA as "
+        "imagens anexadas (prints de um controle da EPS) e transcreva os números. Se não conseguir ler TODOS os números "
+        "com certeza (imagem pequena, cortada, borrada, ou você não consegue ver imagens), responda SOMENTE "
+        "`ILEGIVEL: <motivo curto>`. Nunca chute número. Devolva APENAS JSON válido, números com ponto decimal.\n")
+    if kind == "volume":
+        return common + (
+            "Os prints trazem, por célula (ex.: CX Review, Super CX), por hora: volume projetado e real (tabela 'Volume por "
+            "Hora'), produtividade projetada e real e HC projetado e real (tabela 'Produtividade e HCs por Hora'). Junte "
+            "tudo por célula e hora. Só as horas com algum número.\n"
+            '{"tipo": "volume", "data": "20/10/2026", "ate": "08:00", "celulas": [{"celula": "CX Review", "horas": '
+            '[{"hora": "00:00", "vol_proj": 29, "vol_real": 13, "prod_proj": 29, "prod_real": 13, "hc_proj": 12, "hc_real": 14}], '
+            '"total": {"vol_proj": 103, "vol_real": 77, "prod_proj": 103, "prod_real": 48}}]}\n'
+            "Campo que não aparece no print: null. total = linha 'Total Geral' de cada tabela.")
+    return common + (
+        "O print é uma tabela de produtividade por hora: supervisor (linha agrupadora), atendentes (e-mail) e a contagem "
+        "por hora, com Total Geral. NÃO devolva e-mails: só a contagem de cada atendente.\n"
+        '{"tipo": "produtividade", "celula": "CX Review", "ate": "09:00", "supervisores": [{"supervisor": "NOME DO SUPERVISOR", '
+        '"operadores": [{"horas": {"00:00": 2, "01:00": 1}, "total": 3}]}]}\n'
+        "Hora sem número: não inclua. total = coluna Total Geral do atendente.")
+
+
+def _validate_print(kind: str, data: dict[str, Any]) -> str | None:
+    """Confere a leitura pelos totais do próprio print. Devolve o problema (ou None se a leitura fecha)."""
+    if kind == "volume":
+        cels = data.get("celulas") or []
+        if not cels:
+            return "não achei as células"
+        for cel in cels:
+            horas, total = cel.get("horas") or [], cel.get("total") or {}
+            for key in ("vol_real", "prod_real"):
+                vals = [_num(h.get(key)) for h in horas if h.get(key) is not None]
+                if total.get(key) is not None and vals and abs(sum(vals) - (_num(total[key]) or 0)) > 0.5:
+                    return f"a soma das horas de {cel.get('celula')} não bate com o total ({key})"
+        return None
+    sups = data.get("supervisores") or []
+    ops = [o for s in sups for o in (s.get("operadores") or [])]
+    if not ops:
+        return "não achei os atendentes"
+    wrong = sum(1 for o in ops if o.get("total") is not None
+                and abs(sum(_num(v) or 0 for v in (o.get("horas") or {}).values()) - (_num(o["total"]) or 0)) > 0.5)
+    return f"{wrong} atendentes com soma diferente do total" if wrong > 1 else None
+
+
+def _hh(hora: Any) -> str:
+    m = re.match(r"\s*(\d{1,2})", str(hora or ""))
+    return f"{int(m.group(1))}h" if m else str(hora)
+
+
+def _judge_volume(data: dict[str, Any]) -> list[tuple[str, str]]:
+    issues: list[tuple[str, str]] = []
+    for cel in data.get("celulas") or []:
+        name = str(cel.get("celula") or "célula")
+        horas = [{k: (_num(v) if k != "hora" else v) for k, v in h.items()} for h in (cel.get("horas") or [])]
+        vol = sum(h.get("vol_real") or 0 for h in horas)
+        prod_vals = [h.get("prod_real") for h in horas if h.get("prod_real") is not None]
+        if vol >= 20 and prod_vals and sum(prod_vals) < VOL_BACKLOG_RATIO * vol:
+            issues.append((f"fila:{name}", f"*{name}:* produziram {_fmt_int(sum(prod_vals))} de {_fmt_int(vol)} casos que "
+                                            f"entraram ({_bfmt(sum(prod_vals) / vol * 100, 0)}%). Está acumulando fila? Qual o plano?"))
+        falta = [h for h in horas if h.get("hc_proj") and h.get("hc_real") is not None and h.get("vol_proj")
+                 and h["hc_real"] < HC_SHORT_RATIO * h["hc_proj"] and (h.get("vol_real") or 0) >= h["vol_proj"]]
+        if falta:
+            ex = falta[0]
+            issues.append((f"falta:{name}", f"*{name}:* menos gente que o projetado com volume no projetado ou acima "
+                                             f"({', '.join(_hh(h['hora']) for h in falta[:4])}; ex.: {_hh(ex['hora'])}, "
+                                             f"{_fmt_int(ex['hc_real'])} logados contra {_fmt_int(ex['hc_proj'])}). Risco de SLA: qual o ajuste?"))
+        sobra = [h for h in horas if h.get("hc_proj") is not None and h.get("hc_real") is not None and h.get("vol_proj")
+                 and h["hc_real"] >= HC_EXCESS_RATIO * h["hc_proj"] and h["hc_real"] - h["hc_proj"] >= 2
+                 and (h.get("vol_real") or 0) < h["vol_proj"]]
+        if sobra:
+            ex = max(sobra, key=lambda h: h["hc_real"] - h["hc_proj"])
+            issues.append((f"sobra:{name}", f"*{name}:* mais gente que o projetado com volume abaixo "
+                                             f"({', '.join(_hh(h['hora']) for h in sobra[:4])}; ex.: {_hh(ex['hora'])}, "
+                                             f"{_fmt_int(ex['hc_real'])} logados contra {_fmt_int(ex['hc_proj'])} projetados pra "
+                                             f"{_fmt_int(ex.get('vol_real') or 0)} entradas). A escala acompanhou o volume?"))
+        parado = [h for h in horas if (h.get("hc_real") or 0) >= 2 and (h.get("vol_real") or 0) >= 3 and h.get("prod_real") == 0]
+        if parado:
+            ex = parado[0]
+            issues.append((f"parado:{name}", f"*{name}:* às {_hh(ex['hora'])} tinha {_fmt_int(ex['hc_real'])} pessoas logadas, "
+                                              f"{_fmt_int(ex['vol_real'])} entradas e nenhuma produção. O que aconteceu?"))
+    return issues
+
+
+def _judge_produtividade(data: dict[str, Any]) -> list[tuple[str, str]]:
+    """Compara cada equipe com a média da célula NA MESMA HORA (madrugada x dia não se misturam)."""
+    cells: list[tuple[str, str, float]] = []
+    for sup in data.get("supervisores") or []:
+        for op in sup.get("operadores") or []:
+            for hora, val in (op.get("horas") or {}).items():
+                v = _num(val)
+                if v:
+                    cells.append((str(sup.get("supervisor") or "?"), _hh(hora), v))
+    by_hour: dict[str, list[float]] = {}
+    for _, hora, v in cells:
+        by_hour.setdefault(hora, []).append(v)
+    hour_avg = {h: sum(vs) / len(vs) for h, vs in by_hour.items() if len(vs) >= 3}
+    issues: list[tuple[str, str]] = []
+    teams: dict[str, list[tuple[float, float]]] = {}
+    for sup, hora, v in cells:
+        if hora in hour_avg:
+            teams.setdefault(sup, []).append((v, hour_avg[hora]))
+    for sup, pairs in teams.items():
+        if len(pairs) < 4:
+            continue
+        mine = sum(v for v, _ in pairs) / len(pairs)
+        ref = sum(a for _, a in pairs) / len(pairs)
+        if ref and mine < PROD_TEAM_RATIO * ref:
+            issues.append((f"equipe:{sup}", f"Equipe de {sup.title()}: {_bfmt(mine)} por pessoa/hora contra {_bfmt(ref)} da "
+                                            "célula nas mesmas horas. O que está segurando a produção da equipe?"))
+    return issues
+
+
+def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> str | None:
+    messages = _fetch_thread(channel, thread_ts)
+    if not messages:
+        return None
+    title = str(messages[0].get("text") or "")
+    kind = _print_control_kind(title)
+    msg = next((m for m in messages if str(m.get("ts")) == msg_ts), None)
+    if not kind or not msg:
+        return None
+    images = _image_files(msg)
+    if not images:
+        return None
+    user = msg.get("user")
+    head_base = f"📷 *{re.sub(r'[`*_]', '', title).strip()[:60]} · {eps}*"
+    problem = ""
+    data: dict[str, Any] | None = None
+    try:
+        file_ids = []
+        for f in images[:4]:
+            content = _download_slack_bytes(f)
+            if content:
+                file_ids.append(toqan_upload_file(content, str(f.get("name") or "print.png"), str(f.get("mimetype") or "image/png")))
+        if not file_ids:
+            problem = "não consegui baixar a imagem do Slack"
+        else:
+            answer = ask_toqan_with_files(_print_prompt(kind), file_ids, max_attempts=PRINT_MAX_POLLS)
+            if answer.strip().upper().startswith("ILEGIVEL") or answer.strip().upper().startswith("ILEGÍVEL"):
+                problem = answer.split(":", 1)[-1].strip()[:150] or "imagem ilegível"
+            else:
+                data = _block_data_from_json(answer)
+                problem = "não consegui transcrever a tabela" if not data else (_validate_print(kind, data) or "")
+    except Exception as exc:
+        logger.exception("[%s] Print read failed", eps)
+        problem = f"falha ao ler a imagem ({type(exc).__name__})"
+    if problem or not data:
+        return _post_status_reply(channel, thread_ts, eps, title, head_base,
+                                  [f"Não consegui ler o print ({problem or 'sem dados'}). Manda em tamanho maior, sem cortar "
+                                   "a tabela, ou o Excel do controle."], user)
+    issues = _judge_volume(data) if kind == "volume" else _judge_produtividade(data)
+    skey = f"print:{channel}:{thread_ts}"
+    try:
+        raised = json.loads(STATE.get(skey) or "{}")
+    except ValueError:
+        raised = {}
+    idx = int(raised.get("_n", 0)) + 1
+    new = [(k, txt) for k, txt in issues if idx - int(raised.get(k, -99)) >= STATUS_RERAISE_EVERY]
+    raised["_n"] = idx
+    for k, _ in new:
+        raised[k] = idx
+    STATE.set(skey, json.dumps(raised))
+    if not new:
+        return None
+    ate = str(data.get("ate") or "").strip()
+    return _post_status_reply(channel, thread_ts, eps, title, head_base + (f" — até {ate}" if ate else ""),
+                              [txt for _, txt in new], user)
+
+
+def _maybe_status_reply(event: dict[str, Any]) -> bool:
+    channel = str(event.get("channel") or "")
+    eps = _STATUS_CHANNEL_EPS.get(channel)
+    thread_ts = str(event.get("thread_ts") or "")
+    if not eps or not thread_ts or thread_ts == str(event.get("ts") or ""):
+        return False
+    if event.get("bot_id"):
+        return False
+    if _image_files(event):
+        msg_ts = str(event.get("ts") or "")
+        with _LIVE_LOCK:
+            if msg_ts in _PRINT_PENDING:
+                return True
+            _PRINT_PENDING.add(msg_ts)
+
+        def run_print() -> None:
+            try:
+                time.sleep(min(STATUS_REPLY_DELAY_SECONDS, 30))
+                _read_print_message(channel, thread_ts, msg_ts, eps)
+            except Exception:
+                logger.exception("[%s] Print control read failed", eps)
+
+        threading.Thread(target=run_print, daemon=True).start()
+        return True
+    if not _looks_like_status(str(event.get("text") or "")):
+        return False
+    with _LIVE_LOCK:
+        if thread_ts in _STATUS_PENDING:
+            return True
+        _STATUS_PENDING.add(thread_ts)
+
+    def run() -> None:
+        try:
+            time.sleep(STATUS_REPLY_DELAY_SECONDS)  # espera edição/complemento antes de ler
+            with _LIVE_LOCK:
+                _STATUS_PENDING.discard(thread_ts)
+            _read_status_thread(channel, thread_ts, eps)
+        except Exception:
+            logger.exception("[%s] Status thread read failed", eps)
+
+    threading.Thread(target=run, daemon=True).start()
+    return True
 
 # ---------------------------------------------------------------------------
 # Chamados de moedas: Fluxo Owners CX -> #rewards-engine-support-cx
@@ -4499,6 +5214,8 @@ def handle_message(event, say, client, ack):
         ack()
         if not is_im:
             try:
+                if _maybe_status_reply(event):
+                    return
                 _maybe_live_thread_reply(event)
             except Exception:
                 logger.exception("Live thread check failed")
