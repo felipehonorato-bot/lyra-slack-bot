@@ -5,3 +5,4 @@ gspread>=6.0.0
 google-auth>=2.0.0
 openpyxl>=3.1.0
 holidays>=0.40
+matplotlib>=3.8

@@ -1,4 +1,9 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.8).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.10).
+
+v5.10 — PRINT_READING=0 desliga a leitura dos prints; falha técnica na leitura (download, Toqan, resposta fora do
+        formato) vira alerta para o Felipe e não aparece para a EPS. Só print ilegível de verdade é devolvido.
+
+v5.9 — TMA_IN_REPORT=0 tira o TMA do report e da cobrança (CSAT segue normal).
 
 v5.8 — EPS_EXTRA_CHANNELS: canais extras de conversa com recorte de uma EPS (sem report).
 
@@ -208,6 +213,8 @@ FILA_OWNERS: dict[str, list[str]] = {**_DEFAULT_FILA_OWNERS, **_parse_owners(os.
 # TMA = tempo de atribuição por interação × média de interações por ticket (coluna X da CAPA).
 # Filas que não têm TMA (não aparece no report nem é cobrado)
 NO_TMA_FILAS = {"DX - PF Contestação", "DX - PF Contestação Bloqueio temporário"}
+# TMA_IN_REPORT=0 tira o TMA do report e da cobrança (ex.: enquanto a query não bate com a planilha de eficiência)
+TMA_IN_REPORT = os.getenv("TMA_IN_REPORT", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
 _DEFAULT_TMA_PLAN: dict[str, tuple[float, float]] = {
     "CX Suporte": (520, 1.8), "Madrugada": (562, 1.89),
     "CX Review - AeC": (620, 2.05), "CX Review - CSU": (620, 2.05),
@@ -2893,7 +2900,7 @@ def _fmt_tempo(seconds: float) -> str:
 
 def _tma_data(fila: str, data: dict[str, Any]) -> dict[str, Any] | None:
     """TMA = tempo por interação × interações por ticket, no D-1 e no mês, contra o plan da célula."""
-    if any(_norm_text(fila) == _norm_text(f) for f in NO_TMA_FILAS):
+    if not TMA_IN_REPORT or any(_norm_text(fila) == _norm_text(f) for f in NO_TMA_FILAS):
         return None
     tpi_d1, int_d1 = _num(data.get("tma_tpi_d1")), _num(data.get("tma_int_d1"))
     if tpi_d1 is None or int_d1 is None:
@@ -3080,7 +3087,10 @@ def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str]
             suffix = "Plano aqui na thread até 14h: *ação · responsável · prazo*."
         lines.append(f"👉 *Cobrança:* {cobranca} {suffix}")
     elif has_target:
-        elogio = str(data.get("elogio") or "").strip() or "CSAT e TMA dentro do esperado, bom trabalho, time."
+        elogio = str(data.get("elogio") or "").strip() or ("CSAT e TMA dentro do esperado, bom trabalho, time."
+                                                             if tma else "CSAT dentro do esperado, bom trabalho, time.")
+        if not tma:
+            elogio = re.sub(r"\s*(e|,)?\s*TMA[^.,;]*", "", elogio).strip() or "CSAT dentro do esperado, bom trabalho, time."
         lines.append(f"✅ *Destaque:* {elogio}")
     return title, "\n".join(lines).strip()
 
@@ -4673,6 +4683,8 @@ def _post_status_reply(channel: str, thread_ts: str, eps: str, thread_title: str
 # --- Controles em print (Volume, Produtividade): a Lyra lê a imagem e cobra; se não der pra ler, avisa -----------
 PRINT_CONTROLS = (("volume", re.compile(r"\bvolume\b")), ("produtividade", re.compile(r"\bprodutividade\b")))
 PRINT_MAX_POLLS = 36  # 6 min
+# PRINT_READING=0 desliga a leitura dos prints (Volume/Produtividade). Falha técnica nunca vai para a EPS: só alerta.
+PRINT_READING = os.getenv("PRINT_READING", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
 VOL_BACKLOG_RATIO = float(os.getenv("VOL_BACKLOG_RATIO", "0.8"))  # produção < 80% da entrada = fila acumulando
 HC_SHORT_RATIO = 0.9   # logados < 90% do projetado com volume no projetado ou acima
 HC_EXCESS_RATIO = 1.2  # logados ≥ 120% do projetado (e +2 pessoas) com volume abaixo
@@ -4818,6 +4830,7 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
     user = msg.get("user")
     head_base = f"📷 *{re.sub(r'[`*_]', '', title).strip()[:60]} · {eps}*"
     problem = ""
+    tech_problem = ""  # falha nossa (download, Toqan, JSON): só alerta, nunca cobra a EPS
     data: dict[str, Any] | None = None
     try:
         file_ids = []
@@ -4826,17 +4839,23 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
             if content:
                 file_ids.append(toqan_upload_file(content, str(f.get("name") or "print.png"), str(f.get("mimetype") or "image/png")))
         if not file_ids:
-            problem = "não consegui baixar a imagem do Slack"
+            tech_problem = "não consegui baixar a imagem do Slack"
         else:
             answer = ask_toqan_with_files(_print_prompt(kind), file_ids, max_attempts=PRINT_MAX_POLLS)
             if answer.strip().upper().startswith("ILEGIVEL") or answer.strip().upper().startswith("ILEGÍVEL"):
                 problem = answer.split(":", 1)[-1].strip()[:150] or "imagem ilegível"
             else:
                 data = _block_data_from_json(answer)
-                problem = "não consegui transcrever a tabela" if not data else (_validate_print(kind, data) or "")
+                if not data:
+                    tech_problem = "a resposta do Toqan não veio como tabela"
+                else:
+                    problem = _validate_print(kind, data) or ""
     except Exception as exc:
         logger.exception("[%s] Print read failed", eps)
-        problem = f"falha ao ler a imagem ({type(exc).__name__})"
+        tech_problem = f"falha ao ler a imagem ({type(exc).__name__})"
+    if tech_problem:
+        _alert(f"Print de controle ({eps} · {re.sub(r'[`*_]', '', title).strip()[:60]}): {tech_problem}. Nada foi postado para a EPS.")
+        return None
     if problem or not data:
         return _post_status_reply(channel, thread_ts, eps, title, head_base,
                                   [f"Não consegui ler o print ({problem or 'sem dados'}). Manda em tamanho maior, sem cortar "
@@ -4869,6 +4888,8 @@ def _maybe_status_reply(event: dict[str, Any]) -> bool:
     if event.get("bot_id"):
         return False
     if _image_files(event):
+        if not PRINT_READING:
+            return False
         msg_ts = str(event.get("ts") or "")
         with _LIVE_LOCK:
             if msg_ts in _PRINT_PENDING:
