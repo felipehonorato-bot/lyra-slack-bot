@@ -2,6 +2,8 @@
 
 v5.10 — PRINT_READING=0 desliga a leitura dos prints; falha técnica na leitura (download, Toqan, resposta fora do
         formato) vira alerta para o Felipe e não aparece para a EPS. Só print ilegível de verdade é devolvido.
+        STATUS_SHADOW aceita lista de EPS em teste (ex.: AeC) e STATUS_TEST_CHANNELS guarda o canal de testes de cada
+        EPS, para o modo teste seguir no canal de testes depois que EPS_CHANNELS virar o canal oficial.
 
 v5.9 — TMA_IN_REPORT=0 tira o TMA do report e da cobrança (CSAT segue normal).
 
@@ -4419,7 +4421,21 @@ _STATUS_CHANNEL_EPS = {channel: eps for eps, channel in STATUS_CHANNELS.items()}
 STATUS_REPLY_DELAY_SECONDS = int(os.getenv("STATUS_REPLY_DELAY_SECONDS", "90"))
 # Fase de testes: lê o canal real da EPS, mas responde no canal de testes da EPS (EPS_CHANNELS), sem marcar ninguém.
 # STATUS_SHADOW=0 = responde na própria thread da EPS, marcando quem postou.
-STATUS_SHADOW = os.getenv("STATUS_SHADOW", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+# Também aceita a lista de EPS que seguem em teste (ex.: STATUS_SHADOW=AeC: a AeC fica em teste e a CSU vale).
+_SHADOW_RAW = os.getenv("STATUS_SHADOW", "1").strip()
+_SHADOW_OFF = {"0", "false", "nao", "não", "off"}
+_SHADOW_ON = {"1", "true", "sim", "on"}
+STATUS_SHADOW = _SHADOW_RAW.lower() not in _SHADOW_OFF
+_SHADOW_EPS = (set() if _SHADOW_RAW.lower() in _SHADOW_OFF | _SHADOW_ON
+               else {p.strip().casefold() for p in _SHADOW_RAW.split(",") if p.strip()})
+# Canal de testes de cada EPS para o modo teste. Vazio = usa EPS_CHANNELS (que na virada passa a ser o canal oficial).
+STATUS_TEST_CHANNELS = _parse_channel_map(os.getenv("STATUS_TEST_CHANNELS", ""))
+
+
+def _status_shadow(eps: str) -> bool:
+    if _SHADOW_EPS:
+        return eps.casefold() in _SHADOW_EPS
+    return STATUS_SHADOW
 STATUS_REPEAT_LIMIT = 3  # mesma justificativa em 3 status seguidos = cobrar atualização real
 STATUS_RERAISE_EVERY = 4  # CSAT/SLA fora da meta e justificativa repetida só voltam a ser cobrados a cada 4 status
 
@@ -4658,7 +4674,7 @@ def _post_status_reply(channel: str, thread_ts: str, eps: str, thread_title: str
     """Responde a um controle da EPS. Fase de testes (STATUS_SHADOW): vai para o canal de testes da EPS, numa
     thread por controle, sem marcar ninguém; senão, na própria thread da EPS marcando quem postou."""
     lines = [f"• {b}" for b in bullets]
-    test_channel = EPS_CHANNELS.get(eps) if STATUS_SHADOW else None
+    test_channel = (STATUS_TEST_CHANNELS.get(eps) or EPS_CHANNELS.get(eps)) if _status_shadow(eps) else None
     if test_channel:
         text = head + ("\n\n" + "\n".join(lines) if lines else "")
         parent_key = f"status_shadow:{channel}:{thread_ts}"
@@ -4681,7 +4697,14 @@ def _post_status_reply(channel: str, thread_ts: str, eps: str, thread_title: str
 
 
 # --- Controles em print (Volume, Produtividade): a Lyra lê a imagem e cobra; se não der pra ler, avisa -----------
-PRINT_CONTROLS = (("volume", re.compile(r"\bvolume\b")), ("produtividade", re.compile(r"\bprodutividade\b")))
+PRINT_CONTROLS = (("hora", re.compile(r"acompanhamento de fila|hora ?/ ?hora")),
+                  ("volume", re.compile(r"\bvolume\b")), ("produtividade", re.compile(r"\bprodutividade\b")))
+# Acompanhamento de Fila da AeC (print de hora em hora, P = planejado, R = realizado). Lê só o CONSOLIDADO da hora.
+HORA_TMA_RATIO = 1.10   # TMA realizado > 110% do planejado
+HORA_SLA_PP = 2.0       # SLA 1ª resposta abaixo da meta (SLA_METAS) ou do P SLA em mais de 2 p.p.
+HORA_MIN_CASES = 10     # TMA/SLA só com pelo menos 10 casos tratados/recebidos na hora
+_HORA_SEGMENTOS = (("madrugada", "Madrugada"), ("review", "CX Review - AeC"), ("super", "CX Super Cliente - AeC"),
+                   ("suporte", "CX Suporte"))
 PRINT_MAX_POLLS = 36  # 6 min
 # PRINT_READING=0 desliga a leitura dos prints (Volume/Produtividade). Falha técnica nunca vai para a EPS: só alerta.
 PRINT_READING = os.getenv("PRINT_READING", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
@@ -4708,6 +4731,16 @@ def _print_prompt(kind: str) -> str:
         "imagens anexadas (prints de um controle da EPS) e transcreva os números. Se não conseguir ler TODOS os números "
         "com certeza (imagem pequena, cortada, borrada, ou você não consegue ver imagens), responda SOMENTE "
         "`ILEGIVEL: <motivo curto>`. Nunca chute número. Devolva APENAS JSON válido, números com ponto decimal.\n")
+    if kind == "hora":
+        return common + (
+            "O print é o acompanhamento de fila de hora em hora da EPS: uma linha por Segmento (ex.: IFOOD_CX_REVIEW) ou "
+            "por Intervalo, com as colunas P SLA, R SLA 1 Resp, R SLA Res, P Vol, R Vol, Δ, Tratados, P TMA, R TMA, Δ, "
+            "P HC Prod, R HC Prod, Δ, P Prod/HC, R Prod/HC (P = planejado, R = realizado). Ignore as colunas Δ. "
+            "Percentuais sem o símbolo %, TMA em segundos como está no print.\n"
+            '{"tipo": "hora", "linhas": [{"segmento": "IFOOD_CX_REVIEW", "p_sla": 99.43, "r_sla_1resp": 100, '
+            '"r_sla_res": null, "p_vol": 52, "r_vol": 5, "tratados": 5, "p_tma": 589.34, "r_tma": 350, "p_hc": 15.48, '
+            '"r_hc": 10, "p_prod_hc": 3.35, "r_prod_hc": 0.51}]}\n'
+            "Célula vazia: null. Uma linha por segmento ou intervalo que aparecer.")
     if kind == "volume":
         return common + (
             "Os prints trazem, por célula (ex.: CX Review, Super CX), por hora: volume projetado e real (tabela 'Volume por "
@@ -4727,6 +4760,13 @@ def _print_prompt(kind: str) -> str:
 
 def _validate_print(kind: str, data: dict[str, Any]) -> str | None:
     """Confere a leitura pelos totais do próprio print. Devolve o problema (ou None se a leitura fecha)."""
+    if kind == "hora":
+        linhas = data.get("linhas") or []
+        if not linhas:
+            return "não achei as linhas da tabela"
+        if not any(_hora_fila(str(l.get("segmento") or "")) for l in linhas):
+            return "não reconheci os segmentos"
+        return None
     if kind == "volume":
         cels = data.get("celulas") or []
         if not cels:
@@ -4786,6 +4826,39 @@ def _judge_volume(data: dict[str, Any]) -> list[tuple[str, str]]:
     return issues
 
 
+def _hora_fila(segmento: str) -> str | None:
+    text = _norm_text(segmento).replace("_", " ")
+    return next((fila for key, fila in _HORA_SEGMENTOS if key in text), None)
+
+
+def _judge_hora(data: dict[str, Any]) -> list[tuple[str, str]]:
+    """Acompanhamento de fila hora a hora (AeC): falta de HC, TMA acima do plan e SLA 1ª resposta abaixo da meta."""
+    issues: list[tuple[str, str]] = []
+    hora = str(data.get("ate") or "").strip()
+    quando = f" às {_hh(hora)}" if hora else ""
+    for linha in data.get("linhas") or []:
+        fila = _hora_fila(str(linha.get("segmento") or ""))
+        if not fila:
+            continue
+        v = {k: _num(linha.get(k)) for k in ("p_sla", "r_sla_1resp", "p_vol", "r_vol", "tratados", "p_tma", "r_tma",
+                                              "p_hc", "r_hc")}
+        if v["p_hc"] and v["r_hc"] is not None and v["p_vol"] and v["r_vol"] is not None \
+                and v["r_hc"] < HC_SHORT_RATIO * v["p_hc"] and v["r_vol"] >= v["p_vol"]:
+            issues.append((f"falta:{fila}", f"*{fila}:* HC abaixo do planejado{quando} ({_bfmt(v['r_hc'])} contra "
+                                             f"{_bfmt(v['p_hc'])}) com volume no previsto ou acima ({_fmt_int(v['r_vol'])} "
+                                             f"contra {_fmt_int(v['p_vol'])}). Qual o ajuste de escala?"))
+        if v["p_tma"] and v["r_tma"] and (v["tratados"] or 0) >= HORA_MIN_CASES and v["r_tma"] > HORA_TMA_RATIO * v["p_tma"]:
+            issues.append((f"tma:{fila}", f"*{fila}:* TMA de {_fmt_int(v['r_tma'])} s{quando}, "
+                                           f"{_bfmt((v['r_tma'] / v['p_tma'] - 1) * 100, 0)}% acima do plan de "
+                                           f"{_fmt_int(v['p_tma'])} s. O que está alongando o atendimento?"))
+        meta = SLA_METAS.get(fila) or v["p_sla"]
+        casos = max(v["r_vol"] or 0, v["tratados"] or 0)
+        if meta and v["r_sla_1resp"] is not None and casos >= HORA_MIN_CASES and v["r_sla_1resp"] < meta - HORA_SLA_PP:
+            issues.append((f"sla:{fila}", f"*{fila}:* SLA de 1ª resposta em {_bfmt(v['r_sla_1resp'])}%{quando}, abaixo "
+                                           f"da meta de {_bfmt(meta)}%. O que está segurando a primeira resposta?"))
+    return issues
+
+
 def _judge_produtividade(data: dict[str, Any]) -> list[tuple[str, str]]:
     """Compara cada equipe com a média da célula NA MESMA HORA (madrugada x dia não se misturam)."""
     cells: list[tuple[str, str, float]] = []
@@ -4827,6 +4900,14 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
     images = _image_files(msg)
     if not images:
         return None
+    hora_txt = ""
+    if kind == "hora":
+        msg_text = _norm_text(msg.get("text"))
+        if "consolidado" not in msg_text:  # as tabelas por célula repetem o consolidado: lê só ele
+            return None
+        mh = re.search(r"(\d{1,2})\s*[:h]\s*(\d{2})?", str(msg.get("text") or ""))
+        hora_txt = f"{int(mh.group(1)):02d}:{mh.group(2) or '00'}" if mh else ""
+        images = images[:1]
     user = msg.get("user")
     head_base = f"📷 *{re.sub(r'[`*_]', '', title).strip()[:60]} · {eps}*"
     problem = ""
@@ -4857,10 +4938,18 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
         _alert(f"Print de controle ({eps} · {re.sub(r'[`*_]', '', title).strip()[:60]}): {tech_problem}. Nada foi postado para a EPS.")
         return None
     if problem or not data:
+        ikey = f"print_ilegivel:{channel}:{thread_ts}"
+        if STATE.get(ikey):  # já pediu print legível nessa thread hoje: não repete a cada hora
+            _alert(f"Print de controle ({eps}) ilegível de novo: {problem or 'sem dados'}.")
+            return None
+        STATE.set(ikey, "1")
         return _post_status_reply(channel, thread_ts, eps, title, head_base,
                                   [f"Não consegui ler o print ({problem or 'sem dados'}). Manda em tamanho maior, sem cortar "
                                    "a tabela, ou o Excel do controle."], user)
-    issues = _judge_volume(data) if kind == "volume" else _judge_produtividade(data)
+    if kind == "hora" and hora_txt and not data.get("ate"):
+        data["ate"] = hora_txt
+    issues = (_judge_hora(data) if kind == "hora" else _judge_volume(data) if kind == "volume"
+              else _judge_produtividade(data))
     skey = f"print:{channel}:{thread_ts}"
     try:
         raised = json.loads(STATE.get(skey) or "{}")
