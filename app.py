@@ -1,9 +1,19 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.10).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.11).
+
+v5.11 — DM aberta pelo e-mail do Slack: domínio iFood (DM_ALLOWED_DOMAINS) vê tudo, e-mail de EPS vê só a própria EPS
+        (precisa do escopo users:read.email). DM com memória da conversa (últimas mensagens / thread), "ontem" completa
+        o pedido anterior. Sem pergunta de volta: falta indicador = CSAT, falta período = D-1, falta fila = todas.
+        "Resultado por operador" / "ofensores": quem tem visão completa (e-mail iFood ou canal interno) recebe direto
+        no chat (até 15, do pior para o melhor; ofensores = Q4), com a planilha completa se passar disso. Nos canais
+        das EPSs segue em planilha. Período pedido: ontem, mês ou semana; fila citada filtra.
 
 v5.10 — PRINT_READING=0 desliga a leitura dos prints; falha técnica na leitura (download, Toqan, resposta fora do
         formato) vira alerta para o Felipe e não aparece para a EPS. Só print ilegível de verdade é devolvido.
         STATUS_SHADOW aceita lista de EPS em teste (ex.: AeC) e STATUS_TEST_CHANNELS guarda o canal de testes de cada
         EPS, para o modo teste seguir no canal de testes depois que EPS_CHANNELS virar o canal oficial.
+        Acompanhamento de Fila da AeC (print hora a hora, só o CONSOLIDADO): cobra HC abaixo do planejado com volume
+        no previsto, TMA > 110% do plan e SLA 1ª resposta abaixo da meta (SLA_METAS ou o P SLA do print). Print
+        ilegível é pedido uma vez por thread; depois só alerta.
 
 v5.9 — TMA_IN_REPORT=0 tira o TMA do report e da cobrança (CSAT segue normal).
 
@@ -83,7 +93,7 @@ v3.2 — segregação por EPS:
 - Toda mensagem ao Toqan leva um bloco ESCOPO; em canal de EPS os dados são
   filtrados pelo e-mail do operador (aec / csu) e só as células da EPS aparecem.
 - Upload de MOP no canal de uma EPS troca só as linhas daquela EPS.
-- DM só para DM_ALLOWED_USERS; canal não configurado não recebe resposta.
+- DM: DM_ALLOWED_USERS e e-mails iFood (visão completa) ou de EPS (só a EPS); canal não configurado não recebe resposta.
 
 O que mudou na v3.1 (sustentação):
 - Agendador único, resistente a restart: o estado de cada rotina fica na aba
@@ -176,6 +186,9 @@ INTERNAL_CHANNELS = _parse_id_list(os.getenv("INTERNAL_CHANNELS", "")) | (
 DM_ALLOWED_USERS = _parse_id_list(os.getenv("DM_ALLOWED_USERS", "")) or (
     {t for t in _parse_id_list(ALERT_CHANNEL) if t.startswith("U")}
 )
+# DM liberada para e-mails desses domínios (visão completa). E-mail de EPS (aec/csu) vê só a própria EPS. Vazio = só a lista.
+DM_ALLOWED_DOMAINS = {d.strip().lower().lstrip("@") for d in os.getenv("DM_ALLOWED_DOMAINS", "ifood.com.br").split(",")
+                      if d.strip()}
 CONSOLIDATED = "Consolidado"
 
 # Células de cada EPS (fonte: Felipe, out/2026). O nome da EPS também é o trecho
@@ -600,10 +613,46 @@ def _scope_instruction(eps: str | None) -> str:
     )
 
 
+_DM_SCOPE_CACHE: dict[str, tuple[bool, str | None]] = {}
+_DM_EMAIL_ALERTED = False
+
+
+def _dm_scope(user: str) -> tuple[bool, str | None]:
+    """Quem pode usar a DM e com qual visão, pelo e-mail do Slack:
+    DM_ALLOWED_USERS ou domínio iFood (DM_ALLOWED_DOMAINS) = visão completa; e-mail de EPS (aec/csu no domínio) = só
+    a EPS dela; resto = sem DM. Precisa do escopo users:read.email no app do Slack."""
+    global _DM_EMAIL_ALERTED
+    if user in DM_ALLOWED_USERS:
+        return True, None
+    if user in _DM_SCOPE_CACHE:
+        return _DM_SCOPE_CACHE[user]
+    email = ""
+    try:
+        info = slack_app.client.users_info(user=user)
+        email = str(((info.get("user") or {}).get("profile") or {}).get("email") or "").lower()
+    except Exception:
+        logger.warning("Could not read e-mail of %s", user, exc_info=True)
+    if not email:
+        if not _DM_EMAIL_ALERTED:
+            _DM_EMAIL_ALERTED = True
+            _alert("DM: não consegui ler o e-mail de quem chamou a Lyra. Inclua o escopo users:read.email no app do Slack "
+                   "(OAuth & Permissions) e reinstale; até lá a DM fica só para DM_ALLOWED_USERS.")
+        return False, None
+    domain = email.rsplit("@", 1)[-1]
+    result: tuple[bool, str | None] = (False, None)
+    eps_hit = next((e for e in EPS_CELULAS if _eps_pattern(e) and _eps_pattern(e) in domain), None)
+    if eps_hit:
+        result = (True, eps_hit)
+    elif any(domain == d or domain.endswith("." + d) for d in DM_ALLOWED_DOMAINS):
+        result = (True, None)
+    _DM_SCOPE_CACHE[user] = result
+    return result
+
+
 def _event_scope(event: dict[str, Any]) -> tuple[bool, str | None]:
     """(permitido?, EPS do escopo). EPS None = visão completa."""
     if event.get("channel_type") == "im":
-        return str(event.get("user") or "") in DM_ALLOWED_USERS, None
+        return _dm_scope(str(event.get("user") or ""))
     channel = str(event.get("channel") or "")
     if channel in CHANNEL_SCOPE:
         return True, CHANNEL_SCOPE[channel]
@@ -2364,20 +2413,47 @@ _OPERATORS_EXCEL_RE = re.compile(
 OPERATORS_CSV_HEADER = ["email", "fila", "avaliacoes", "promotores", "csat", "meta", "atingimento", "quadrante"]
 
 
+# Resultado individual pedido em texto ("resultado por operador de ontem", "CSAT dos analistas"): vai em Excel,
+# porque nome/e-mail de operador não aparece no Slack.
+_OPERATORS_RESULT_RE = re.compile(
+    r"\bpor (operador|analista|atendente)\b|\bresultado (individual|dos operadores|dos analistas|dos atendentes)\b"
+    r"|\b(quem|quais|lista|listar|resultado|traz|traga|mostra|manda)\b.*\b(ofensor|ofensores)\b"
+    r"|\b(ofensor|ofensores)\b (de|do|da|em) (ontem|hoje|csat|d 1|mes|semana)\b"
+    r"|\bpiores (operadores|analistas|atendentes)\b"
+    r"|\b(csat|resultado|quadrante|ranking)\b.*\b(dos|de cada|por) (operador|operadores|analista|analistas|atendente|atendentes)\b"
+)
+
+
 def _is_operators_excel_request(question: str) -> bool:
     text = _norm_text(question)
     if re.search(r"\bmop\b", text):  # pedido de MOP tem prioridade
         return False
-    return bool(_OPERATORS_EXCEL_RE.search(text))
+    return bool(_OPERATORS_EXCEL_RE.search(text) or _OPERATORS_RESULT_RE.search(text))
 
 
-def _operators_prompt(eps: str | None) -> str:
+def _operators_period(question: str) -> tuple[str, str]:
+    """(instrução de período para o agente, rótulo para o arquivo)."""
+    text = _norm_text(question)
+    day = _today_brazil() - timedelta(days=1)
+    if re.search(r"\b(ontem|d 1|d1)\b", text):
+        return f"D-1 ({day.strftime('%d/%m/%Y')}). Só operadores com 3+ avaliações no dia.", f"de ontem ({day.strftime('%d/%m')})"
+    if re.search(r"\b(mes|mensal)\b", text):
+        return "mês corrente até o D-1. Só operadores com 5+ avaliações.", "do mês"
+    return "semana corrente (D-7 a D-1). Só operadores com 5+ avaliações.", "da semana"
+
+
+def _eps_in_text(question: str) -> str | None:
+    words = set(_norm_text(question).split())
+    return next((e for e in EPS_CELULAS if _norm_text(e) in words), None)
+
+
+def _operators_prompt(eps: str | None, period: str = "semana corrente (D-7 a D-1). Só operadores com 5+ avaliações.") -> str:
     return (
         f"{_scope_instruction(eps)}\n\n"
         "TAREFA INTERNA DO APP — base de operadores para Excel. Não é mensagem para o Slack.\n"
         "Se você usa subagentes, peça ao subagente de indicadores com "
-        f"'EPS: {eps or 'iFood'}' e 'Pedido: base de operadores (CSV)'.\n"
-        "Período: semana corrente (D-7 a D-1). Só filas da lista oficial da EPS. Só operadores com 5+ avaliações.\n"
+        f"'EPS: {eps or 'iFood'}', 'Pedido: base de operadores (CSV)' e 'Período: {period}'\n"
+        f"Período: {period} Só filas da lista oficial da EPS.\n"
         "Quadrante pelo atingimento = CSAT do operador ÷ meta da fila: Q1 ≥ 100% · Q2 95–99% · Q3 90–94% · Q4 < 90%.\n"
         "Responda APENAS um CSV separado por ';', sem markdown, com este cabeçalho exato:\n"
         "email;fila;avaliacoes;promotores;csat;meta;atingimento;quadrante\n"
@@ -2657,30 +2733,91 @@ def _build_operators_xlsx(rows: list[list[str]], eps: str | None) -> bytes:
     return buf.getvalue()
 
 
-def _send_operators_excel(event: dict[str, Any], client: Any, eps: str | None) -> str | None:
-    """Pede a base ao agente, monta o Excel e posta na thread. Devolve texto se não deu."""
-    answer = ask_toqan(_operators_prompt(eps))
+def _operators_rows(eps: str | None, question: str) -> tuple[list[list[str]], int | None, str, str | None] | str:
+    """Base de operadores do período pedido: (linhas, total, rótulo do período, EPS usada) ou texto de erro."""
+    period, period_label = _operators_period(question)
+    if eps is None:
+        eps = _eps_in_text(question)  # visão completa pedindo uma EPS: recorta nela
+    answer = ask_toqan(_operators_prompt(eps, period))
     if _is_error_answer(answer):
         return "Não consegui puxar os dados dos operadores agora. Tenta de novo em alguns minutos?"
     rows, total = _parse_operators_csv(answer)
     if not rows:
-        return "Não consegui montar a planilha dos operadores agora. Tenta de novo em alguns minutos?"
+        return "Não consegui montar a base dos operadores agora. Tenta de novo em alguns minutos?"
     if eps:
         rows = [r for r in rows if _eps_pattern(eps) in r[0].lower()]  # trava: só e-mails da EPS
-    content = _build_operators_xlsx(rows, eps)
-    who = f" da {eps}" if eps else ""
-    note = ""
-    if total and total > len(rows):
-        note = f" (vieram {len(rows)} de {total} — a lista pode estar incompleta)"
+    fila = _fila_in_question(question, eps)
+    if fila:
+        rows = [r for r in rows if _norm_text(r[1]) == _norm_text(fila)]
+    return rows, total, period_label, eps
+
+
+def _upload_operators_xlsx(event: dict[str, Any], client: Any, rows: list[list[str]], eps: str | None,
+                           period_label: str, comment: str) -> None:
     stamp = _now_brazil().strftime("%d-%m-%Y")
+    who = f" da {eps}" if eps else ""
     (client or slack_app.client).files_upload_v2(
         channel=event.get("channel"),
         thread_ts=event.get("thread_ts") or event.get("ts"),
-        content=content,
+        content=_build_operators_xlsx(rows, eps),
         filename=f"Operadores{('_' + eps) if eps else ''}_{stamp}.xlsx",
-        title=f"Operadores{who} — CSAT e quadrante da semana",
-        initial_comment=f"Segue a planilha dos operadores{who} com CSAT e quadrante da semana 📋{note}",
+        title=f"Operadores{who} — CSAT e quadrante {period_label}",
+        initial_comment=comment,
     )
+
+
+def _send_operators_excel(event: dict[str, Any], client: Any, eps: str | None, question: str = "") -> str | None:
+    """Pede a base ao agente, monta o Excel e posta na thread. Devolve texto se não deu."""
+    got = _operators_rows(eps, question)
+    if isinstance(got, str):
+        return got
+    rows, total, period_label, eps = got
+    if not rows:
+        return "Não achei operadores com avaliações suficientes nesse recorte."
+    who = f" da {eps}" if eps else ""
+    note = f" (vieram {len(rows)} de {total} — a lista pode estar incompleta)" if total and total > len(rows) else ""
+    _upload_operators_xlsx(event, client, rows, eps, period_label,
+                           f"Segue a planilha dos operadores{who} com CSAT e quadrante {period_label} 📋{note}")
+    return None
+
+
+OPERATORS_INLINE_MAX = 15
+_OFFENDERS_RE = re.compile(r"\b(ofensor|ofensores|piores|q4|detrator|detratores)\b")
+
+
+def _send_operators_inline(event: dict[str, Any], client: Any, eps: str | None, question: str,
+                           say: Callable[..., Any], in_thread: bool) -> str | None:
+    """Visão completa (e-mail iFood / canal interno): resultado por operador direto no chat. "Ofensores" = Q4,
+    do pior para o melhor. Mais de 15 linhas: mostra as 15 piores e manda a planilha completa junto."""
+    got = _operators_rows(eps, question)
+    if isinstance(got, str):
+        return got
+    rows, _, period_label, eps = got
+    fila = _fila_in_question(question, eps)
+    offenders = bool(_OFFENDERS_RE.search(_norm_text(question)))
+    data = sorted(rows, key=lambda r: (_to_float(r[6]) if _to_float(r[6]) is not None else 999,
+                                       -(_to_float(r[2]) or 0)))
+    if offenders:
+        data = [r for r in data if str(r[7]).strip().upper() == "Q4"]
+    where = " · ".join(x for x in (fila, eps if not fila else None) if x) or "todas as filas"
+    when = re.sub(r"^(de|do|da) ", "", period_label)
+    title = f"*{'Ofensores de CSAT' if offenders else 'CSAT por operador'} · {where} · {when}*"
+    if not data:
+        return f"{title}\nNinguém no Q4 nesse recorte (abaixo de 90% da meta, com avaliações suficientes). 👏"
+    lines = []
+    for i, r in enumerate(data[:OPERATORS_INLINE_MAX], 1):
+        user = r[0].split("@")[0]
+        csat, ating = _to_float(r[4]), _to_float(r[6])
+        fila_txt = f" · {r[1]}" if not fila else ""
+        lines.append(f"{i}. `{user}`{fila_txt} — CSAT {_bfmt(csat) if csat is not None else r[4]}% "
+                     f"({r[3]}/{r[2]} promotoras) · {_bfmt(ating, 0) if ating is not None else r[6]}% da meta · {r[7]}")
+    rule = "Q4 = abaixo de 90% da meta da fila" if offenders else "do menor para o maior atingimento"
+    text = f"{title}\n_{rule}_\n\n" + "\n".join(lines)
+    if len(data) > OPERATORS_INLINE_MAX:
+        text += f"\n\n…e mais {len(data) - OPERATORS_INLINE_MAX}. A lista completa vai na planilha aqui embaixo 📋"
+    _say(say, text, event, in_thread)
+    if len(data) > OPERATORS_INLINE_MAX:
+        _upload_operators_xlsx(event, client, data, eps, period_label, "Lista completa 📋")
     return None
 
 
@@ -4155,6 +4292,66 @@ def _thread_context(event: dict[str, Any]) -> str:
     return f"{head}:\n{body}\n\n"
 
 
+DM_CONTEXT_MESSAGES = 12
+DM_CONTEXT_HOURS = 3
+
+
+def _dm_context(event: dict[str, Any]) -> str:
+    """DM: manda junto as últimas mensagens da conversa (ou da thread da DM), para 'ontem' ou 'da AeC' completar o
+    pedido anterior em vez de virar pergunta nova."""
+    if event.get("channel_type") != "im":
+        return ""
+    channel = str(event.get("channel") or "")
+    thread_ts = str(event.get("thread_ts") or "")
+    try:
+        if thread_ts and thread_ts != str(event.get("ts") or ""):
+            messages = _fetch_thread(channel, thread_ts)
+        else:
+            oldest = str(time.time() - DM_CONTEXT_HOURS * 3600)
+            resp = slack_app.client.conversations_history(channel=channel, limit=DM_CONTEXT_MESSAGES + 1, oldest=oldest)
+            messages = list(reversed(resp.get("messages") or []))
+    except Exception:
+        logger.warning("Could not read DM context", exc_info=True)
+        return ""
+    parts = []
+    for m in messages[-(DM_CONTEXT_MESSAGES + 1):]:
+        if m.get("ts") == event.get("ts"):
+            continue
+        who = "Lyra" if (m.get("bot_id") or m.get("subtype") == "bot_message") else "Pessoa"
+        text = _strip_mentions(str(m.get("text") or "")).strip()
+        if text:
+            parts.append(f"[{who}] {text}")
+    if not parts:
+        return ""
+    body = "\n".join(parts)
+    if len(body) > THREAD_CONTEXT_MAX_CHARS:
+        body = body[-THREAD_CONTEXT_MAX_CHARS:]
+    return ("INFORMAÇÃO INTERNA PARA A LYRA — CONVERSA ATÉ AQUI (a mensagem nova pode só completar o pedido anterior, "
+            f"ex.: 'ontem' ou 'da AeC'; junte as duas e responda):\n{body}\n\n")
+
+
+def _last_dm_human_text(event: dict[str, Any]) -> str:
+    """Última mensagem da pessoa antes desta, na DM (para juntar um complemento curto ao pedido anterior)."""
+    if event.get("channel_type") != "im":
+        return ""
+    try:
+        resp = slack_app.client.conversations_history(channel=str(event.get("channel") or ""), limit=6,
+                                                       oldest=str(time.time() - DM_CONTEXT_HOURS * 3600))
+    except Exception:
+        return ""
+    for m in resp.get("messages") or []:  # mais recente primeiro
+        if m.get("ts") == event.get("ts") or m.get("bot_id") or m.get("subtype") == "bot_message":
+            continue
+        return _strip_mentions(str(m.get("text") or "")).strip()
+    return ""
+
+
+DEFAULTS_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA — RESPONDA, NÃO DEVOLVA PERGUNTA: se faltar o indicador, use CSAT; se faltar o "
+    "período, use o D-1 (ontem) com o mês como contexto; se faltar a fila, traga todas as filas do escopo. Diga em meia "
+    "frase o recorte que usou. Só pergunte quando for impossível responder sem a informação.\n\n")
+
+
 def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bool, client: Any = None) -> None:
     """Processa upload de MOP ou repassa a mensagem para o Toqan."""
     event_key = _event_key(event)
@@ -4199,9 +4396,22 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             _say(say, _agents_summary(_run_agent_checks(_now_brazil())), event, in_thread)
             return
 
-        if _is_operators_excel_request(question):
-            _say(say, "Vou montar a planilha dos operadores, já te mando aqui. ⏳", event, in_thread=True)
-            problem = _send_operators_excel(event, client, eps)
+        op_question = question
+        if not _is_operators_excel_request(question) and len(question.split()) <= 4:
+            prev = _last_dm_human_text(event)  # "ontem" respondendo a um pedido de operadores
+            if prev and _is_operators_excel_request(prev):
+                op_question = f"{prev} {question}"
+        if _is_operators_excel_request(op_question):
+            wants_file = bool(re.search(r"\b(excel|planilha|xlsx|arquivo)\b", _norm_text(op_question)))
+            if eps is None and not wants_file:  # visão completa (e-mail iFood / canal interno): direto no chat
+                _say(say, "Vou puxar o resultado por operador, já te mando. ⏳", event, in_thread=True)
+                problem = _send_operators_inline(event, client, eps, op_question, say, in_thread)
+                if problem:
+                    _say(say, problem, event, in_thread)
+                return
+            _say(say, "Resultado individual vai em planilha, para não expor operadores aqui. Já te mando. ⏳",
+                 event, in_thread=True)
+            problem = _send_operators_excel(event, client, eps, op_question)
             if problem:
                 _say(say, problem, event, in_thread)
             return
@@ -4257,7 +4467,9 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             extra = PLAN_INSTRUCTION
         elif not extra and _is_knowledge_question(question):
             extra = KNOWLEDGE_INSTRUCTION
-        prompt = f"{_scope_instruction(eps)}\n\n{_thread_context(event)}{extra}{_inject_mop_context(question, eps)}"
+        context = _thread_context(event) or _dm_context(event)
+        prompt = (f"{_scope_instruction(eps)}\n\n{context}{extra}{DEFAULTS_INSTRUCTION if not extra else ''}"
+                  f"{_inject_mop_context(question, eps)}")
         answer = ask_toqan(prompt, progress_callback=send_progress)
         _passive_access_check(answer)
         answer = _strip_file_promises(answer)
