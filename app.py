@@ -2,7 +2,7 @@
 
 v5.11 — DM aberta pelo e-mail do Slack: domínio iFood (DM_ALLOWED_DOMAINS) vê tudo, e-mail de EPS vê só a própria EPS
         (precisa do escopo users:read.email). DM com memória da conversa (últimas mensagens / thread), "ontem" completa
-        o pedido anterior. Sem pergunta de volta: falta indicador = CSAT, falta período = D-1, falta fila = todas.
+        o pedido anterior. Na DM a resposta sai na conversa principal (sem thread). Sem pergunta de volta: falta indicador = CSAT, falta período = D-1, falta fila = todas.
         "Resultado por operador" / "ofensores": quem tem visão completa (e-mail iFood ou canal interno) recebe direto
         no chat (até 15, do pior para o melhor; ofensores = Q4), com a planilha completa se passar disso. Nos canais
         das EPSs segue em planilha. Período pedido: ontem, mês ou semana; fila citada filtra.
@@ -1537,7 +1537,7 @@ def _send_mop_export(event: dict[str, Any], client: Any, eps: str | None) -> str
     uploader = client or slack_app.client
     uploader.files_upload_v2(
         channel=event.get("channel"),
-        thread_ts=event.get("thread_ts") or event.get("ts"),
+        thread_ts=_reply_ts(event),
         content=content,
         filename=f"MOP{('_' + eps) if eps else '_Consolidado'}_{stamp}.xlsx",
         title=f"MOP{who} — {stamp}",
@@ -2606,7 +2606,7 @@ def _send_chart(event: dict[str, Any], client: Any, eps: str | None, question: s
     nota = str(spec.get("nota") or "").strip()
     title = str(spec.get("titulo") or "Gráfico")
     (client or slack_app.client).files_upload_v2(
-        channel=event.get("channel"), thread_ts=event.get("thread_ts") or event.get("ts"),
+        channel=event.get("channel"), thread_ts=_reply_ts(event),
         content=png, filename=re.sub(r"[^\w\-]+", "_", title)[:60] + ".png", title=title,
         initial_comment=(f"📊 {nota}" if nota else "📊 Segue o gráfico."),
     )
@@ -2691,7 +2691,7 @@ def _send_data_excel(event: dict[str, Any], client: Any, eps: str | None, questi
     stamp = _now_brazil().strftime("%d-%m-%Y")
     (client or slack_app.client).files_upload_v2(
         channel=event.get("channel"),
-        thread_ts=event.get("thread_ts") or event.get("ts"),
+        thread_ts=_reply_ts(event),
         content=_build_data_xlsx(header, rows, name),
         filename=f"{safe}{('_' + eps) if eps else ''}_{stamp}.xlsx",
         title=name,
@@ -2758,7 +2758,7 @@ def _upload_operators_xlsx(event: dict[str, Any], client: Any, rows: list[list[s
     who = f" da {eps}" if eps else ""
     (client or slack_app.client).files_upload_v2(
         channel=event.get("channel"),
-        thread_ts=event.get("thread_ts") or event.get("ts"),
+        thread_ts=_reply_ts(event),
         content=_build_operators_xlsx(rows, eps),
         filename=f"Operadores{('_' + eps) if eps else ''}_{stamp}.xlsx",
         title=f"Operadores{who} — CSAT e quadrante {period_label}",
@@ -3443,7 +3443,7 @@ def _post_esteira_on_demand(event: dict[str, Any], eps: str | None, question: st
         text = _render_esteira(data, gap, periodo="do D-1" if d1_only else "do mês", fila=fila)
         if not text:
             return False
-        _post_sections(str(event.get("channel") or ""), text, thread_ts=event.get("thread_ts") or event.get("ts"))
+        _post_sections(str(event.get("channel") or ""), text, thread_ts=_reply_ts(event))
         return True
     except Exception:
         logger.exception("On-demand esteira failed (%s)", fila)
@@ -4204,8 +4204,9 @@ def _post_sections(channel: str, text: str, thread_ts: str | None = None) -> Any
 
 def _say_sections(say: Callable[..., Any], answer: str, event: dict[str, Any], in_thread: bool = True) -> None:
     kwargs: dict[str, Any] = {"text": answer}
-    if in_thread:
-        kwargs["thread_ts"] = event.get("thread_ts") or event.get("ts")
+    ts = _reply_ts(event) if (in_thread or event.get("channel_type") == "im") else None
+    if ts:
+        kwargs["thread_ts"] = ts
     blocks = _section_blocks(answer)
     if blocks:
         try:
@@ -4216,9 +4217,18 @@ def _say_sections(say: Callable[..., Any], answer: str, event: dict[str, Any], i
     say(**kwargs)
 
 
+def _reply_ts(event: dict[str, Any]) -> str | None:
+    """Onde a Lyra responde: em canal, na thread da pergunta; na DM, na conversa principal (ou na thread, se a pessoa
+    escreveu dentro de uma thread da DM)."""
+    if event.get("channel_type") == "im":
+        return event.get("thread_ts") or None
+    return event.get("thread_ts") or event.get("ts")
+
+
 def _say(say: Callable[..., Any], answer: str, event: dict[str, Any], in_thread: bool) -> None:
-    if in_thread:
-        say(text=answer, thread_ts=event.get("thread_ts") or event.get("ts"))
+    ts = _reply_ts(event) if (in_thread or event.get("channel_type") == "im") else None
+    if ts:
+        say(text=answer, thread_ts=ts)
     else:
         say(text=answer)
 
