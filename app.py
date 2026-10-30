@@ -1,4 +1,12 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.11).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.12).
+
+v5.12 — Visão de equipe ("minha equipe", "equipe da X", "por supervisor"): pelo MOP (supervisor/coordenador) e pela
+        base de operadores do período (com o anterior para o Δ: D-1 x D-8, semana x semana, mês x mesmos dias), traz
+        CSAT x meta, positivas faltantes, quadrantes (amostra pequena < 10), dispersão Q4÷Q1, limite de controle,
+        concentração das notas 1–3, tabela por supervisor (coordenação) e os Q4 com mais positivas faltantes. Plano
+        escrito na thread do report não dispara essas listas. Reincidentes 4 semanas: Q4 nas 4 últimas semanas
+        (5+ pesquisas em cada), pela base de operadores por semana. "Quais os 10 operadores mais reincidentes de
+        CX Suporte?" vira ranking de semanas no Q4. Operador aparece como "Nome · e-mail".
 
 v5.11 — DM aberta pelo e-mail do Slack: domínio iFood (DM_ALLOWED_DOMAINS) vê tudo, e-mail de EPS vê só a própria EPS
         (precisa do escopo users:read.email). DM com memória da conversa (últimas mensagens / thread), "ontem" completa
@@ -6,7 +14,10 @@ v5.11 — DM aberta pelo e-mail do Slack: domínio iFood (DM_ALLOWED_DOMAINS) v�
         e data digitada no futuro (29/11 pedido em 30/10) vira a data passada mais provável, avisando. Sem pergunta de volta: falta indicador = CSAT, falta período = D-1, falta fila = todas.
         "Resultado por operador" / "ofensores": quem tem visão completa (e-mail iFood ou canal interno) recebe direto
         no chat (até 15, do pior para o melhor; ofensores = Q4), com a planilha completa se passar disso. Nos canais
-        das EPSs segue em planilha. Período pedido: ontem, mês ou semana; fila citada filtra.
+        das EPSs segue em planilha. Período pedido: ontem, mês ou semana; fila citada filtra. "Top N", "melhores" e
+        "mais impacto" (avaliações × gap até a meta) também. Quem tem visão completa pode ver operador nas respostas
+        livres da Lyra, com o NOME do MOP ao lado do usuário (OPERATOR_NAMES=all: em qualquer conversa, cada EPS só
+        os dela; internal: só visão completa; off: só planilha). O report diário segue sem nomes.
 
 v5.10 — PRINT_READING=0 desliga a leitura dos prints; falha técnica na leitura (download, Toqan, resposta fora do
         formato) vira alerta para o Felipe e não aparece para a EPS. Só print ilegível de verdade é devolvido.
@@ -117,6 +128,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import logging
 import os
 import re
@@ -2420,7 +2432,9 @@ _OPERATORS_RESULT_RE = re.compile(
     r"\bpor (operador|analista|atendente)\b|\bresultado (individual|dos operadores|dos analistas|dos atendentes)\b"
     r"|\b(quem|quais|lista|listar|resultado|traz|traga|mostra|manda)\b.*\b(ofensor|ofensores)\b"
     r"|\b(ofensor|ofensores)\b (de|do|da|em) (ontem|hoje|csat|d 1|mes|semana)\b"
-    r"|\bpiores (operadores|analistas|atendentes)\b"
+    r"|\b(piores|melhores) (operadores|analistas|atendentes|agentes)\b"
+    r"|\btop \d{1,2} (operadores|analistas|atendentes|agentes)\b"
+    r"|\b(operadores|analistas|atendentes|agentes) com (mais|maior|menos|menor) (impacto|csat|atingimento)\b"
     r"|\b(csat|resultado|quadrante|ranking)\b.*\b(dos|de cada|por) (operador|operadores|analista|analistas|atendente|atendentes)\b"
 )
 
@@ -2432,19 +2446,40 @@ def _is_operators_excel_request(question: str) -> bool:
     return bool(_OPERATORS_EXCEL_RE.search(text) or _OPERATORS_RESULT_RE.search(text))
 
 
+def _period_spec(question: str) -> dict[str, Any]:
+    """Período pedido com datas explícitas e o período de comparação (regras do Cockpit: D-1 x D-8, W-1 x W-2,
+    mês x mesmos dias do mês anterior)."""
+    text = _norm_text(question)
+    d1 = _as_date(_today_brazil()) - timedelta(days=1)
+    f = lambda d: d.strftime("%d/%m/%Y")
+    if re.search(r"\b(ontem|d 1|d1)\b", text):
+        prev = d1 - timedelta(days=7)
+        return {"label": f"de ontem ({d1.strftime('%d/%m')})", "cur": f"D-1: {f(d1)}", "prev": f"D-8: {f(prev)}",
+                "prev_label": f"D-8 ({prev.strftime('%d/%m')})", "min": 3}
+    if re.search(r"\b(mes|mensal)\b", text):
+        start = d1.replace(day=1)
+        pm_end = start - timedelta(days=1)
+        try:
+            p_end = pm_end.replace(day=d1.day)
+        except ValueError:
+            p_end = pm_end
+        return {"label": "do mês", "cur": f"mês até o D-1: {f(start)} a {f(d1)}",
+                "prev": f"mesmos dias do mês anterior: {f(pm_end.replace(day=1))} a {f(p_end)}",
+                "prev_label": "mesmos dias do mês anterior", "min": 5}
+    start = d1 - timedelta(days=6)
+    return {"label": "da semana", "cur": f"últimos 7 dias: {f(start)} a {f(d1)}",
+            "prev": f"7 dias anteriores: {f(start - timedelta(days=7))} a {f(start - timedelta(days=1))}",
+            "prev_label": "semana anterior", "min": 5}
+
+
 def _operators_period(question: str) -> tuple[str, str]:
     """(instrução de período para o agente, rótulo para o arquivo)."""
-    text = _norm_text(question)
-    day = _today_brazil() - timedelta(days=1)
-    if re.search(r"\b(ontem|d 1|d1)\b", text):
-        return f"D-1 ({day.strftime('%d/%m/%Y')}). Só operadores com 3+ avaliações no dia.", f"de ontem ({day.strftime('%d/%m')})"
-    if re.search(r"\b(mes|mensal)\b", text):
-        return "mês corrente até o D-1. Só operadores com 5+ avaliações.", "do mês"
-    return "semana corrente (D-7 a D-1). Só operadores com 5+ avaliações.", "da semana"
+    spec = _period_spec(question)
+    return f"{spec['cur']}. Só operadores com {spec['min']}+ avaliações.", spec["label"]
 
 
 def _eps_in_text(question: str) -> str | None:
-    words = set(_norm_text(question).split())
+    words = set(re.findall(r"[a-z0-9]+", _norm_text(question)))
     return next((e for e in EPS_CELULAS if _norm_text(e) in words), None)
 
 
@@ -2795,30 +2830,453 @@ def _send_operators_inline(event: dict[str, Any], client: Any, eps: str | None, 
         return got
     rows, _, period_label, eps = got
     fila = _fila_in_question(question, eps)
-    offenders = bool(_OFFENDERS_RE.search(_norm_text(question)))
-    data = sorted(rows, key=lambda r: (_to_float(r[6]) if _to_float(r[6]) is not None else 999,
-                                       -(_to_float(r[2]) or 0)))
+    qtext = _norm_text(question)
+    offenders = bool(_OFFENDERS_RE.search(qtext))
+    by_impact = "impacto" in qtext
+    best = bool(re.search(r"\bmelhores\b", qtext)) and not offenders
+
+    def impact(r: list[str]) -> float:  # avaliações abaixo do que a meta pedia: quanto o operador puxa a fila
+        aval, csat, meta = _to_float(r[2]) or 0, _to_float(r[4]), _to_float(r[5])
+        return aval * (meta - csat) / 100 if csat is not None and meta is not None else 0
+
+    if by_impact:
+        data = sorted(rows, key=lambda r: -impact(r))
+        data = [r for r in data if impact(r) > 0]
+    else:
+        data = sorted(rows, key=lambda r: (_to_float(r[6]) if _to_float(r[6]) is not None else 999,
+                                           -(_to_float(r[2]) or 0)), reverse=False)
+        if best:
+            data = list(reversed(data))
     if offenders:
         data = [r for r in data if str(r[7]).strip().upper() == "Q4"]
+    mtop = re.search(r"\btop (\d{1,2})\b", qtext)
+    limit = min(int(mtop.group(1)), OPERATORS_INLINE_MAX) if mtop else OPERATORS_INLINE_MAX
     where = " · ".join(x for x in (fila, eps if not fila else None) if x) or "todas as filas"
     when = re.sub(r"^(de|do|da) ", "", period_label)
-    title = f"*{'Ofensores de CSAT' if offenders else 'CSAT por operador'} · {where} · {when}*"
+    label = ("Maior impacto no CSAT" if by_impact else "Ofensores de CSAT" if offenders
+             else "Melhores em CSAT" if best else "CSAT por operador")
+    title = f"*{label} · {where} · {when}*"
     if not data:
         return f"{title}\nNinguém no Q4 nesse recorte (abaixo de 90% da meta, com avaliações suficientes). 👏"
     lines = []
-    for i, r in enumerate(data[:OPERATORS_INLINE_MAX], 1):
+    try:
+        names = _operator_name_map()
+    except Exception:
+        names = {}
+    for i, r in enumerate(data[:limit], 1):
         user = r[0].split("@")[0]
+        nome = names.get(r[0].lower()) or names.get(user)
+        who = _operator_label(r[0], nome or "")
         csat, ating = _to_float(r[4]), _to_float(r[6])
         fila_txt = f" · {r[1]}" if not fila else ""
-        lines.append(f"{i}. `{user}`{fila_txt} — CSAT {_bfmt(csat) if csat is not None else r[4]}% "
-                     f"({r[3]}/{r[2]} promotoras) · {_bfmt(ating, 0) if ating is not None else r[6]}% da meta · {r[7]}")
-    rule = "Q4 = abaixo de 90% da meta da fila" if offenders else "do menor para o maior atingimento"
+        lines.append(f"{i}. {who}{fila_txt} — CSAT {_bfmt(csat) if csat is not None else r[4]}% "
+                     f"({r[3]}/{r[2]} promotoras) · {_bfmt(ating, 0) if ating is not None else r[6]}% da meta · {r[7]}"
+                     + (f" · impacto {_bfmt(impact(r))} avaliações abaixo da meta" if by_impact else ""))
+    rule = ("impacto = avaliações abaixo do que a meta pedia (avaliações × gap até a meta)" if by_impact
+            else "Q4 = abaixo de 90% da meta da fila" if offenders
+            else "do maior para o menor atingimento" if best else "do menor para o maior atingimento")
+    rule += f" · mínimo de {3 if 'ontem' in period_label else 5} avaliações"
     text = f"{title}\n_{rule}_\n\n" + "\n".join(lines)
-    if len(data) > OPERATORS_INLINE_MAX:
-        text += f"\n\n…e mais {len(data) - OPERATORS_INLINE_MAX}. A lista completa vai na planilha aqui embaixo 📋"
+    if len(data) > limit:
+        text += f"\n\n…e mais {len(data) - limit}. A lista completa vai na planilha aqui embaixo 📋"
     _say(say, text, event, in_thread)
-    if len(data) > OPERATORS_INLINE_MAX:
+    if len(data) > limit:
         _upload_operators_xlsx(event, client, data, eps, period_label, "Lista completa 📋")
+    return None
+
+
+# --- Visão de equipe (supervisor / coordenador) -------------------------------------------------------------
+# Regras do Cockpit (aba Operadores): soma antes de dividir; quadrante pelo atingimento (Q1 ≥ 100% · Q2 95–99,99% ·
+# Q3 90–94,99% · Q4 < 90%); abaixo de 10 pesquisas = amostra pequena; positivas faltantes = promotoras que faltaram
+# para a meta; dispersão = CSAT do Q4 ÷ CSAT do Q1; limite de controle = CSAT da célula − 1,96 × erro padrão.
+_TEAM_RE = re.compile(
+    r"\b(minha|meu|nossa|nosso) (equipe|time|coordenacao|operacao|celula)\b|\bmeus (operadores|analistas|atendentes)\b"
+    r"|\b(equipe|time|coordenacao) (d[aeo]s?|da supervisora|do supervisor|do coordenador|da coordenadora) \w"
+    r"|\b(resultado|csat|desempenho) d[ao]s? (coordenacao|supervisora?|coordenadora?|equipe)\b"
+    r"|\bpor supervisor\b|\bpor coordenador\b|\b(supervisores|coordenadores)\b|\bpositivas faltantes\b")
+TEAM_SMALL_SAMPLE = 10
+TEAM_LIST_MAX = 10
+
+
+def _is_question_like(text: str) -> bool:
+    """Pedido/pergunta (e não um plano de ação escrito na thread do report)."""
+    t = _norm_text(text)
+    return "?" in text or bool(re.match(r"(qual|quais|quem|como|quanto|me (manda|mostra|traz|passa|envia)|manda|mostra|"
+                                        r"traz|traga|envia|resultado|preciso|quero|lista|ranking|top)\b", t))
+
+
+def _is_team_request(question: str) -> bool:
+    return bool(_TEAM_RE.search(_norm_text(question)))
+
+
+def _mop_people(eps: str | None) -> dict[str, dict[str, str]]:
+    """e-mail -> {nome, supervisor, coordenador, celula} do MOP (só a EPS do escopo)."""
+    values = _read_mop_values() or []
+    if len(values) < 2:
+        return {}
+    header = values[0]
+    cols = {k: _find_col(header, k) for k in ("Nome", "Email", "Supervisor", "Coordenador", "Célula", "EPS")}
+    people: dict[str, dict[str, str]] = {}
+    for row in values[1:]:
+        def cell(k: str) -> str:
+            i = cols[k]
+            return str(row[i]).strip() if i is not None and i < len(row) else ""
+        email = cell("Email").lower()
+        if "@" not in email:
+            continue
+        if eps and not _eps_matches(_row_eps(row, cols["EPS"], cols["Email"]), eps):
+            continue
+        people[email] = {"nome": cell("Nome"), "supervisor": cell("Supervisor"), "coordenador": cell("Coordenador"),
+                         "celula": cell("Célula")}
+    return people
+
+
+def _name_hit(name: str, text: str) -> bool:
+    """O nome (ou pelo menos 2 partes dele) aparece no texto."""
+    parts = [p for p in re.findall(r"[a-z0-9]+", _norm_text(name)) if len(p) >= 3 or p.isdigit()]
+    if not parts:
+        return False
+    words = set(re.findall(r"[a-z0-9]+", _norm_text(text)))
+    hits = sum(1 for p in parts if p in words)
+    return hits >= (len(parts) if len(parts) <= 2 else 2)
+
+
+def _resolve_team(question: str, event: dict[str, Any], people: dict[str, dict[str, str]]) -> tuple[str, str | None]:
+    """('sup', nome) | ('coord', nome) | ('all', None) | ('none', None)."""
+    sups = {p["supervisor"] for p in people.values() if p["supervisor"]}
+    coords = {p["coordenador"] for p in people.values() if p["coordenador"]}
+    for kind, names in (("sup", sups), ("coord", coords)):
+        named = [n for n in names if _name_hit(n, question)]
+        if named:
+            return kind, max(named, key=len)
+    text = _norm_text(question)
+    if re.search(r"\b(minha|meu|nossa|nosso|meus)\b", text):
+        me = ""
+        try:
+            info = slack_app.client.users_info(user=str(event.get("user") or ""))
+            u = info.get("user") or {}
+            email = str((u.get("profile") or {}).get("email") or "").lower()
+            me = (people.get(email) or {}).get("nome") or u.get("real_name") or (u.get("profile") or {}).get("real_name") or ""
+        except Exception:
+            logger.warning("Team view: could not identify asker", exc_info=True)
+        if me:
+            for kind, names in (("coord", coords), ("sup", sups)):
+                own = [n for n in names if _norm_text(n) == _norm_text(me) or _name_hit(n, me)]
+                if own:
+                    return kind, own[0]
+        return "none", None
+    return "all", None
+
+
+def _team_stats(rows: list[list[str]]) -> dict[str, Any]:
+    ops = []
+    for r in rows:
+        aval, prom, meta = _to_float(r[2]) or 0, _to_float(r[3]) or 0, _to_float(r[5])
+        if aval <= 0 or meta is None:
+            continue
+        csat = prom / aval * 100
+        ating = csat / meta * 100 if meta else 0
+        quad = "Q1" if ating >= 100 else "Q2" if ating >= 95 else "Q3" if ating >= 90 else "Q4"
+        falt = max(0, math.ceil(meta / 100 * aval - prom - 1e-9))
+        ops.append({"row": r, "aval": aval, "prom": prom, "meta": meta, "csat": csat, "ating": ating, "quad": quad,
+                    "falt": falt, "det": aval - prom, "small": aval < TEAM_SMALL_SAMPLE})
+    if not ops:
+        return {}
+    aval = sum(o["aval"] for o in ops)
+    prom = sum(o["prom"] for o in ops)
+    meta = sum(o["aval"] * o["meta"] for o in ops) / aval
+    big = [o for o in ops if not o["small"]]
+    q = {k: [o for o in big if o["quad"] == k] for k in ("Q1", "Q2", "Q3", "Q4")}
+
+    def agg(group: list[dict[str, Any]]) -> float | None:
+        a = sum(o["aval"] for o in group)
+        return sum(o["prom"] for o in group) / a * 100 if a else None
+
+    q1, q4 = agg(q["Q1"]), agg(q["Q4"])
+    csats = sorted(o["csat"] for o in big)
+    amp = (csats[int(0.9 * (len(csats) - 1))] - csats[int(0.1 * (len(csats) - 1))]) if len(csats) >= 5 else None
+    # limite de controle: contra a célula (fila) do operador, com todos os operadores da base
+    cell_rate: dict[str, float] = {}
+    for fila in {o["row"][1] for o in ops}:
+        g = [o for o in ops if o["row"][1] == fila]
+        cell_rate[fila] = sum(o["prom"] for o in g) / sum(o["aval"] for o in g)
+    below = []
+    for o in ops:
+        p = cell_rate.get(o["row"][1], 0)
+        if o["aval"] >= 5 and 0 < p < 1:
+            lower = p - 1.96 * math.sqrt(p * (1 - p) / o["aval"])
+            if o["prom"] / o["aval"] < lower:
+                below.append(o)
+    det_total = sum(o["det"] for o in ops)
+    pareto = {}
+    if det_total > 0:
+        acc, n = 0.0, 0
+        for o in sorted(ops, key=lambda o: -o["det"]):
+            acc += o["det"]
+            n += 1
+            for cut in (50, 80):
+                if cut not in pareto and acc / det_total * 100 >= cut:
+                    pareto[cut] = n / len(ops) * 100
+    return {"ops": ops, "aval": aval, "prom": prom, "csat": prom / aval * 100, "meta": meta,
+            "ating": prom / aval * 100 / meta * 100 if meta else 0, "falt": sum(o["falt"] for o in ops),
+            "quads": {k: len(v) for k, v in q.items()}, "small": len(ops) - len(big),
+            "disp": (q4 / q1) if q1 and q4 is not None else None, "amp": amp, "below": below, "pareto": pareto}
+
+
+def _fetch_operator_rows(eps: str | None, period: str) -> list[list[str]] | None:
+    answer = ask_toqan(_operators_prompt(eps, f"{period}. Mínimo: 1 avaliação (o app marca amostra pequena)."))
+    if _is_error_answer(answer):
+        return None
+    rows, _ = _parse_operators_csv(answer)
+    if eps:
+        rows = [r for r in rows if _eps_pattern(eps) in r[0].lower()]
+    return rows or None
+
+
+WEEKS_HEADER = ["email", "fila", "meta", "s1_aval", "s1_prom", "s2_aval", "s2_prom", "s3_aval", "s3_prom",
+                "s4_aval", "s4_prom"]
+WEEK_MIN_AVAL = 5  # semana com menos de 5 pesquisas não conta (nem como Q4, nem como fora)
+
+
+def _weeks_ranges() -> list[tuple[date, date]]:
+    """As 4 últimas semanas fechadas no D-1: s1 = D-7..D-1, s2 = D-14..D-8, ..."""
+    d1 = _as_date(_today_brazil()) - timedelta(days=1)
+    return [(d1 - timedelta(days=7 * i + 6), d1 - timedelta(days=7 * i)) for i in range(4)]
+
+
+def _weeks_prompt(eps: str | None) -> str:
+    rng = "; ".join(f"s{i + 1} = {a.strftime('%d/%m/%Y')} a {b.strftime('%d/%m/%Y')}" for i, (a, b) in enumerate(_weeks_ranges()))
+    return (
+        f"{_scope_instruction(eps)}\n\n"
+        "TAREFA INTERNA DO APP — base de operadores por semana. Não é mensagem para o Slack.\n"
+        "Se você usa subagentes, peça ao subagente de indicadores com "
+        f"'EPS: {eps or 'iFood'}' e 'Pedido: base de operadores por semana (CSV)'.\n"
+        f"Semanas (pela data de abertura do caso): {rng}. Só filas da lista oficial da EPS. Todo operador com pelo "
+        "menos 1 avaliação em alguma das 4 semanas. Fila = a que teve mais avaliações dele nas 4 semanas.\n"
+        "Responda APENAS um CSV separado por ';', sem markdown, com este cabeçalho exato:\n"
+        f"{';'.join(WEEKS_HEADER)}\n"
+        "meta = meta de CSAT da fila em %. sN_aval = avaliações na semana N; sN_prom = promotoras (notas 4 e 5). "
+        "Semana sem avaliação: 0. Uma linha por operador. Última linha: TOTAL;<quantidade de operadores>\n"
+        "Se a consulta falhar: responda só 'ERRO: <motivo>'."
+    )
+
+
+def _fetch_weekly_rows(eps: str | None) -> dict[str, dict[str, Any]] | None:
+    """e-mail -> {q4: semanas no Q4, n: semanas com amostra, csats: CSAT s1..s4 (None sem amostra), fila}."""
+    import csv as _csv
+    answer = ask_toqan(_weeks_prompt(eps))
+    if _is_error_answer(answer):
+        return None
+    out: dict[str, dict[str, Any]] = {}
+    header_seen = False
+    for row in _csv.reader(io.StringIO(_strip_json_code_blocks(answer)), delimiter=";"):
+        cells = [c.strip() for c in row]
+        if not cells or not any(cells):
+            continue
+        if not header_seen:
+            header_seen = [c.lower() for c in cells[:len(WEEKS_HEADER)]] == WEEKS_HEADER
+            continue
+        if len(cells) < len(WEEKS_HEADER) or "@" not in cells[0]:
+            continue
+        email, meta = cells[0].lower(), _to_float(cells[2])
+        if eps and _eps_pattern(eps) not in email:
+            continue
+        q4, sampled, csats = 0, 0, []
+        for i in range(4):
+            aval, prom = _to_float(cells[3 + 2 * i]) or 0, _to_float(cells[4 + 2 * i]) or 0
+            if aval >= WEEK_MIN_AVAL and meta:
+                c = prom / aval * 100
+                csats.append(c)
+                sampled += 1
+                q4 += 1 if c / meta * 100 < 90 else 0
+            else:
+                csats.append(None)
+        out[email] = {"q4": q4, "n": sampled, "csats": csats, "fila": cells[1]}
+    return out or None
+
+
+def _is_reincidentes_request(question: str) -> bool:
+    text = _norm_text(question)
+    return bool(re.search(r"\breincident\w*", text)) and bool(
+        re.search(r"\b(operador|operadores|analista|analistas|atendente|atendentes|agentes|quem|quais|top|lista|mais)\b", text))
+
+
+def _send_reincidentes(event: dict[str, Any], client: Any, eps: str | None, question: str,
+                       say: Callable[..., Any], in_thread: bool) -> str | None:
+    """Ranking de reincidência no Q4 nas 4 últimas semanas (semanas com 5+ pesquisas), por fila/EPS citada."""
+    if eps is None:
+        eps = _eps_in_text(question)
+    weeks = _fetch_weekly_rows(eps)
+    if not weeks:
+        return "Não consegui puxar as últimas 4 semanas dos operadores agora. Tenta de novo em alguns minutos?"
+    fila = _fila_in_question(question, eps)
+    if fila:
+        weeks = {e: w for e, w in weeks.items() if _norm_text(w["fila"]) == _norm_text(fila)}
+    m = re.search(r"\b(\d{1,2})\b", _norm_text(question))
+    limit = min(int(m.group(1)), OPERATORS_INLINE_MAX) if m and 0 < int(m.group(1)) <= 50 else 10
+    ranked = sorted(((e, w) for e, w in weeks.items() if w["q4"] >= 2),
+                    key=lambda x: (-x[1]["q4"], sum(c for c in x[1]["csats"] if c is not None) / max(1, x[1]["n"])))
+    where = " · ".join(x for x in (fila, eps if not fila else None) if x) or "todas as filas"
+    title = f"*Mais reincidentes no Q4 · {where} · últimas 4 semanas*"
+    if not ranked:
+        return f"{title}\nNinguém no Q4 em 2 ou mais das últimas 4 semanas (contando só semanas com 5+ pesquisas). 👏"
+    try:
+        names = _operator_name_map() if _operator_names_allowed(eps) else {}
+    except Exception:
+        names = {}
+    lines = [title, "_Q4 = abaixo de 90% da meta da fila · só semanas com 5+ pesquisas · CSAT da semana mais antiga "
+                    "para a mais recente_", ""]
+    for i, (e, w) in enumerate(ranked[:limit], 1):
+        serie = " · ".join(f"{_bfmt(c, 0)}%" if c is not None else "—" for c in reversed(w["csats"]))
+        fila_txt = f" · {w['fila']}" if not fila else ""
+        nome = names.get(e) or names.get(e.split("@")[0]) or ""
+        lines.append(f"{i}. {_operator_label(e, nome) if _operator_names_allowed(eps) else '`' + e.split('@')[0] + '`'}"
+                     f"{fila_txt} — Q4 em *{w['q4']} de {w['n']}* semanas · {serie}")
+    if len(ranked) < limit:
+        lines.append(f"\n_Só {len(ranked)} operador(es) no Q4 em 2+ semanas nesse recorte._")
+    elif len(ranked) > limit:
+        lines.append(f"\n_…e mais {len(ranked) - limit} no Q4 em 2+ semanas._")
+    _say_sections(say, "\n".join(lines), event)
+    return None
+
+
+def _send_team_view(event: dict[str, Any], client: Any, eps: str | None, question: str,
+                    say: Callable[..., Any], in_thread: bool) -> str | None:
+    """Resultado da equipe de um supervisor/coordenador (ou de todos os supervisores), com Δ vs período anterior."""
+    if eps is None:
+        eps = _eps_in_text(question)
+    people = _mop_people(eps)
+    if not people:
+        return "Não consegui ler o MOP para montar as equipes agora. Tenta de novo em alguns minutos?"
+    kind, leader = _resolve_team(question, event, people)
+    if kind == "none":
+        return ("Não achei você como supervisor(a) ou coordenador(a) no MOP. Me diz de quem é a equipe "
+                "(ex.: \"resultado da equipe da Supervisora 3\").")
+    spec = _period_spec(question)
+    results: dict[str, Any] = {}
+
+    def load(key: str, period: str) -> None:
+        try:
+            results[key] = _fetch_operator_rows(eps, period)
+        except Exception:
+            logger.exception("Team view: operator base failed (%s)", key)
+            results[key] = None
+
+    def load_weeks() -> None:
+        try:
+            results["weeks"] = _fetch_weekly_rows(eps)
+        except Exception:
+            logger.exception("Team view: weekly base failed")
+            results["weeks"] = None
+
+    threads = [threading.Thread(target=load, args=(k, p)) for k, p in (("cur", spec["cur"]), ("prev", spec["prev"]))]
+    threads.append(threading.Thread(target=load_weeks))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    cur, prev = results.get("cur"), results.get("prev") or []
+    if not cur:
+        return "Não consegui puxar o resultado dos operadores agora. Tenta de novo em alguns minutos?"
+
+    def member(email: str) -> dict[str, str] | None:
+        return people.get(email.lower())
+
+    def in_team(email: str) -> bool:
+        p = member(email)
+        if not p:
+            return False
+        if kind == "sup":
+            return _norm_text(p["supervisor"]) == _norm_text(leader)
+        if kind == "coord":
+            return _norm_text(p["coordenador"]) == _norm_text(leader)
+        return True
+
+    team = [r for r in cur if in_team(r[0])]
+    if not team:
+        return f"Não achei avaliações {spec['label']} para a equipe de {leader or 'ninguém'}. O MOP está atualizado?"
+    st = _team_stats(team)
+    st_prev = _team_stats([r for r in prev if in_team(r[0])]) if prev else {}
+    names = {}
+    try:
+        names = _operator_name_map()
+    except Exception:
+        pass
+
+    def who(r: list[str]) -> str:
+        p = member(r[0]) or {}
+        nome = p.get("nome") or names.get(r[0].lower()) or ""
+        return _operator_label(r[0], nome if _operator_names_allowed(eps) else "")
+
+    def delta(a: float | None, b: float | None) -> str:
+        if a is None or b is None:
+            return ""
+        d = a - b
+        return f" · {'▲' if d >= 0 else '▼'} {_bfmt(abs(d))} p.p. vs {spec['prev_label']}"
+
+    title = {"sup": f"Equipe de {leader}", "coord": f"Coordenação de {leader}"}.get(kind, "Supervisores")
+    where = f" · {eps}" if eps else ""
+    lines = [f"👥 *{title}{where} · {spec['label']}*", ""]
+    lines.append(f"• CSAT *{_bfmt(st['csat'])}%* (meta {_bfmt(st['meta'])}% · atingimento {_bfmt(st['ating'], 0)}%)"
+                 f"{delta(st['csat'], st_prev.get('csat'))} · {_fmt_int(st['aval'])} pesquisas")
+    lines.append(f"• Positivas faltantes para a meta: *{_fmt_int(st['falt'])}*")
+    qd = st["quads"]
+    disp = f" · dispersão Q4÷Q1 {_bfmt(st['disp'], 2)}" if st["disp"] is not None else ""
+    lines.append(f"• Quadrantes: Q1 {qd['Q1']} · Q2 {qd['Q2']} · Q3 {qd['Q3']} · Q4 {qd['Q4']}"
+                 + (f" · {st['small']} com amostra pequena (<{TEAM_SMALL_SAMPLE})" if st["small"] else "") + disp)
+    if st["pareto"].get(50):
+        lines.append(f"• Concentração: {_bfmt(st['pareto'][50], 0)}% dos operadores concentram metade das notas 1–3"
+                     + (f" ({_bfmt(st['pareto'][80], 0)}% concentram 80%)" if st["pareto"].get(80) else ""))
+    if kind in {"coord", "all"}:
+        sups: dict[str, list[list[str]]] = {}
+        for r in team:
+            sups.setdefault((member(r[0]) or {}).get("supervisor") or "Sem supervisor no MOP", []).append(r)
+        prev_by_sup: dict[str, list[list[str]]] = {}
+        for r in prev:
+            if in_team(r[0]):
+                prev_by_sup.setdefault((member(r[0]) or {}).get("supervisor") or "Sem supervisor no MOP", []).append(r)
+        table = []
+        for sup, rs in sups.items():
+            s = _team_stats(rs)
+            sp = _team_stats(prev_by_sup.get(sup, [])) if prev_by_sup.get(sup) else {}
+            if s:
+                table.append((s["ating"], sup, s, sp))
+        lines += ["", "*Por supervisor* (do maior gap para o menor):"]
+        for _, sup, s, sp in sorted(table, key=lambda t: t[0])[:15]:
+            d = delta(s["csat"], sp.get("csat")).replace(f" vs {spec['prev_label']}", "")
+            disp_s = f" · disp. {_bfmt(s['disp'], 2)}" if s["disp"] is not None else ""
+            lines.append(f"• {sup}: CSAT {_bfmt(s['csat'])}%{d} · {_bfmt(s['ating'], 0)}% da meta · "
+                         f"{_fmt_int(s['falt'])} positivas faltantes{disp_s}")
+    if st["below"]:
+        lines += ["", "*Abaixo do limite de controle* (ruim de verdade, não é só amostra pequena):"]
+        for o in sorted(st["below"], key=lambda o: o["csat"])[:TEAM_LIST_MAX]:
+            lines.append(f"• {who(o['row'])}: CSAT {_bfmt(o['csat'])}% em {_fmt_int(o['aval'])} pesquisas "
+                         f"({_fmt_int(o['falt'])} positivas faltantes)")
+    weeks = results.get("weeks") or {}
+    if weeks:
+        team_weeks = {e: w for e, w in weeks.items() if in_team(e)}
+        rein4 = [(e, w) for e, w in team_weeks.items() if w["n"] == 4 and w["q4"] == 4]
+        rein3 = [(e, w) for e, w in team_weeks.items() if w["q4"] == 3]
+        if rein4 or rein3:
+            lines += ["", "*Reincidentes 4 semanas* (Q4 nas 4 últimas semanas, com 5+ pesquisas em cada; CSAT da "
+                          "semana mais antiga para a mais recente):"]
+            if not rein4:
+                lines.append("• Ninguém no Q4 nas 4 semanas.")
+            for e, w in sorted(rein4, key=lambda x: sum(c for c in x[1]["csats"] if c is not None))[:TEAM_LIST_MAX]:
+                serie = " · ".join(f"{_bfmt(c, 0)}%" if c is not None else "—" for c in reversed(w["csats"]))
+                lines.append(f"• {who([e])}: CSAT por semana {serie}")
+            if rein3:
+                lines.append(f"• +{len(rein3)} no Q4 em 3 das 4 semanas")
+    worst = sorted([o for o in st["ops"] if o["quad"] == "Q4" and not o["small"]], key=lambda o: -o["falt"])
+    if worst:
+        lines += ["", "*Q4 com mais positivas faltantes:*"]
+        for o in worst[:TEAM_LIST_MAX]:
+            lines.append(f"• {who(o['row'])}: CSAT {_bfmt(o['csat'])}% ({_fmt_int(o['prom'])}/{_fmt_int(o['aval'])}) · "
+                         f"{_bfmt(o['ating'], 0)}% da meta · faltaram {_fmt_int(o['falt'])}")
+    lines += ["", "_Quer ajuda para montar o plano da equipe? É só pedir aqui._"]
+    _say_sections(say, "\n".join(lines), event)
+    if _operator_names_allowed(eps):
+        _upload_operators_xlsx(event, client, team, eps, spec["label"], "Base completa da equipe 📋")
     return None
 
 
@@ -4396,6 +4854,74 @@ def _date_context(question: str) -> str:
     return note + "\n\n"
 
 
+# Operador por nome: all = em qualquer conversa (cada EPS só vê os dela); internal = só visão completa (e-mail iFood /
+# canal interno); off = só planilha. O report diário continua gerencial (sem nomes) em qualquer caso.
+OPERATOR_NAMES = os.getenv("OPERATOR_NAMES", "all").strip().lower()
+_NAMES_CACHE: dict[str, Any] = {"at": 0.0, "map": {}}
+
+
+def _operator_label(email: str, nome: str = "") -> str:
+    """Como o operador aparece no Slack: "Nome · `email`" (só o e-mail se não achar o nome no MOP)."""
+    email = email.strip().lower()
+    return f"{nome} · `{email}`" if nome else f"`{email}`"
+
+
+def _email_of(user: str, names: dict[str, str]) -> str | None:
+    return next((k for k in names if "@" in k and k.split("@")[0] == user), None)
+
+
+def _operator_names_allowed(eps: str | None) -> bool:
+    if OPERATOR_NAMES in {"off", "0", "nao", "não", "false"}:
+        return False
+    return OPERATOR_NAMES == "all" or eps is None
+
+
+def _operator_name_map() -> dict[str, str]:
+    """usuário do e-mail (e e-mail completo) -> Nome, pelo MOP. Cache de 30 min."""
+    if time.time() - _NAMES_CACHE["at"] < 1800 and _NAMES_CACHE["map"]:
+        return _NAMES_CACHE["map"]
+    values = _read_mop_values() or []
+    result: dict[str, str] = {}
+    if values:
+        name_col, email_col = _find_col(values[0], "Nome"), _find_col(values[0], "Email")
+        for row in values[1:]:
+            if name_col is None or email_col is None or max(name_col, email_col) >= len(row):
+                continue
+            email, nome = str(row[email_col]).strip().lower(), str(row[name_col]).strip()
+            if "@" in email and nome:
+                result[email] = nome.title() if nome.isupper() else nome
+                result.setdefault(email.split("@")[0], result[email])
+    _NAMES_CACHE.update(at=time.time(), map=result)
+    return result
+
+
+def _with_operator_names(text: str) -> str:
+    """Troca o usuário/e-mail de operador citado na resposta por "Nome (`usuário`)", pelo MOP."""
+    names = _operator_name_map()
+    if not names or not text:
+        return text
+
+    def repl(m: "re.Match[str]") -> str:
+        token = m.group(1).lower()
+        nome = names.get(token) or names.get(token.split("@")[0])
+        if not nome or len(token) < 5:
+            return m.group(0)
+        email = token if "@" in token else _email_of(token, names) or token
+        return _operator_label(email, nome)
+
+    return re.sub(r"`?\b([a-z0-9][a-z0-9._-]{3,}(?:@[a-z0-9.-]+\.[a-z]{2,})?)\b`?", repl, text)
+
+
+FULL_ACCESS_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA — ACESSO A OPERADORES: aqui PODE identificar operador pelo usuário do e-mail "
+    "(a parte antes do @; o app completa com o nome) quando a pergunta for sobre operadores (quem melhorou/piorou, "
+    "ranking, impacto), sempre dentro do ESCOPO desta conversa. "
+    "Ao chamar a Lyra Indicadores, inclua a linha 'Acesso: completo'. Ranking ou comparação de operador só com "
+    "avaliações mínimas (D-1: 3+; semana ou mês: 5+) e diga o mínimo usado; no máximo 15 nomes e, se houver mais, "
+    "quantos ficaram de fora. Comparação entre períodos por operador: use semana contra semana (ou mês) e só quem tem "
+    "o mínimo nos dois períodos.\n\n")
+
+
 DEFAULTS_INSTRUCTION = (
     "INFORMAÇÃO INTERNA PARA A LYRA — RESPONDA, NÃO DEVOLVA PERGUNTA: se faltar o indicador, use CSAT; se faltar o "
     "período, use o D-1 (ontem) com o mês como contexto; se faltar a fila, traga todas as filas do escopo. Diga em meia "
@@ -4446,14 +4972,30 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             _say(say, _agents_summary(_run_agent_checks(_now_brazil())), event, in_thread)
             return
 
+        in_report_thread = bool(_report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or "")))
+        asks = _is_question_like(question)
+        if _is_team_request(question) and (asks or not in_report_thread):
+            _say(say, "Vou montar o resultado da equipe, já te mando. ⏳", event, in_thread=True)
+            problem = _send_team_view(event, client, eps, question, say, in_thread)
+            if problem:
+                _say(say, problem, event, in_thread)
+            return
+
+        if _is_reincidentes_request(question) and (asks or not in_report_thread):
+            _say(say, "Vou puxar as últimas 4 semanas dos operadores, já te mando. ⏳", event, in_thread=True)
+            problem = _send_reincidentes(event, client, eps, question, say, in_thread)
+            if problem:
+                _say(say, problem, event, in_thread)
+            return
+
         op_question = question
         if not _is_operators_excel_request(question) and len(question.split()) <= 4:
             prev = _last_dm_human_text(event)  # "ontem" respondendo a um pedido de operadores
             if prev and _is_operators_excel_request(prev):
                 op_question = f"{prev} {question}"
-        if _is_operators_excel_request(op_question):
+        if _is_operators_excel_request(op_question) and (asks or not in_report_thread):
             wants_file = bool(re.search(r"\b(excel|planilha|xlsx|arquivo)\b", _norm_text(op_question)))
-            if eps is None and not wants_file:  # visão completa (e-mail iFood / canal interno): direto no chat
+            if _operator_names_allowed(eps) and not wants_file:  # direto no chat, com nome (cada EPS só vê os dela)
                 _say(say, "Vou puxar o resultado por operador, já te mando. ⏳", event, in_thread=True)
                 problem = _send_operators_inline(event, client, eps, op_question, say, in_thread)
                 if problem:
@@ -4519,11 +5061,16 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             extra = KNOWLEDGE_INSTRUCTION
         context = _thread_context(event) or _dm_context(event)
         prompt = (f"{_scope_instruction(eps)}\n\n{_date_context(question)}{context}{extra}"
-                  f"{DEFAULTS_INSTRUCTION if not extra else ''}"
+                  f"{DEFAULTS_INSTRUCTION if not extra else ''}{FULL_ACCESS_INSTRUCTION if _operator_names_allowed(eps) else ''}"
                   f"{_inject_mop_context(question, eps)}")
         answer = ask_toqan(prompt, progress_callback=send_progress)
         _passive_access_check(answer)
         answer = _strip_file_promises(answer)
+        if _operator_names_allowed(eps):
+            try:
+                answer = _with_operator_names(answer)
+            except Exception:
+                logger.warning("Could not add operator names", exc_info=True)
         conv_blocks = _split_blocks(answer or "")
         if conv_blocks:
             day = _today_brazil() - timedelta(days=1)
