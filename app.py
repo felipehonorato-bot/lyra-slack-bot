@@ -2,7 +2,8 @@
 
 v5.11 — DM aberta pelo e-mail do Slack: domínio iFood (DM_ALLOWED_DOMAINS) vê tudo, e-mail de EPS vê só a própria EPS
         (precisa do escopo users:read.email). DM com memória da conversa (últimas mensagens / thread), "ontem" completa
-        o pedido anterior. Na DM a resposta sai na conversa principal (sem thread). Sem pergunta de volta: falta indicador = CSAT, falta período = D-1, falta fila = todas.
+        o pedido anterior. Na DM a resposta sai na thread da pergunta, como no canal. A conversa recebe a data de hoje,
+        e data digitada no futuro (29/11 pedido em 30/10) vira a data passada mais provável, avisando. Sem pergunta de volta: falta indicador = CSAT, falta período = D-1, falta fila = todas.
         "Resultado por operador" / "ofensores": quem tem visão completa (e-mail iFood ou canal interno) recebe direto
         no chat (até 15, do pior para o melhor; ofensores = Q4), com a planilha completa se passar disso. Nos canais
         das EPSs segue em planilha. Período pedido: ontem, mês ou semana; fila citada filtra.
@@ -4218,10 +4219,7 @@ def _say_sections(say: Callable[..., Any], answer: str, event: dict[str, Any], i
 
 
 def _reply_ts(event: dict[str, Any]) -> str | None:
-    """Onde a Lyra responde: em canal, na thread da pergunta; na DM, na conversa principal (ou na thread, se a pessoa
-    escreveu dentro de uma thread da DM)."""
-    if event.get("channel_type") == "im":
-        return event.get("thread_ts") or None
+    """Onde a Lyra responde: sempre na thread da pergunta, em canal e na DM (duas perguntas seguidas não se misturam)."""
     return event.get("thread_ts") or event.get("ts")
 
 
@@ -4356,6 +4354,48 @@ def _last_dm_human_text(event: dict[str, Any]) -> str:
     return ""
 
 
+def _date_context(question: str) -> str:
+    """Data de hoje para a conversa (o agente não sabe que dia é) e correção de data no futuro digitada errado
+    (ex.: "29/11" pedido em 30/10 = 29/10)."""
+    today = _as_date(_today_brazil())
+    yesterday = today - timedelta(days=1)
+    weekday = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"][today.weekday()]
+    note = (f"INFORMAÇÃO INTERNA PARA A LYRA — hoje é {today.strftime('%d/%m/%Y')} ({weekday}); ontem (D-1) = "
+            f"{yesterday.strftime('%d/%m/%Y')}.")
+    fixes = []
+    for m in re.finditer(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", question or ""):
+        d, mo = int(m.group(1)), int(m.group(2))
+        y = int(m.group(3)) if m.group(3) else today.year
+        y = y + 2000 if y < 100 else y
+        try:
+            asked = date(y, mo, d)
+        except ValueError:
+            continue
+        if asked < today:
+            continue
+        guess = None
+        if (asked.year, asked.month) != (today.year, today.month):  # mês digitado errado: mesmo dia, mês atual/anterior
+            for back in range(0, 2):
+                mm, yy = today.month - back, today.year
+                if mm < 1:
+                    mm, yy = mm + 12, yy - 1
+                try:
+                    cand = date(yy, mm, d)
+                except ValueError:
+                    continue
+                if cand < today:
+                    guess = cand
+                    break
+        if guess:
+            fixes.append(f"{m.group(0)} ainda não aconteceu; quase certamente é {guess.strftime('%d/%m/%Y')}: use essa "
+                         f"data e avise em meia frase (\"considerei {guess.strftime('%d/%m')}\")")
+        else:
+            fixes.append(f"{m.group(0)} ainda não aconteceu: diga que ainda não tem dado desse dia e traga o D-1")
+    if fixes:
+        note += " " + "; ".join(fixes) + "."
+    return note + "\n\n"
+
+
 DEFAULTS_INSTRUCTION = (
     "INFORMAÇÃO INTERNA PARA A LYRA — RESPONDA, NÃO DEVOLVA PERGUNTA: se faltar o indicador, use CSAT; se faltar o "
     "período, use o D-1 (ontem) com o mês como contexto; se faltar a fila, traga todas as filas do escopo. Diga em meia "
@@ -4478,7 +4518,8 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
         elif not extra and _is_knowledge_question(question):
             extra = KNOWLEDGE_INSTRUCTION
         context = _thread_context(event) or _dm_context(event)
-        prompt = (f"{_scope_instruction(eps)}\n\n{context}{extra}{DEFAULTS_INSTRUCTION if not extra else ''}"
+        prompt = (f"{_scope_instruction(eps)}\n\n{_date_context(question)}{context}{extra}"
+                  f"{DEFAULTS_INSTRUCTION if not extra else ''}"
                   f"{_inject_mop_context(question, eps)}")
         answer = ask_toqan(prompt, progress_callback=send_progress)
         _passive_access_check(answer)
