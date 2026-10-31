@@ -1,4 +1,27 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.12).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.13).
+
+v5.13 — Respostas grandes no visual do report diário (o report em si não muda): título "<status> *Rótulo ·* `fila/EPS`
+        *— período* · número", seções com divisória (📍 Resultado · 👥 Por supervisor · 👤 Operadores · 💡 Leitura),
+        linhas curtas, nome sem CAIXA ALTA, e-mail sem crase, 10 itens por padrão e o resto na planilha. Vale para a
+        visão de equipe/supervisores, ofensores/lista de operadores, reincidentes e para as respostas livres da Lyra
+        (instrução de layout no prompt + divisórias pelo app). Uma mensagem só de andamento, editada e apagada quando
+        a resposta chega. Pergunta de análise ("por que", "quem piorou", "quanto contribuiu") que cita supervisor ou
+        operador vai para a análise livre, não para as listas prontas. Reincidentes 4 semanas: consulta única agrupada
+        (SQL na Indicadores v1.9.2), leitura tolerante (separador, ordem das colunas, formato longo) e alerta com o
+        início da resposta quando não der para ler. Contra sobrecarga: bases de operadores ficam em cache até a
+        meia-noite (pedidos iguais simultâneos viram uma consulta só), pré-carga da semana depois do report
+        (PREWARM_BASES) e pergunta repetida em 30 min reaproveita a resposta (RECENT_ANSWER_TTL).
+        Canais de melhorias (MELHORIAS_CHANNELS: #ef-melhorias-aec C0C5NDFB87R, #ef-melhorias-csu C0C6Y5W8ETS): a Lyra
+        lê toda thread aberta pelo Fluxo Owners CX. Moedas: confere os dados, pede o que falta na thread e abre o
+        chamado no formato do Reward Engine (Número do Ticket, ID do Cliente, ID do Pedido, Id ou Nome da Missão,
+        Descreva o problema, Tipo de problema, Evidências) no destino da EPS (CHAMADOS_DESTINO — por padrão os canais
+        de teste; com destino de teste o webhook do Rewards nunca é chamado). A resposta no chamado volta para a
+        thread de origem. Outros tópicos (Ajuda, Escalar Ticket...): responde na thread pela Lyra Conhecimento e
+        responde de novo quando marcarem a Lyra na thread.
+        Crises (subagente Lyra Crises): antes de cobrar, a Lyra confere se teve crise no período (CRISIS_CHECK). No
+        report, em paralelo com a consulta do D-1: fila cobrada em dia de crise ganha a linha 🚨 e a cobrança vira
+        "o que a operação fez durante a crise". Nos status de hora em hora e prints: checagem das últimas 3h,
+        reaproveitada por 30 min (CRISIS_CHECK_TTL). Falha na checagem nunca trava a cobrança.
 
 v5.12 — Visão de equipe ("minha equipe", "equipe da X", "por supervisor"): pelo MOP (supervisor/coordenador) e pela
         base de operadores do período (com o anterior para o Δ: D-1 x D-8, semana x semana, mês x mesmos dias), traz
@@ -743,10 +766,10 @@ def get_answer(
             return _clean_answer(answer)
 
         progress_message = {
-            18: "Ainda processando — essa é uma consulta complexa, só um momento...",
-            42: "Ainda consultando o Databricks, quase lá...",
-            72: "Demorando mais que o normal — a consulta é pesada, aguarde...",
-            108: "Continuando a consulta, não desista — já estamos em 18 min...",
+            18: "Ainda buscando os números, já te respondo... ⏳",
+            42: "Ainda consultando a base, quase lá...",
+            72: "Está demorando mais que o normal, mas sigo consultando...",
+            108: "Ainda consultando (já são 18 min). Se não vier em seguida, me pede de novo.",
         }.get(attempt)
         if progress_message and progress_callback:
             try:
@@ -2432,6 +2455,7 @@ _OPERATORS_RESULT_RE = re.compile(
     r"\bpor (operador|analista|atendente)\b|\bresultado (individual|dos operadores|dos analistas|dos atendentes)\b"
     r"|\b(quem|quais|lista|listar|resultado|traz|traga|mostra|manda)\b.*\b(ofensor|ofensores)\b"
     r"|\b(ofensor|ofensores)\b (de|do|da|em) (ontem|hoje|csat|d 1|mes|semana)\b"
+    r"|^(os |as )?(ofensor|ofensores|detratores)\b"
     r"|\b(piores|melhores) (operadores|analistas|atendentes|agentes)\b"
     r"|\btop \d{1,2} (operadores|analistas|atendentes|agentes)\b"
     r"|\b(operadores|analistas|atendentes|agentes) com (mais|maior|menos|menor) (impacto|csat|atingimento)\b"
@@ -2455,7 +2479,7 @@ def _period_spec(question: str) -> dict[str, Any]:
     if re.search(r"\b(ontem|d 1|d1)\b", text):
         prev = d1 - timedelta(days=7)
         return {"label": f"de ontem ({d1.strftime('%d/%m')})", "cur": f"D-1: {f(d1)}", "prev": f"D-8: {f(prev)}",
-                "prev_label": f"D-8 ({prev.strftime('%d/%m')})", "min": 3}
+                "prev_label": f"D-8 ({prev.strftime('%d/%m')})", "min": 3, "short": f"D-1 {d1.strftime('%d/%m')}"}
     if re.search(r"\b(mes|mensal)\b", text):
         start = d1.replace(day=1)
         pm_end = start - timedelta(days=1)
@@ -2465,11 +2489,16 @@ def _period_spec(question: str) -> dict[str, Any]:
             p_end = pm_end
         return {"label": "do mês", "cur": f"mês até o D-1: {f(start)} a {f(d1)}",
                 "prev": f"mesmos dias do mês anterior: {f(pm_end.replace(day=1))} a {f(p_end)}",
-                "prev_label": "mesmos dias do mês anterior", "min": 5}
+                "prev_label": "mesmos dias do mês anterior", "min": 5, "short": f"mês 01 a {d1.strftime('%d/%m')}"}
     start = d1 - timedelta(days=6)
     return {"label": "da semana", "cur": f"últimos 7 dias: {f(start)} a {f(d1)}",
             "prev": f"7 dias anteriores: {f(start - timedelta(days=7))} a {f(start - timedelta(days=1))}",
-            "prev_label": "semana anterior", "min": 5}
+            "prev_label": "semana anterior", "min": 5, "short": f"semana {_short_range(start, d1)}"}
+
+
+def _short_range(a: date, b: date) -> str:
+    """23–29/10 (mesmo mês) ou 28/09–04/10."""
+    return f"{a.day:02d}–{b.strftime('%d/%m')}" if a.month == b.month else f"{a.strftime('%d/%m')}–{b.strftime('%d/%m')}"
 
 
 def _operators_period(question: str) -> tuple[str, str]:
@@ -2774,7 +2803,7 @@ def _operators_rows(eps: str | None, question: str) -> tuple[list[list[str]], in
     period, period_label = _operators_period(question)
     if eps is None:
         eps = _eps_in_text(question)  # visão completa pedindo uma EPS: recorta nela
-    answer = ask_toqan(_operators_prompt(eps, period))
+    answer = _ask_cached(_operators_prompt(eps, period))
     if _is_error_answer(answer):
         return "Não consegui puxar os dados dos operadores agora. Tenta de novo em alguns minutos?"
     rows, total = _parse_operators_csv(answer)
@@ -2818,6 +2847,7 @@ def _send_operators_excel(event: dict[str, Any], client: Any, eps: str | None, q
 
 
 OPERATORS_INLINE_MAX = 15
+OPERATORS_INLINE_DEFAULT = 10
 _OFFENDERS_RE = re.compile(r"\b(ofensor|ofensores|piores|q4|detrator|detratores)\b")
 
 
@@ -2850,39 +2880,162 @@ def _send_operators_inline(event: dict[str, Any], client: Any, eps: str | None, 
     if offenders:
         data = [r for r in data if str(r[7]).strip().upper() == "Q4"]
     mtop = re.search(r"\btop (\d{1,2})\b", qtext)
-    limit = min(int(mtop.group(1)), OPERATORS_INLINE_MAX) if mtop else OPERATORS_INLINE_MAX
-    where = " · ".join(x for x in (fila, eps if not fila else None) if x) or "todas as filas"
-    when = re.sub(r"^(de|do|da) ", "", period_label)
+    limit = min(int(mtop.group(1)), OPERATORS_INLINE_MAX) if mtop else OPERATORS_INLINE_DEFAULT
+    where = fila or eps or "todas as filas"
+    when = _period_spec(question)["short"]
     label = ("Maior impacto no CSAT" if by_impact else "Ofensores de CSAT" if offenders
              else "Melhores em CSAT" if best else "CSAT por operador")
-    title = f"*{label} · {where} · {when}*"
+    emoji = "🏆" if best else ("🔴" if (offenders or by_impact) and data else "👤")
+    head = f"{emoji} *{label} ·* `{where}` *— {when}*"
     if not data:
-        return f"{title}\nNinguém no Q4 nesse recorte (abaixo de 90% da meta, com avaliações suficientes). 👏"
-    lines = []
+        return f"{head}\nNinguém no Q4 nesse recorte (abaixo de 90% da meta, com avaliações suficientes). 👏"
+    head += f" · {len(data)} operador{'es' if len(data) != 1 else ''}"
     try:
         names = _operator_name_map()
     except Exception:
         names = {}
+    lines = []
     for i, r in enumerate(data[:limit], 1):
-        user = r[0].split("@")[0]
-        nome = names.get(r[0].lower()) or names.get(user)
-        who = _operator_label(r[0], nome or "")
+        nome = names.get(r[0].lower()) or names.get(r[0].split("@")[0])
         csat, ating = _to_float(r[4]), _to_float(r[6])
-        fila_txt = f" · {r[1]}" if not fila else ""
-        lines.append(f"{i}. {who}{fila_txt} — CSAT {_bfmt(csat) if csat is not None else r[4]}% "
-                     f"({r[3]}/{r[2]} promotoras) · {_bfmt(ating, 0) if ating is not None else r[6]}% da meta · {r[7]}"
-                     + (f" · impacto {_bfmt(impact(r))} avaliações abaixo da meta" if by_impact else ""))
-    rule = ("impacto = avaliações abaixo do que a meta pedia (avaliações × gap até a meta)" if by_impact
+        parts = [f"{i}. {_operator_label(r[0], nome or '')}"]
+        if not fila:
+            parts.append(r[1])
+        parts.append(f"*{_bfmt(csat) if csat is not None else r[4]}%* ({r[3]}/{r[2]})")
+        if by_impact:
+            parts.append(f"impacto {_bfmt(impact(r))} aval.")
+        else:
+            parts.append(f"{_bfmt(ating, 0) if ating is not None else r[6]}% da meta")
+        if not offenders:
+            parts.append(str(r[7]).upper())
+        lines.append(" · ".join(parts))
+    rule = ("impacto = avaliações abaixo do que a meta pedia" if by_impact
             else "Q4 = abaixo de 90% da meta da fila" if offenders
             else "do maior para o menor atingimento" if best else "do menor para o maior atingimento")
-    rule += f" · mínimo de {3 if 'ontem' in period_label else 5} avaliações"
-    text = f"{title}\n_{rule}_\n\n" + "\n".join(lines)
+    rule += f" · mínimo de {_period_spec(question)['min']} avaliações"
+    text = f"{head}\n_{rule}_\n\n" + "\n".join(lines)
     if len(data) > limit:
-        text += f"\n\n…e mais {len(data) - limit}. A lista completa vai na planilha aqui embaixo 📋"
-    _say(say, text, event, in_thread)
+        text += f"\n\n_…e mais {len(data) - limit} na planilha abaixo 📋_"
+    _say_sections(say, text, event)
     if len(data) > limit:
         _upload_operators_xlsx(event, client, data, eps, period_label, "Lista completa 📋")
     return None
+
+
+# --- Visual das respostas grandes (mesmo molde do report diário) + cache das bases ---------------------------
+# Molde: título "<status> *<Rótulo> ·* `<fila/EPS>` *— <período>* · <número principal>"; seções separadas por linha
+# em branco (viram divisórias); cabeçalhos 📍 resultado · 👥 quebra · 👤 operadores · 💡 Leitura; linhas curtas com o
+# valor em negrito e "→ 🔴/🟢"; lista longa vai para a planilha.
+_NAME_PARTICLES = {"da", "de", "do", "das", "dos", "e"}
+
+
+def _nice_name(name: str) -> str:
+    """ARTHUR FERNANDES NOBRE -> Arthur Fernandes Nobre (nome já em caixa mista fica como está)."""
+    name = re.sub(r"\s+", " ", str(name or "")).strip()
+    if not name or not (name.isupper() or name.islower()):
+        return name
+    return " ".join(w.lower() if i and w.lower() in _NAME_PARTICLES else w.capitalize()
+                    for i, w in enumerate(name.split(" ")))
+
+
+def _status_dot(ating: float | None) -> str:
+    return "⚪" if ating is None else ("🟢" if ating >= 100 else "🔴")
+
+
+def _vs_meta(value: float, meta: float | None) -> str:
+    if meta is None:
+        return "⚪ sem meta"
+    if value < meta:
+        return f"🔴 {_bfmt(meta - value)} p.p. abaixo da meta {_bfmt(meta)}%"
+    return "🟢 na meta" if abs(value - meta) < 0.05 else f"🟢 {_bfmt(value - meta)} p.p. acima da meta {_bfmt(meta)}%"
+
+
+_BASE_CACHE: dict[str, tuple[float, str]] = {}
+_BASE_INFLIGHT: dict[str, threading.Event] = {}
+_BASE_LOCK = threading.Lock()
+
+
+def _ask_cached(prompt: str, ttl_seconds: float | None = None) -> str:
+    """Pergunta ao Toqan reaproveitando a resposta: as bases fecham no D-1, então valem o dia todo (ttl None = até a
+    meia-noite). Duas pessoas pedindo a mesma base ao mesmo tempo: a segunda espera a primeira (uma consulta só)."""
+    key = f"{_as_date(_today_brazil()).isoformat()}|{hash(prompt)}"
+    while True:
+        with _BASE_LOCK:
+            hit = _BASE_CACHE.get(key)
+            if hit and hit[0] > time.time():
+                return hit[1]
+            waiter = _BASE_INFLIGHT.get(key)
+            if waiter is None:
+                _BASE_INFLIGHT[key] = threading.Event()
+                break
+        waiter.wait(timeout=POLL_INTERVAL_SECONDS * MAX_POLL_ATTEMPTS + 120)
+        with _BASE_LOCK:
+            hit = _BASE_CACHE.get(key)
+        if hit and hit[0] > time.time():
+            return hit[1]
+        # a primeira falhou: esta tenta por conta própria
+        with _BASE_LOCK:
+            if key not in _BASE_INFLIGHT:
+                _BASE_INFLIGHT[key] = threading.Event()
+                break
+    try:
+        answer = ask_toqan(prompt)
+        if not _is_error_answer(answer):
+            if ttl_seconds is None:
+                now = _now_brazil()
+                midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                ttl_seconds = max(60.0, (midnight - now).total_seconds())
+            with _BASE_LOCK:
+                _BASE_CACHE[key] = (time.time() + ttl_seconds, answer)
+                for k in [k for k, v in _BASE_CACHE.items() if v[0] <= time.time()]:
+                    _BASE_CACHE.pop(k, None)
+        return answer
+    finally:
+        with _BASE_LOCK:
+            ev = _BASE_INFLIGHT.pop(key, None)
+        if ev:
+            ev.set()
+
+
+class _Progress:
+    """Uma mensagem só de andamento na thread: a primeira é postada, as seguintes editam a mesma, e ela some quando a
+    resposta chega (thread limpa: pergunta → resposta)."""
+
+    def __init__(self, event: dict[str, Any]):
+        self.event = event
+        self.ts: str | None = None
+
+    def __call__(self, text: str) -> None:
+        channel = str(self.event.get("channel") or "")
+        try:
+            if self.ts:
+                slack_app.client.chat_update(channel=channel, ts=self.ts, text=text)
+                return
+            resp = slack_app.client.chat_postMessage(channel=channel, thread_ts=_reply_ts(self.event), text=text)
+            self.ts = _resp_get(resp, "ts")
+        except Exception:
+            logger.warning("Progress message failed", exc_info=True)
+
+    def done(self) -> None:
+        if not self.ts:
+            return
+        try:
+            slack_app.client.chat_delete(channel=str(self.event.get("channel") or ""), ts=self.ts)
+        except Exception:
+            logger.info("Could not delete progress message", exc_info=True)
+        self.ts = None
+
+
+_ANALYTIC_RE = re.compile(
+    r"\b(por ?que|pq|contribu\w*|explica\w*|o que (aconteceu|houve|mudou)|causa\w*|piorou|piora|piorar|melhorou|"
+    r"melhora|melhorar|caiu|cair|subiu|queda|variacao|variou|evolucao|evoluiu|impactou|puxou|puxando|influenci\w*|"
+    r"diferenca|correlac\w*|relacao|tendencia)\b")
+
+
+def _is_analytical(question: str) -> bool:
+    """Pergunta de análise (por que, quem piorou, quanto contribuiu...): vai para a análise livre, não para as listas
+    prontas, mesmo citando supervisor ou operador."""
+    return bool(_ANALYTIC_RE.search(_norm_text(question)))
 
 
 # --- Visão de equipe (supervisor / coordenador) -------------------------------------------------------------
@@ -2896,6 +3049,8 @@ _TEAM_RE = re.compile(
     r"|\bpor supervisor\b|\bpor coordenador\b|\b(supervisores|coordenadores)\b|\bpositivas faltantes\b")
 TEAM_SMALL_SAMPLE = 10
 TEAM_LIST_MAX = 10
+TEAM_SUP_MAX = 8
+TEAM_OPS_MAX = 8
 
 
 def _is_question_like(text: str) -> bool:
@@ -3024,7 +3179,7 @@ def _team_stats(rows: list[list[str]]) -> dict[str, Any]:
 
 
 def _fetch_operator_rows(eps: str | None, period: str) -> list[list[str]] | None:
-    answer = ask_toqan(_operators_prompt(eps, f"{period}. Mínimo: 1 avaliação (o app marca amostra pequena)."))
+    answer = _ask_cached(_operators_prompt(eps, f"{period}. Mínimo: 1 avaliação (o app marca amostra pequena)."))
     if _is_error_answer(answer):
         return None
     rows, _ = _parse_operators_csv(answer)
@@ -3045,15 +3200,16 @@ def _weeks_ranges() -> list[tuple[date, date]]:
 
 
 def _weeks_prompt(eps: str | None) -> str:
-    rng = "; ".join(f"s{i + 1} = {a.strftime('%d/%m/%Y')} a {b.strftime('%d/%m/%Y')}" for i, (a, b) in enumerate(_weeks_ranges()))
+    rng = _weeks_ranges()
+    sem = "; ".join(f"s{i + 1} = {a.strftime('%d/%m/%Y')} a {b.strftime('%d/%m/%Y')}" for i, (a, b) in enumerate(rng))
     return (
         f"{_scope_instruction(eps)}\n\n"
         "TAREFA INTERNA DO APP — base de operadores por semana. Não é mensagem para o Slack.\n"
         "Se você usa subagentes, peça ao subagente de indicadores com "
-        f"'EPS: {eps or 'iFood'}' e 'Pedido: base de operadores por semana (CSV)'.\n"
-        f"Semanas (pela data de abertura do caso): {rng}. Só filas da lista oficial da EPS. Todo operador com pelo "
-        "menos 1 avaliação em alguma das 4 semanas. Fila = a que teve mais avaliações dele nas 4 semanas.\n"
-        "Responda APENAS um CSV separado por ';', sem markdown, com este cabeçalho exato:\n"
+        f"'EPS: {eps or 'iFood'}', 'Pedido: base de operadores por semana (CSV)' e 'Semanas: {sem}'.\n"
+        f"Semanas (pela data de abertura do caso): {sem}. Só filas da lista oficial da EPS. Uma consulta só, agrupada "
+        "por operador (use o SQL da seção 8.4b). Só operadores com 5+ avaliações em pelo menos 2 das 4 semanas.\n"
+        "Responda APENAS o CSV separado por ';', sem markdown e sem texto antes ou depois, com este cabeçalho:\n"
         f"{';'.join(WEEKS_HEADER)}\n"
         "meta = meta de CSAT da fila em %. sN_aval = avaliações na semana N; sN_prom = promotoras (notas 4 e 5). "
         "Semana sem avaliação: 0. Uma linha por operador. Última linha: TOTAL;<quantidade de operadores>\n"
@@ -3061,29 +3217,58 @@ def _weeks_prompt(eps: str | None) -> str:
     )
 
 
-def _fetch_weekly_rows(eps: str | None) -> dict[str, dict[str, Any]] | None:
-    """e-mail -> {q4: semanas no Q4, n: semanas com amostra, csats: CSAT s1..s4 (None sem amostra), fila}."""
+_WEEK_COL_RE = re.compile(r"^s(?:emana)?_?([1-4])_?(aval\w*|avaliac\w*|prom\w*)$")
+
+
+def _parse_weeks_csv(answer: str, eps: str | None) -> dict[str, dict[str, Any]]:
+    """Leitura tolerante: aceita ';', ',' ou tab, colunas em qualquer ordem (pelo nome), cercas de código, texto em
+    volta, decimal com vírgula e também o formato longo (email;fila;meta;semana;aval;prom)."""
     import csv as _csv
-    answer = ask_toqan(_weeks_prompt(eps))
-    if _is_error_answer(answer):
-        return None
-    out: dict[str, dict[str, Any]] = {}
-    header_seen = False
-    for row in _csv.reader(io.StringIO(_strip_json_code_blocks(answer)), delimiter=";"):
-        cells = [c.strip() for c in row]
-        if not cells or not any(cells):
+    text = _strip_json_code_blocks(answer or "").replace("```", "")
+    lines = [l for l in text.splitlines() if l.strip()]
+    hdr_i = next((i for i, l in enumerate(lines) if "email" in l.lower() and re.search(r"aval", l.lower())), None)
+    if hdr_i is None:
+        return {}
+    hdr_line = lines[hdr_i]
+    delim = max((";", "\t", ","), key=hdr_line.count)
+    rows = list(_csv.reader(io.StringIO("\n".join(lines[hdr_i:])), delimiter=delim))
+    header = [_norm_text(c).replace(" ", "_") for c in rows[0]]
+    idx = {h: i for i, h in enumerate(header)}
+    col = lambda *names: next((idx[n] for n in names if n in idx), None)
+    c_email, c_fila, c_meta = col("email", "e_mail", "operador_email"), col("fila"), col("meta")
+    wide: dict[int, dict[str, int]] = {}
+    for h, i in idx.items():
+        m = _WEEK_COL_RE.match(h)
+        if m:
+            wide.setdefault(int(m.group(1)), {})["prom" if m.group(2).startswith("prom") else "aval"] = i
+    c_sem, c_aval, c_prom = col("semana", "week", "sem"), col("aval", "avaliacoes"), col("prom", "promotoras", "promotores")
+    if c_email is None or c_meta is None:
+        return {}
+    num = lambda v: _to_float(str(v).replace(",", ".")) if v not in (None, "") else None
+    raw: dict[str, dict[str, Any]] = {}
+    for r in rows[1:]:
+        cells = [c.strip() for c in r]
+        if len(cells) <= c_email or "@" not in cells[c_email]:
             continue
-        if not header_seen:
-            header_seen = [c.lower() for c in cells[:len(WEEKS_HEADER)]] == WEEKS_HEADER
-            continue
-        if len(cells) < len(WEEKS_HEADER) or "@" not in cells[0]:
-            continue
-        email, meta = cells[0].lower(), _to_float(cells[2])
+        email = cells[c_email].lower()
         if eps and _eps_pattern(eps) not in email:
             continue
-        q4, sampled, csats = 0, 0, []
-        for i in range(4):
-            aval, prom = _to_float(cells[3 + 2 * i]) or 0, _to_float(cells[4 + 2 * i]) or 0
+        get = lambda i: cells[i] if i is not None and i < len(cells) else ""
+        op = raw.setdefault(email, {"fila": get(c_fila), "meta": num(get(c_meta)), "w": {}})
+        if wide:
+            for w, cols in wide.items():
+                op["w"][w] = (num(get(cols.get("aval"))) or 0, num(get(cols.get("prom"))) or 0)
+        elif c_sem is not None and c_aval is not None and c_prom is not None:
+            m = re.search(r"([1-4])", get(c_sem))
+            if m:
+                w = int(m.group(1))
+                a0, p0 = op["w"].get(w, (0, 0))
+                op["w"][w] = (a0 + (num(get(c_aval)) or 0), p0 + (num(get(c_prom)) or 0))
+    out: dict[str, dict[str, Any]] = {}
+    for email, op in raw.items():
+        meta, q4, sampled, csats = op["meta"], 0, 0, []
+        for w in range(1, 5):
+            aval, prom = op["w"].get(w, (0, 0))
             if aval >= WEEK_MIN_AVAL and meta:
                 c = prom / aval * 100
                 csats.append(c)
@@ -3091,8 +3276,26 @@ def _fetch_weekly_rows(eps: str | None) -> dict[str, dict[str, Any]] | None:
                 q4 += 1 if c / meta * 100 < 90 else 0
             else:
                 csats.append(None)
-        out[email] = {"q4": q4, "n": sampled, "csats": csats, "fila": cells[1]}
-    return out or None
+        out[email] = {"q4": q4, "n": sampled, "csats": csats, "fila": op["fila"], "meta": meta}
+    return out
+
+
+def _fetch_weekly_rows(eps: str | None) -> dict[str, dict[str, Any]] | None:
+    """e-mail -> {q4: semanas no Q4, n: semanas com amostra, csats: CSAT s1..s4 (None sem amostra), fila}."""
+    answer = _ask_cached(_weeks_prompt(eps))
+    if _is_error_answer(answer):
+        _alert(f"Reincidentes 4 semanas ({eps or 'iFood'}): a consulta voltou com erro — {str(answer).strip()[:200]}")
+        return None
+    out = _parse_weeks_csv(answer, eps)
+    if not out:
+        masked = re.sub(r"[\w.+-]+@[\w.-]+", "<email>", str(answer or "")).strip()
+        _alert(f"Reincidentes 4 semanas ({eps or 'iFood'}): não li a resposta do agente. Início da resposta: "
+               f"{masked[:300] or '(vazia)'}")
+        with _BASE_LOCK:  # não guarda resposta ilegível no cache
+            for k in [k for k, v in _BASE_CACHE.items() if v[1] == answer]:
+                _BASE_CACHE.pop(k, None)
+        return None
+    return out
 
 
 def _is_reincidentes_request(question: str) -> bool:
@@ -3113,30 +3316,33 @@ def _send_reincidentes(event: dict[str, Any], client: Any, eps: str | None, ques
     if fila:
         weeks = {e: w for e, w in weeks.items() if _norm_text(w["fila"]) == _norm_text(fila)}
     m = re.search(r"\b(\d{1,2})\b", _norm_text(question))
-    limit = min(int(m.group(1)), OPERATORS_INLINE_MAX) if m and 0 < int(m.group(1)) <= 50 else 10
+    limit = min(int(m.group(1)), OPERATORS_INLINE_MAX) if m and 0 < int(m.group(1)) <= 50 else OPERATORS_INLINE_DEFAULT
     ranked = sorted(((e, w) for e, w in weeks.items() if w["q4"] >= 2),
                     key=lambda x: (-x[1]["q4"], sum(c for c in x[1]["csats"] if c is not None) / max(1, x[1]["n"])))
-    where = " · ".join(x for x in (fila, eps if not fila else None) if x) or "todas as filas"
-    title = f"*Mais reincidentes no Q4 · {where} · últimas 4 semanas*"
+    rng = _weeks_ranges()
+    where = fila or eps or "todas as filas"
+    full = sum(1 for _, w in ranked if w["q4"] == 4 and w["n"] == 4)
+    head = f"🔁 *Reincidentes 4 semanas ·* `{where}` *— {_short_range(rng[-1][0], rng[0][1])}*"
     if not ranked:
-        return f"{title}\nNinguém no Q4 em 2 ou mais das últimas 4 semanas (contando só semanas com 5+ pesquisas). 👏"
+        return f"{head}\nNinguém no Q4 em 2 ou mais das últimas 4 semanas (contando só semanas com 5+ pesquisas). 👏"
+    head += f" · {full} no Q4 nas 4 semanas · {len(ranked)} em 2+"
     try:
         names = _operator_name_map() if _operator_names_allowed(eps) else {}
     except Exception:
         names = {}
-    lines = [title, "_Q4 = abaixo de 90% da meta da fila · só semanas com 5+ pesquisas · CSAT da semana mais antiga "
-                    "para a mais recente_", ""]
+    lines = []
     for i, (e, w) in enumerate(ranked[:limit], 1):
-        serie = " · ".join(f"{_bfmt(c, 0)}%" if c is not None else "—" for c in reversed(w["csats"]))
-        fila_txt = f" · {w['fila']}" if not fila else ""
+        serie = " → ".join(f"{_bfmt(c, 0)}%" if c is not None else "—" for c in reversed(w["csats"]))
         nome = names.get(e) or names.get(e.split("@")[0]) or ""
-        lines.append(f"{i}. {_operator_label(e, nome) if _operator_names_allowed(eps) else '`' + e.split('@')[0] + '`'}"
-                     f"{fila_txt} — Q4 em *{w['q4']} de {w['n']}* semanas · {serie}")
-    if len(ranked) < limit:
-        lines.append(f"\n_Só {len(ranked)} operador(es) no Q4 em 2+ semanas nesse recorte._")
-    elif len(ranked) > limit:
-        lines.append(f"\n_…e mais {len(ranked) - limit} no Q4 em 2+ semanas._")
-    _say_sections(say, "\n".join(lines), event)
+        who = _operator_label(e, nome) if _operator_names_allowed(eps) else e.split("@")[0]
+        parts = [f"{i}. {who}"] + ([w["fila"]] if not fila and w.get("fila") else [])
+        parts.append(f"Q4 em *{w['q4']} de {w['n']}* · {serie}")
+        lines.append(" · ".join(parts))
+    text = (f"{head}\n_Q4 = abaixo de 90% da meta da fila · só semanas com 5+ pesquisas · CSAT da semana mais antiga → "
+            f"mais recente_\n\n" + "\n".join(lines))
+    if len(ranked) > limit:
+        text += f"\n\n_…e mais {len(ranked) - limit} no Q4 em 2+ semanas._"
+    _say_sections(say, text, event)
     return None
 
 
@@ -3208,25 +3414,33 @@ def _send_team_view(event: dict[str, Any], client: Any, eps: str | None, questio
         nome = p.get("nome") or names.get(r[0].lower()) or ""
         return _operator_label(r[0], nome if _operator_names_allowed(eps) else "")
 
-    def delta(a: float | None, b: float | None) -> str:
+    def dpp(a: float | None, b: float | None) -> str:
         if a is None or b is None:
             return ""
         d = a - b
-        return f" · {'▲' if d >= 0 else '▼'} {_bfmt(abs(d))} p.p. vs {spec['prev_label']}"
+        return f"{'▲' if d >= 0 else '▼'} {_bfmt(abs(d))} p.p."
 
-    title = {"sup": f"Equipe de {leader}", "coord": f"Coordenação de {leader}"}.get(kind, "Supervisores")
-    where = f" · {eps}" if eps else ""
-    lines = [f"👥 *{title}{where} · {spec['label']}*", ""]
-    lines.append(f"• CSAT *{_bfmt(st['csat'])}%* (meta {_bfmt(st['meta'])}% · atingimento {_bfmt(st['ating'], 0)}%)"
-                 f"{delta(st['csat'], st_prev.get('csat'))} · {_fmt_int(st['aval'])} pesquisas")
+    title = {"sup": f"Equipe de {_nice_name(leader or '')}", "coord": f"Coordenação de {_nice_name(leader or '')}"}.get(
+        kind, "Supervisores")
+    where = eps or "todas as EPSs"
+    head = (f"{_status_dot(st['ating'])} *{title} ·* `{where}` *— {spec['short']}* · CSAT {_bfmt(st['csat'])}% "
+            f"(meta {_bfmt(st['meta'])}%)")
+    lines = [head, ""]
+
+    # 📍 Resultado
+    extra = [x for x in (dpp(st["csat"], st_prev.get("csat")) and f"{dpp(st['csat'], st_prev.get('csat'))} vs "
+                         f"{spec['prev_label']}", f"n={_fmt_int(st['aval'])}") if x]
+    lines.append(f"📍 *Resultado · {spec['short']}*")
+    lines.append(f"• CSAT *{_bfmt(st['csat'])}%* → {_vs_meta(st['csat'], st['meta'])} ({' · '.join(extra)})")
     lines.append(f"• Positivas faltantes para a meta: *{_fmt_int(st['falt'])}*")
     qd = st["quads"]
-    disp = f" · dispersão Q4÷Q1 {_bfmt(st['disp'], 2)}" if st["disp"] is not None else ""
-    lines.append(f"• Quadrantes: Q1 {qd['Q1']} · Q2 {qd['Q2']} · Q3 {qd['Q3']} · Q4 {qd['Q4']}"
-                 + (f" · {st['small']} com amostra pequena (<{TEAM_SMALL_SAMPLE})" if st["small"] else "") + disp)
-    if st["pareto"].get(50):
-        lines.append(f"• Concentração: {_bfmt(st['pareto'][50], 0)}% dos operadores concentram metade das notas 1–3"
-                     + (f" ({_bfmt(st['pareto'][80], 0)}% concentram 80%)" if st["pareto"].get(80) else ""))
+    big = sum(qd.values())
+    if big:
+        q_txt = " · ".join(f"{k} {round(qd[k] / big * 100):d}%" for k in ("Q1", "Q2", "Q3", "Q4"))
+        disp = f" · dispersão {_bfmt(st['disp'], 2)}" if st["disp"] is not None else ""
+        lines.append(f"• Quadrantes: {q_txt}{disp}")
+
+    # 👥 Por supervisor (coordenação ou todos)
     if kind in {"coord", "all"}:
         sups: dict[str, list[list[str]]] = {}
         for r in team:
@@ -3237,47 +3451,153 @@ def _send_team_view(event: dict[str, Any], client: Any, eps: str | None, questio
                 prev_by_sup.setdefault((member(r[0]) or {}).get("supervisor") or "Sem supervisor no MOP", []).append(r)
         table = []
         for sup, rs in sups.items():
-            s = _team_stats(rs)
+            s_ = _team_stats(rs)
             sp = _team_stats(prev_by_sup.get(sup, [])) if prev_by_sup.get(sup) else {}
-            if s:
-                table.append((s["ating"], sup, s, sp))
-        lines += ["", "*Por supervisor* (do maior gap para o menor):"]
-        for _, sup, s, sp in sorted(table, key=lambda t: t[0])[:15]:
-            d = delta(s["csat"], sp.get("csat")).replace(f" vs {spec['prev_label']}", "")
-            disp_s = f" · disp. {_bfmt(s['disp'], 2)}" if s["disp"] is not None else ""
-            lines.append(f"• {sup}: CSAT {_bfmt(s['csat'])}%{d} · {_bfmt(s['ating'], 0)}% da meta · "
-                         f"{_fmt_int(s['falt'])} positivas faltantes{disp_s}")
-    if st["below"]:
-        lines += ["", "*Abaixo do limite de controle* (ruim de verdade, não é só amostra pequena):"]
-        for o in sorted(st["below"], key=lambda o: o["csat"])[:TEAM_LIST_MAX]:
-            lines.append(f"• {who(o['row'])}: CSAT {_bfmt(o['csat'])}% em {_fmt_int(o['aval'])} pesquisas "
-                         f"({_fmt_int(o['falt'])} positivas faltantes)")
+            if s_:
+                table.append((s_["ating"], sup, s_, sp))
+        table.sort(key=lambda t: t[0])
+        lines += ["", "👥 *Por supervisor* — do maior gap para o menor"]
+        for _, sup, s_, sp in table[:TEAM_SUP_MAX]:
+            parts = [f"{_status_dot(s_['ating'])} {_nice_name(sup)}", f"*{_bfmt(s_['csat'])}%*",
+                     f"{_bfmt(s_['ating'], 0)}% da meta"]
+            d = dpp(s_["csat"], sp.get("csat"))
+            if d:
+                parts.append(d)
+            parts.append(f"{_fmt_int(s_['falt'])} faltantes")
+            lines.append(" · ".join(parts))
+        if len(table) > TEAM_SUP_MAX:
+            lines.append(f"_…e mais {len(table) - TEAM_SUP_MAX} supervisores na planilha 📋_")
+
+    # 👤 Operadores para olhar primeiro (reincidentes 4 semanas, abaixo do limite de controle, Q4 com mais faltantes)
     weeks = results.get("weeks") or {}
-    if weeks:
-        team_weeks = {e: w for e, w in weeks.items() if in_team(e)}
-        rein4 = [(e, w) for e, w in team_weeks.items() if w["n"] == 4 and w["q4"] == 4]
-        rein3 = [(e, w) for e, w in team_weeks.items() if w["q4"] == 3]
-        if rein4 or rein3:
-            lines += ["", "*Reincidentes 4 semanas* (Q4 nas 4 últimas semanas, com 5+ pesquisas em cada; CSAT da "
-                          "semana mais antiga para a mais recente):"]
-            if not rein4:
-                lines.append("• Ninguém no Q4 nas 4 semanas.")
-            for e, w in sorted(rein4, key=lambda x: sum(c for c in x[1]["csats"] if c is not None))[:TEAM_LIST_MAX]:
-                serie = " · ".join(f"{_bfmt(c, 0)}%" if c is not None else "—" for c in reversed(w["csats"]))
-                lines.append(f"• {who([e])}: CSAT por semana {serie}")
-            if rein3:
-                lines.append(f"• +{len(rein3)} no Q4 em 3 das 4 semanas")
-    worst = sorted([o for o in st["ops"] if o["quad"] == "Q4" and not o["small"]], key=lambda o: -o["falt"])
-    if worst:
-        lines += ["", "*Q4 com mais positivas faltantes:*"]
-        for o in worst[:TEAM_LIST_MAX]:
-            lines.append(f"• {who(o['row'])}: CSAT {_bfmt(o['csat'])}% ({_fmt_int(o['prom'])}/{_fmt_int(o['aval'])}) · "
-                         f"{_bfmt(o['ating'], 0)}% da meta · faltaram {_fmt_int(o['falt'])}")
-    lines += ["", "_Quer ajuda para montar o plano da equipe? É só pedir aqui._"]
+    team_weeks = {e: w for e, w in weeks.items() if in_team(e)}
+    rein4 = {e for e, w in team_weeks.items() if w["n"] == 4 and w["q4"] == 4}
+    rein3 = sum(1 for w in team_weeks.values() if w["q4"] == 3)
+    below = {o["row"][0].lower() for o in st["below"]}
+    flagged = [o for o in st["ops"] if o["row"][0].lower() in rein4 or o["row"][0].lower() in below
+               or (o["quad"] == "Q4" and not o["small"])]
+    flagged.sort(key=lambda o: (o["row"][0].lower() not in rein4, o["row"][0].lower() not in below, -o["falt"]))
+    if kind != "all" and flagged:
+        lines += ["", "👤 *Operadores para olhar primeiro*"]
+        for o in flagged[:TEAM_OPS_MAX]:
+            e = o["row"][0].lower()
+            tags = (["🔁 Q4 nas 4 semanas"] if e in rein4 else []) + (["⚠️ abaixo do limite"] if e in below else [])
+            lines.append(" · ".join([f"• {who(o['row'])}", f"*{_bfmt(o['csat'])}%* ({_fmt_int(o['prom'])}/"
+                                     f"{_fmt_int(o['aval'])})", f"faltam {_fmt_int(o['falt'])}"] + tags))
+        if len(flagged) > TEAM_OPS_MAX:
+            lines.append(f"_…e mais {len(flagged) - TEAM_OPS_MAX} na planilha 📋_")
+
+    # 💡 Leitura
+    leitura = []
+    if st["pareto"].get(50):
+        leitura.append(f"{_bfmt(st['pareto'][50], 0)}% dos operadores concentram metade das notas 1–3"
+                       + (": o problema está concentrado, dá para atacar por nome." if st["pareto"][50] <= 30
+                          else ": o problema está espalhado, é mais processo do que pessoa."))
+    if st["below"]:
+        leitura.append(f"{len(st['below'])} operador(es) abaixo do limite de controle: ruim de verdade, não é só amostra.")
+    if rein4 or rein3:
+        leitura.append(f"{len(rein4)} reincidente(s) 4 semanas no Q4" + (f" e {rein3} em 3 das 4" if rein3 else "") + ".")
+    if kind == "all" and table:
+        worst = table[0]
+        leitura.append(f"Maior gap: {_nice_name(worst[1])}, com {_fmt_int(worst[2]['falt'])} positivas faltantes.")
+    if st["small"]:
+        leitura.append(f"{st['small']} operador(es) com amostra pequena (<{TEAM_SMALL_SAMPLE}) ficaram fora dos quadrantes.")
+    if leitura:
+        lines += ["", "💡 *Leitura*"] + [f"↳ {t}" for t in leitura]
+    lines += ["", "_Quer ajuda para montar o plano da equipe? É só pedir aqui."
+              + (" A base completa vai na planilha abaixo 📋_" if _operator_names_allowed(eps) else "_")]
     _say_sections(say, "\n".join(lines), event)
     if _operator_names_allowed(eps):
         _upload_operators_xlsx(event, client, team, eps, spec["label"], "Base completa da equipe 📋")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Checagem de crise (Lyra Crises): antes de cobrar a EPS, a Lyra confere se teve crise no período. Crise do lado do
+# iFood (Rosie, plataforma, Salesforce, clima...) é registro: a cobrança vira "o que a operação fez durante a crise".
+# ---------------------------------------------------------------------------
+CRISIS_CHECK = os.getenv("CRISIS_CHECK", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+CRISIS_CHECK_TTL = int(os.getenv("CRISIS_CHECK_TTL", "1800"))  # status/prints reaproveitam a checagem por 30 min
+CRISIS_STATUS_WINDOW_HOURS = 3
+
+
+def _crisis_prompt(start: datetime, end: datetime, eps: str | None) -> str:
+    f = lambda d: d.strftime("%d/%m/%Y %H:%M")
+    return (
+        "TAREFA INTERNA DO APP — checagem de crise. Não é mensagem para o Slack. Responda APENAS com JSON válido.\n"
+        "Chame o subagente *Lyra Crises* com 'Pedido: checagem de crise' e "
+        f"'Período: {f(start)} a {f(end)} (BRT)'"
+        + (f" e 'EPS: {eps}'" if eps else "") + ". Devolva exatamente o JSON que ele responder:\n"
+        '{"crise": true|false, "resumo": "<sistema e o que aconteceu, 1 frase>", "inicio": "~hhhmm", "fim": "~hhhmm ou '
+        'em andamento", "impacto": "<efeito no atendimento: transbordo, fila, filas afetadas>", "filas": ["<fila>"], '
+        '"status": "Estabilizado|Estabilizando|Em andamento|Em investigação"}\n'
+        "Sem crise ou sem fonte: {\"crise\": false}. Se a consulta falhar: responda só 'ERRO: <motivo>'."
+    )
+
+
+def _crisis_check(start: datetime, end: datetime, eps: str | None = None,
+                  ttl: float | None = CRISIS_CHECK_TTL) -> dict[str, Any] | None:
+    """{crise, resumo, inicio, fim, impacto, filas, status} quando teve crise no período; None se não teve, se a
+    checagem estiver desligada ou se falhar (falha nunca trava a cobrança)."""
+    if not CRISIS_CHECK:
+        return None
+    try:
+        answer = _ask_cached(_crisis_prompt(start, end, eps), ttl_seconds=ttl)
+    except Exception:
+        logger.warning("Crisis check failed", exc_info=True)
+        return None
+    if _is_error_answer(answer):
+        logger.warning("Crisis check returned error: %s", str(answer)[:200])
+        return None
+    try:
+        data = json.loads(_strip_json_code_blocks(answer))
+    except Exception:
+        m = re.search(r"\{.*\}", answer or "", re.S)
+        try:
+            data = json.loads(m.group(0)) if m else None
+        except Exception:
+            data = None
+    if not isinstance(data, dict) or not data.get("crise") or not str(data.get("resumo") or "").strip():
+        return None
+    data["filas"] = [str(x) for x in (data.get("filas") or []) if str(x).strip()]
+    return data
+
+
+def _crisis_line(c: dict[str, Any], when: str = "") -> str:
+    ini, fim = str(c.get("inicio") or "").strip(), str(c.get("fim") or "").strip()
+    if "andamento" in _norm_text(fim):
+        janela = f"desde {ini}, em andamento" if ini else "em andamento"
+    else:
+        janela = " ".join(x for x in (f"das {ini}" if ini else "", f"às {fim}" if fim else "") if x)
+    txt = f"🚨 *Crise{(' ' + when) if when else ''}:* {str(c['resumo']).strip().rstrip('.')}"
+    if janela:
+        txt += f" ({janela})"
+    if c.get("impacto"):
+        txt += f" — {str(c['impacto']).strip().rstrip('.')}"
+    return txt + "."
+
+
+def _crisis_hits_fila(c: dict[str, Any], fila: str) -> bool:
+    """Sem filas informadas, a crise vale para todas as filas da EPS."""
+    filas = c.get("filas") or []
+    return not filas or any(_norm_text(f) in _norm_text(fila) or _norm_text(fila) in _norm_text(f) for f in filas)
+
+
+def _apply_crisis_to_body(body: str, fila: str, c: dict[str, Any] | None) -> str:
+    """Report: fila cobrada no D-1 em que teve crise -> registra a crise e troca a cobrança por "o que a operação fez
+    durante a crise"."""
+    if not c or "👉 *Cobrança:*" not in body or not _crisis_hits_fila(c, fila):
+        return body
+    out = []
+    for line in body.split("\n"):
+        if line.startswith("👉 *Cobrança:*"):
+            out.append(_crisis_line(c, "no D-1"))
+            out.append("👉 *Cobrança:* A queda coincide com a crise, que é do lado do iFood. O que a operação fez durante "
+                       "ela (escala, priorização da fila, comunicação com o cliente) e o que muda se acontecer de novo? "
+                       "Retorno aqui na thread até 14h.")
+        else:
+            out.append(line)
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -3817,6 +4137,21 @@ def _is_knowledge_question(question: str) -> bool:
     return bool(_KNOWLEDGE_RE.search(text)) and not _is_cause_request(question)
 
 
+_CLUBE_RE = re.compile(r"\b(clube|assinatura|turbine|payer|payer_id|fingerprint|spotify|decolar|uber one|uber|santander|"
+                       r"sympla|crm bonus|easy live|youtube premium|amazon prime|mec)\b")
+
+
+def _is_clube_question(question: str) -> bool:
+    return bool(_CLUBE_RE.search(_norm_text(question)))
+
+
+CLUBE_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA: este é um assunto de Clube iFood. Chame a *ClubIA* com a pergunta completa "
+    "(e todos os dados que a pessoa mandou: payer_id, valor, data, 4 últimos dígitos) e devolva a resposta dela como "
+    "veio (📥 Dados coletados / ⚡ Ação para operações), sem cortar validações, textos rápidos e macros. NÃO chame a "
+    "Lyra Conhecimento para Clube e não complete com conhecimento geral.\n\n"
+)
+
 KNOWLEDGE_INSTRUCTION = (
     "INFORMAÇÃO INTERNA PARA A LYRA: esta é uma dúvida de processo, política ou agente de IA. Chame o subagente "
     "*Lyra Conhecimento* com `Pedido: <a pergunta, completa>` (uma chamada por pergunta, se houver mais de uma) e "
@@ -4106,11 +4441,23 @@ def _run_daily_report(now: datetime | None = None, tenant: Tenant | None = None)
     google_client = _safe_google_client()
     compromissos_text = _get_open_compromissos(google_client, now, tenant.key) if google_client else ""
 
+    crisis: dict[str, Any] = {}
+    d1 = now.date() - timedelta(days=1)
+    d1_start = datetime(d1.year, d1.month, d1.day, 0, 0, tzinfo=now.tzinfo)
+
+    def check_crisis() -> None:  # em paralelo com a consulta do report
+        crisis["c"] = _crisis_check(d1_start, d1_start + timedelta(hours=23, minutes=59), tenant.eps, ttl=None)
+
+    crisis_thread = threading.Thread(target=check_crisis, daemon=True)
+    crisis_thread.start()
     answer = ask_toqan(_report_prompt(tenant, compromissos_text))
     if _is_error_answer(answer):
         raise ReportGenerationError(answer.strip()[:300] or "resposta vazia")
 
     blocks = _prepare_blocks(_split_blocks(answer, use_headers=True), now.date() - timedelta(days=1))
+    crisis_thread.join(timeout=300)
+    if crisis.get("c"):
+        blocks = [(fila, title, _apply_crisis_to_body(body, fila, crisis["c"])) for fila, title, body in blocks]
     if blocks:
         posted: list[dict[str, Any]] = []
         csat: dict[str, dict[str, float]] = {}
@@ -4413,6 +4760,28 @@ def _report_targets(question: str) -> list[Tenant] | None:
     return named or list(TENANTS)
 
 
+PREWARM_BASES = os.getenv("PREWARM_BASES", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+
+
+def _prewarm_bases(eps: str) -> None:
+    """Depois do report: puxa 1x as bases de operadores da semana (lista, equipe e 4 semanas), uma de cada vez, para
+    as perguntas do dia saírem do cache em vez de abrir uma consulta pesada por pessoa."""
+    eps_scope = eps if eps in EPS_CELULAS else None
+    if eps_scope is None:
+        return
+    spec = _period_spec("semana")
+    jobs = [lambda: _fetch_weekly_rows(eps_scope),
+            lambda: _fetch_operator_rows(eps_scope, spec["cur"]),
+            lambda: _fetch_operator_rows(eps_scope, spec["prev"]),
+            lambda: _ask_cached(_operators_prompt(eps_scope, _operators_period("semana")[0]))]
+    for job in jobs:
+        try:
+            job()
+        except Exception:
+            logger.warning("[%s] Prewarm failed", eps, exc_info=True)
+    logger.info("[%s] Bases de operadores pré-carregadas", eps)
+
+
 def _run_report_now(targets: list[Tenant]) -> list[str]:
     """Roda o report na hora (teste manual). Devolve uma linha de resultado por tenant."""
     lines = []
@@ -4486,6 +4855,8 @@ def _tenant_tick(tenant: Tenant, now: datetime) -> None:
                 try:
                     _run_daily_report(now, tenant)
                     _report_next_attempt_at.pop(tenant.key, None)
+                    if PREWARM_BASES:
+                        threading.Thread(target=_prewarm_bases, args=(tenant.eps or "",), daemon=True).start()
                 except Exception as exc:
                     failures += 1
                     STATE.set(fail_key, str(failures))
@@ -4861,9 +5232,9 @@ _NAMES_CACHE: dict[str, Any] = {"at": 0.0, "map": {}}
 
 
 def _operator_label(email: str, nome: str = "") -> str:
-    """Como o operador aparece no Slack: "Nome · `email`" (só o e-mail se não achar o nome no MOP)."""
+    """Como o operador aparece no Slack: "Nome · email" (só o e-mail se não achar o nome no MOP). Sem código."""
     email = email.strip().lower()
-    return f"{nome} · `{email}`" if nome else f"`{email}`"
+    return f"{_nice_name(nome)} · {email}" if nome else email
 
 
 def _email_of(user: str, names: dict[str, str]) -> str | None:
@@ -4922,6 +5293,44 @@ FULL_ACCESS_INSTRUCTION = (
     "o mínimo nos dois períodos.\n\n")
 
 
+ANSWER_LAYOUT_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA — VISUAL DA RESPOSTA: resposta curta (1 a 3 frases) fica em texto corrido. "
+    "Resposta grande (ranking, comparação, análise com mais de um bloco) segue o visual do report diário:\n"
+    "1ª linha = título: <🔴 se está fora da meta/piorou, 🟢 se está bem> *<Rótulo> ·* `<fila ou EPS>` *— <período>* "
+    "· <número principal>. Ex.: 📉 *Maior piora em CSAT ·* `CX Suporte` *— 23–29/10 vs 16–22/10* · 5 operadores\n"
+    "Depois, seções separadas por UMA linha em branco (viram divisórias), cada uma com cabeçalho curto: "
+    "📍 *Resultado* · 👥 *Por supervisor* · 👤 *Operadores* · 💡 *Leitura* (1 a 3 linhas começando com ↳: o que o "
+    "número quer dizer e onde agir).\n"
+    "Linhas curtas: • <o quê> *<valor>* → 🔴/🟢 <vs meta ou vs período anterior> (n=<avaliações>). Ranking numerado "
+    "(1., 2., ...), um item por linha, no máximo 10. Operador: só o usuário do e-mail, sem crase (o app põe o nome). "
+    "Nome de pessoa sem CAIXA ALTA. Sem crase em nada além do nome da fila/EPS no título. Não repita a mesma "
+    "informação em duas seções. Não escreva mensagens de andamento ('processando', 'aguarde').\n\n")
+
+
+def _looks_sectioned(answer: str | None) -> bool:
+    """Resposta no visual do report (título + seções): vai com divisórias."""
+    parts = [p for p in re.split(r"\n\s*\n", answer or "") if p.strip()]
+    return len(parts) >= 3 or (len(parts) >= 2 and bool(re.match(r"^\W{1,3}\s*\*", (answer or "").lstrip())))
+
+
+_RECENT_ANSWERS: dict[str, tuple[float, str]] = {}
+RECENT_ANSWER_TTL = int(os.getenv("RECENT_ANSWER_TTL", "1800"))  # pergunta repetida em 30 min reaproveita a resposta
+
+
+def _recent_answer(prompt: str) -> str | None:
+    hit = _RECENT_ANSWERS.get(f"{_as_date(_today_brazil())}|{hash(prompt)}")
+    return hit[1] if hit and hit[0] > time.time() else None
+
+
+def _remember_answer(prompt: str, answer: str | None) -> None:
+    if not answer or _is_error_answer(answer) or RECENT_ANSWER_TTL <= 0:
+        return
+    now = time.time()
+    for k in [k for k, v in _RECENT_ANSWERS.items() if v[0] <= now]:
+        _RECENT_ANSWERS.pop(k, None)
+    _RECENT_ANSWERS[f"{_as_date(_today_brazil())}|{hash(prompt)}"] = (now + RECENT_ANSWER_TTL, answer)
+
+
 DEFAULTS_INSTRUCTION = (
     "INFORMAÇÃO INTERNA PARA A LYRA — RESPONDA, NÃO DEVOLVA PERGUNTA: se faltar o indicador, use CSAT; se faltar o "
     "período, use o D-1 (ontem) com o mês como contexto; se faltar a fila, traga todas as filas do escopo. Diga em meia "
@@ -4974,16 +5383,24 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
 
         in_report_thread = bool(_report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or "")))
         asks = _is_question_like(question)
-        if _is_team_request(question) and (asks or not in_report_thread):
-            _say(say, "Vou montar o resultado da equipe, já te mando. ⏳", event, in_thread=True)
-            problem = _send_team_view(event, client, eps, question, say, in_thread)
+        analytical = _is_analytical(question)  # "por que", "quem piorou", "quanto contribuiu": análise livre
+        progress = _Progress(event)
+        if _is_team_request(question) and not analytical and (asks or not in_report_thread):
+            progress("Vou montar o resultado da equipe, já te mando. ⏳")
+            try:
+                problem = _send_team_view(event, client, eps, question, say, in_thread)
+            finally:
+                progress.done()
             if problem:
                 _say(say, problem, event, in_thread)
             return
 
-        if _is_reincidentes_request(question) and (asks or not in_report_thread):
-            _say(say, "Vou puxar as últimas 4 semanas dos operadores, já te mando. ⏳", event, in_thread=True)
-            problem = _send_reincidentes(event, client, eps, question, say, in_thread)
+        if _is_reincidentes_request(question) and not analytical and (asks or not in_report_thread):
+            progress("Vou puxar as últimas 4 semanas dos operadores, já te mando. ⏳")
+            try:
+                problem = _send_reincidentes(event, client, eps, question, say, in_thread)
+            finally:
+                progress.done()
             if problem:
                 _say(say, problem, event, in_thread)
             return
@@ -4993,11 +5410,15 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             prev = _last_dm_human_text(event)  # "ontem" respondendo a um pedido de operadores
             if prev and _is_operators_excel_request(prev):
                 op_question = f"{prev} {question}"
-        if _is_operators_excel_request(op_question) and (asks or not in_report_thread):
-            wants_file = bool(re.search(r"\b(excel|planilha|xlsx|arquivo)\b", _norm_text(op_question)))
+        wants_file = bool(re.search(r"\b(excel|planilha|xlsx|arquivo)\b", _norm_text(op_question)))
+        if (_is_operators_excel_request(op_question) and (wants_file or not analytical)
+                and (asks or not in_report_thread)):
             if _operator_names_allowed(eps) and not wants_file:  # direto no chat, com nome (cada EPS só vê os dela)
-                _say(say, "Vou puxar o resultado por operador, já te mando. ⏳", event, in_thread=True)
-                problem = _send_operators_inline(event, client, eps, op_question, say, in_thread)
+                progress("Vou puxar o resultado por operador, já te mando. ⏳")
+                try:
+                    problem = _send_operators_inline(event, client, eps, op_question, say, in_thread)
+                finally:
+                    progress.done()
                 if problem:
                     _say(say, problem, event, in_thread)
                 return
@@ -5028,8 +5449,7 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
                 _say(say, problem, event, in_thread)
             return
 
-        def send_progress(message: str) -> None:
-            _say(say, message, event, in_thread=True)
+        send_progress = progress  # uma mensagem de andamento só, editada e apagada quando a resposta chega
 
         extra = ""
         if _is_cause_request(question):
@@ -5043,6 +5463,7 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
                 fila_v = block_q[1].get("fila") if block_q else fila_q
                 cur, ref, l_cur, l_ref = _variation_periods(question)
                 var_answer = ask_toqan(_variation_prompt(eps, fila_v, cur, ref), progress_callback=send_progress)
+                progress.done()
                 var_data = {} if _is_error_answer(var_answer) else (_block_data_from_json(var_answer) or {})
                 rendered = _render_variation(fila_v, var_data, l_cur, l_ref) if var_data else None
                 if rendered:
@@ -5057,13 +5478,21 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
                          "e response rate). Feche com 1 frase sobre o que é da EPS cobrar.\n\n")
         if not extra and _is_plan_request(question):
             extra = PLAN_INSTRUCTION
+        elif not extra and _is_clube_question(question) and not _DATA_WORDS_RE.search(_norm_text(question)):
+            extra = CLUBE_INSTRUCTION
         elif not extra and _is_knowledge_question(question):
             extra = KNOWLEDGE_INSTRUCTION
         context = _thread_context(event) or _dm_context(event)
         prompt = (f"{_scope_instruction(eps)}\n\n{_date_context(question)}{context}{extra}"
                   f"{DEFAULTS_INSTRUCTION if not extra else ''}{FULL_ACCESS_INSTRUCTION if _operator_names_allowed(eps) else ''}"
-                  f"{_inject_mop_context(question, eps)}")
-        answer = ask_toqan(prompt, progress_callback=send_progress)
+                  f"{ANSWER_LAYOUT_INSTRUCTION}{_inject_mop_context(question, eps)}")
+        answer = _recent_answer(prompt)
+        if answer is None:
+            try:
+                answer = ask_toqan(prompt, progress_callback=send_progress)
+            finally:
+                progress.done()
+            _remember_answer(prompt, answer)
         _passive_access_check(answer)
         answer = _strip_file_promises(answer)
         if _operator_names_allowed(eps):
@@ -5084,7 +5513,10 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             if detail:
                 _say(say, detail, event, in_thread=True)
             return
-        _say(say, answer or EMPTY_ANSWER_MESSAGE, event, in_thread)
+        if _looks_sectioned(answer):
+            _say_sections(say, answer, event, in_thread)
+        else:
+            _say(say, answer or EMPTY_ANSWER_MESSAGE, event, in_thread)
     except MOPChannelNotAllowedError:
         _say(say, MOP_CHANNEL_NOT_ALLOWED_MESSAGE, event, in_thread=True)
     except MOPGoogleCredentialsError as exc:
@@ -5146,9 +5578,8 @@ def _dispatch(event: dict[str, Any], say: Callable[..., Any], client: Any, ack: 
 
 @slack_app.event("app_mention")
 def handle_app_mention(event, say, client, ack):
-    if OWNERS_FLOW_CHANNEL and event.get("channel") == OWNERS_FLOW_CHANNEL:
-        _route_chamados_event(event)  # marcar a Lyra no fluxo de chamados = complemento do chamado
-        ack()
+    if _is_flow_channel(str(event.get("channel") or "")):
+        ack()  # o evento "message" do mesmo post já trata (chamado de moedas ou resposta pela base)
         return
     if MOP_FLOW_CHANNEL and event.get("channel") == MOP_FLOW_CHANNEL:
         # No canal do fluxo a Lyra só processa o Excel do MOP; não conversa ali.
@@ -5480,10 +5911,19 @@ def _read_status_thread(channel: str, thread_ts: str, eps: str) -> str | None:
 
 
 def _post_status_reply(channel: str, thread_ts: str, eps: str, thread_title: str, head: str,
-                       bullets: list[str], user: str | None) -> str:
+                       bullets: list[str], user: str | None, crisis_check: bool = True) -> str:
     """Responde a um controle da EPS. Fase de testes (STATUS_SHADOW): vai para o canal de testes da EPS, numa
-    thread por controle, sem marcar ninguém; senão, na própria thread da EPS marcando quem postou."""
+    thread por controle, sem marcar ninguém; senão, na própria thread da EPS marcando quem postou.
+    Antes de cobrar, confere crise nas últimas horas (checagem reaproveitada por 30 min)."""
     lines = [f"• {b}" for b in bullets]
+    if crisis_check and bullets:
+        now = _now_brazil()
+        slot_end = now.replace(minute=0 if now.minute < 30 else 30, second=0, microsecond=0)
+        c = _crisis_check(slot_end - timedelta(hours=CRISIS_STATUS_WINDOW_HOURS), slot_end, eps)
+        if c:
+            lines = [f"• {_crisis_line(c, 'agora' if 'andamento' in _norm_text(c.get('fim') or c.get('status')) else 'nas últimas horas')}",
+                     "• Do lado do iFood, fica registrado. O que a operação está fazendo para segurar a fila durante a "
+                     "crise (escala, priorização, comunicação)?"] + lines
     test_channel = (STATUS_TEST_CHANNELS.get(eps) or EPS_CHANNELS.get(eps)) if _status_shadow(eps) else None
     if test_channel:
         text = head + ("\n\n" + "\n".join(lines) if lines else "")
@@ -5755,7 +6195,7 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
         STATE.set(ikey, "1")
         return _post_status_reply(channel, thread_ts, eps, title, head_base,
                                   [f"Não consegui ler o print ({problem or 'sem dados'}). Manda em tamanho maior, sem cortar "
-                                   "a tabela, ou o Excel do controle."], user)
+                                   "a tabela, ou o Excel do controle."], user, crisis_check=False)
     if kind == "hora" and hora_txt and not data.get("ate"):
         data["ate"] = hora_txt
     issues = (_judge_hora(data) if kind == "hora" else _judge_volume(data) if kind == "volume"
@@ -5832,6 +6272,13 @@ def _maybe_status_reply(event: dict[str, Any]) -> bool:
 # sem webhook, postando o chamado direto no canal. Depois devolve o retorno do Rewards na thread de origem.
 OWNERS_FLOW_CHANNEL = os.getenv("OWNERS_FLOW_CHANNEL", "").strip()
 REWARDS_CHANNEL = os.getenv("REWARDS_CHANNEL", "C08M93FKB63").strip()
+# Canais de melhorias das EPSs (Fluxo Owners CX): a Lyra lê todas as threads. Moedas = chamado no formato do Reward
+# Engine; demais tópicos (Ajuda, Escalar Ticket...) = resposta na thread pela base de conhecimento.
+MELHORIAS_CHANNELS = _parse_channel_map(os.getenv("MELHORIAS_CHANNELS", "AeC:C0C5NDFB87R,CSU:C0C6Y5W8ETS"))
+# Para onde vai o chamado de moedas, por EPS. Enquanto estiver preenchido (padrão = canais de teste das EPSs), o
+# chamado NÃO vai para o Rewards de verdade. No go-live: CHAMADOS_DESTINO=AeC:<canal real>,CSU:<canal real> (ou vazio
+# = REWARDS_CHANNEL / webhook do fluxo).
+CHAMADOS_DESTINO = _parse_channel_map(os.getenv("CHAMADOS_DESTINO", "AeC:C0C9F5BLVN1,CSU:C0C9L8NRPPC"))
 REWARDS_WEBHOOK_URL = os.getenv("REWARDS_WEBHOOK_URL", "").strip()
 REWARDS_PROBLEM_TYPES = [t.strip() for t in os.getenv(
     "REWARDS_PROBLEM_TYPES", "Missão concluída, mas moedas não creditadas").split(";") if t.strip()]
@@ -5868,6 +6315,27 @@ def _flow_value(fields: dict[str, str], *labels: str) -> str:
                 value = value.strip()
                 return "" if value in {".", "-", "—"} else value
     return ""
+
+
+def _flow_eps(channel: str) -> str | None:
+    return next((e for e, c in MELHORIAS_CHANNELS.items() if c == channel), None)
+
+
+def _is_flow_channel(channel: str) -> bool:
+    return bool(channel) and (channel == OWNERS_FLOW_CHANNEL or channel in MELHORIAS_CHANNELS.values())
+
+
+def _chamado_destino(eps: str | None) -> tuple[str, bool]:
+    """(canal do chamado, é teste?). Teste = canal diferente do Rewards real: posta direto, sem webhook."""
+    dest = CHAMADOS_DESTINO.get(eps or "") or (next(iter(CHAMADOS_DESTINO.values())) if CHAMADOS_DESTINO and not eps else "")
+    if dest and dest != REWARDS_CHANNEL:
+        return dest, True
+    return REWARDS_CHANNEL, False
+
+
+def _flow_topic(fields: dict[str, str], parent_fields: dict[str, str]) -> str:
+    return " ".join(x for x in [_flow_value(parent_fields, "topico"), _flow_value(fields, "topico"),
+                                _flow_value(fields, "tipo"), _flow_value(parent_fields, "tipo")] if x).strip()
 
 
 def _is_moedas_flow(fields: dict[str, str], parent_fields: dict[str, str]) -> bool:
@@ -5945,14 +6413,16 @@ def _download_slack_bytes(file_info: dict[str, Any]) -> bytes | None:
         return None
 
 
-def _post_rewards_chamado(chamado: dict[str, str], triage: dict[str, Any], origin_link: str) -> str | None:
-    """Abre o chamado no Rewards. Devolve o ts da mensagem do chamado no canal (quando acha)."""
+def _post_rewards_chamado(chamado: dict[str, str], triage: dict[str, Any], origin_link: str,
+                          eps: str | None = None, n_evid: int = 0) -> str | None:
+    """Abre o chamado no Rewards (ou no canal de teste da EPS). Devolve o ts da mensagem do chamado no canal."""
+    dest, teste = _chamado_destino(eps)
     payload = {
         "numero_ticket": chamado["ticket"], "id_cliente": chamado["cliente"], "id_pedido": chamado.get("pedido", ""),
         "missao": triage["missao"], "descricao": triage["descricao"], "tipo_problema": triage["tipo_problema"],
         "solicitante": chamado.get("solicitante", ""), "origem": origin_link,
     }
-    if REWARDS_WEBHOOK_URL:
+    if REWARDS_WEBHOOK_URL and not teste:
         req = urllib.request.Request(REWARDS_WEBHOOK_URL, data=json.dumps(payload).encode("utf-8"),
                                      headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=30) as response:
@@ -5971,18 +6441,22 @@ def _post_rewards_chamado(chamado: dict[str, str], triage: dict[str, Any], origi
         return None
     solicitante = f"<@{chamado['solicitante']}>" if chamado.get("solicitante") else "operação"
     text = "\n".join(line for line in [
-        "*Chamado de moedas* (aberto pela Lyra a partir do Fluxo Owners CX)",
-        f"*Solicitante:* {solicitante}",
+        (f"🧪 *TESTE · chamado de moedas {eps or ''}* — em produção vai para o <#{REWARDS_CHANNEL}>" if teste
+         else "🪙 *Rewards Engine CX Support* · chamado aberto pela Lyra"),
+        "",
         f"*Número do Ticket:* {chamado['ticket']}",
         f"*ID do Cliente:* {chamado['cliente']}",
-        f"*ID do Pedido:* {chamado['pedido']}" if chamado.get("pedido") else "",
-        f"*Missão:* {triage['missao']}" if triage.get("missao") else "",
-        f"*Tipo de problema:* {triage['tipo_problema']}",
-        f"*Prioridade:* {chamado['prioridade']}" if chamado.get("prioridade") else "",
+        f"*ID do Pedido:* {chamado.get('pedido') or '—'}",
+        f"*Id ou Nome da Missão:* {triage.get('missao') or '—'}",
         f"*Descreva o problema:* {triage['descricao']}",
-        f"<{origin_link}|Chamado de origem>" if origin_link else "",
-    ] if line)
-    resp = slack_app.client.chat_postMessage(channel=REWARDS_CHANNEL, text=text)
+        f"*Tipo de problema:* {triage['tipo_problema']}",
+        f"*Evidências:* {f'{n_evid} anexo(s) aqui na thread' if n_evid else 'sem anexo'}",
+        "",
+        f"*Solicitante:* {solicitante}" + (f" · *Prioridade:* {chamado['prioridade']}" if chamado.get("prioridade") else ""),
+        f"<{origin_link}|Thread de origem>" if origin_link else "",
+    ] if line is not None)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    resp = slack_app.client.chat_postMessage(channel=dest, text=text)
     return str(_resp_get(resp, "ts") or "") or None
 
 
@@ -6004,27 +6478,38 @@ def _chamados_ws() -> Any | None:
         return None
 
 
-def _handle_owners_flow(channel: str, thread_ts: str) -> None:
-    """Lê o chamado do Fluxo Owners CX (mensagem + thread) e, se for de moedas, faz triagem e abre no Rewards."""
+def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "") -> None:
+    """Lê o chamado do Fluxo Owners CX (mensagem + thread). Moedas: triagem e chamado no Rewards. Outros tópicos:
+    responde na thread pela base de conhecimento (e de novo quando marcarem a Lyra na thread)."""
     key = f"chamado:{thread_ts}"
+    eps = _flow_eps(channel)
     with _CHAMADOS_LOCK:
         state = STATE.get(key)
-        if state in {"aberto", "processando", "fora"}:
+        if state == "respondido" and mention_text:
+            STATE.set(key, "processando")
+        elif state in {"aberto", "processando", "fora", "respondido"}:
             return
-        STATE.set(key, "processando")
+        else:
+            STATE.set(key, "processando")
     try:
         messages = _fetch_thread(channel, thread_ts)
         parent = next((m for m in messages if m.get("ts") == thread_ts), {})
         parent_text = str(parent.get("text") or "")
         flow_msgs = [m for m in messages if m.get("bot_id") or m.get("subtype") == "bot_message"]
         details = next((m for m in flow_msgs if m.get("ts") != thread_ts and "descri" in _norm_text(m.get("text"))), None)
+        if details is None and "descri" in _norm_text(parent_text):
+            details = parent  # fluxo que posta tudo na mensagem principal
         if details is None:
             STATE.set(key, state or "")
             return  # o fluxo ainda não postou os detalhes na thread
         fields = _parse_flow_fields(str(details.get("text") or ""))
         parent_fields = _parse_flow_fields(parent_text)
         if not _is_moedas_flow(fields, parent_fields):
-            STATE.set(key, "fora")
+            if eps is None:  # canal antigo do fluxo (OWNERS_FLOW_CHANNEL): só moedas
+                STATE.set(key, "fora")
+                return
+            _answer_flow_question(channel, thread_ts, eps, messages, fields, parent_fields, mention_text)
+            STATE.set(key, "respondido")
             return
         bot = _bot_user_id()
         replies = [str(m.get("text") or "") for m in messages
@@ -6041,26 +6526,29 @@ def _handle_owners_flow(channel: str, thread_ts: str) -> None:
             STATE.set(key, "aguardando")
             return
         origin = _permalink(channel, thread_ts)
-        rewards_ts = _post_rewards_chamado(chamado, triage, origin)
         files = [f for m in messages for f in (m.get("files") or []) if isinstance(f, dict)]
+        dest, teste = _chamado_destino(eps)
+        rewards_ts = _post_rewards_chamado(chamado, triage, origin, eps, len(files[:10]))
         if rewards_ts and files:
             for f in files[:10]:
                 content = _download_slack_bytes(f)
                 if content:
                     try:
-                        slack_app.client.files_upload_v2(channel=REWARDS_CHANNEL, thread_ts=rewards_ts, content=content,
+                        slack_app.client.files_upload_v2(channel=dest, thread_ts=rewards_ts, content=content,
                                                          filename=f.get("name") or "evidencia.png", title="Evidência")
                     except Exception:
                         logger.warning("Could not upload evidence", exc_info=True)
-        link = _permalink(REWARDS_CHANNEL, rewards_ts) if rewards_ts else ""
+        link = _permalink(dest, rewards_ts) if rewards_ts else ""
         slack_app.client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
-            text=("Chamado aberto no time de Rewards ✅" + (f" <{link}|ver chamado>" if link else f" (<#{REWARDS_CHANNEL}>)")
+            text=(("🧪 [teste] " if teste else "") + "Chamado aberto no time de Rewards ✅"
+                  + (f" <{link}|ver chamado>" if link else f" (<#{dest}>)")
                   + f"\n*Tipo:* {triage['tipo_problema']}" + (f" · *Missão:* {triage['missao']}" if triage["missao"] else "")
                   + "\nTe aviso aqui quando o Rewards responder."))
         STATE.set(key, "aberto")
         if rewards_ts:
             STATE.set(f"rewards:{rewards_ts}", json.dumps({"channel": channel, "ts": thread_ts}))
+            STATE.set(f"rewards_dest:{dest}", "1")
         ws = _chamados_ws()
         if ws is not None:
             now = _now_brazil()
@@ -6073,6 +6561,35 @@ def _handle_owners_flow(channel: str, thread_ts: str) -> None:
         logger.exception("Owners flow handling failed")
         STATE.set(key, "")
         _alert(f"Falha ao abrir chamado de moedas ({thread_ts}): {type(exc).__name__}: {str(exc)[:150]}")
+
+
+def _answer_flow_question(channel: str, thread_ts: str, eps: str | None, messages: list[dict[str, Any]],
+                          fields: dict[str, str], parent_fields: dict[str, str], mention_text: str = "") -> None:
+    """Tópico que não é Moedas (Ajuda, Escalar Ticket...): a Lyra tenta ajudar na thread pela base de conhecimento."""
+    topic = _flow_topic(fields, parent_fields) or "dúvida da operação"
+    pedido = "\n".join(f"{k}: {v}" for k, v in {**parent_fields, **fields}.items() if v and not re.match(r"^<@", v))
+    bot = _bot_user_id()
+    conversa = "\n".join(
+        f"{'Lyra' if m.get('user') == bot else 'Operação'}: {_MENTION_RE.sub('', str(m.get('text') or '')).strip()[:600]}"
+        for m in messages if m.get("ts") != thread_ts and not (m.get("bot_id") and m.get("user") != bot))
+    prompt = (
+        f"{_scope_instruction(eps)}\n\n"
+        f"INFORMAÇÃO INTERNA PARA A LYRA — CANAL DE MELHORIAS DA {eps or 'EPS'}: a operação abriu um pedido pelo fluxo "
+        f"Owners CX (tópico: {topic}). Ajude a operação na thread, como analista do time iFood.\n"
+        f"Pedido aberto:\n{pedido[:2500]}\n"
+        + (f"Conversa na thread até aqui:\n{conversa[-2500:]}\n" if conversa else "")
+        + (f"Nova mensagem para você: {mention_text}\n" if mention_text else "")
+        + "Regras: responda pelo que a base devolver (ClubIA para Clube; Lyra Conhecimento para os demais processos, "
+        "política, matriz de decisão e agentes). "
+        "Se for pedido para escalar um ticket, diga o que a operação precisa fazer e o que já pode adiantar pelo "
+        "processo. Se a base não tiver a resposta (NÃO SEI), diga em 1 frase que isso não está na sua base e que o "
+        "time iFood vai responder aqui — sem chute. Resposta curta (até 6 linhas), sem título, sem dado pessoal de "
+        "cliente.\n\n" + (CLUBE_INSTRUCTION if _is_clube_question(f"{topic} {pedido} {mention_text}") else KNOWLEDGE_INSTRUCTION))
+    answer = ask_toqan(prompt)
+    if _is_error_answer(answer) or not answer.strip():
+        _alert(f"Canal de melhorias {eps or ''}: não consegui responder a thread {thread_ts} ({str(answer)[:120]})")
+        return
+    slack_app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=_strip_file_promises(answer))
 
 
 def _handle_rewards_reply(event: dict[str, Any]) -> None:
@@ -6109,16 +6626,25 @@ def _handle_rewards_reply(event: dict[str, Any]) -> None:
 def _route_chamados_event(event: dict[str, Any]) -> bool:
     """Eventos dos canais de chamados. True = já tratado."""
     channel = str(event.get("channel") or "")
-    if OWNERS_FLOW_CHANNEL and channel == OWNERS_FLOW_CHANNEL:
+    if _is_flow_channel(channel):
         root = str(event.get("thread_ts") or event.get("ts") or "")
-        if event.get("user") != _bot_user_id() and root:
+        bot = _bot_user_id()
+        if event.get("user") != bot and root and event.get("subtype") not in {"message_changed", "message_deleted"}:
+            text = str(event.get("text") or "")
+            mention = _strip_mentions(text) if (bot and f"<@{bot}>" in text and event.get("thread_ts")) else ""
+
             # espera o fluxo postar os detalhes na thread e junta mensagens seguidas
             def run() -> None:
-                time.sleep(LIVE_REPLY_DELAY_SECONDS if event.get("thread_ts") and not event.get("bot_id") else 5)
-                _handle_owners_flow(channel, root)
+                if mention:
+                    time.sleep(2)
+                else:
+                    time.sleep(LIVE_REPLY_DELAY_SECONDS if event.get("thread_ts") and not event.get("bot_id") else 5)
+                _handle_owners_flow(channel, root, mention)
             threading.Thread(target=run, daemon=True).start()
         return True
-    if REWARDS_CHANNEL and channel == REWARDS_CHANNEL and event.get("thread_ts"):
+    thread_ts = str(event.get("thread_ts") or "")
+    is_dest = channel == REWARDS_CHANNEL or channel in CHAMADOS_DESTINO.values()
+    if channel and is_dest and thread_ts and STATE.get(f"rewards:{thread_ts}"):
         threading.Thread(target=_handle_rewards_reply, args=(event,), daemon=True).start()
         return True
     return False
