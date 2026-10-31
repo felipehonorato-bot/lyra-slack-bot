@@ -22,6 +22,10 @@ v5.13 — Respostas grandes no visual do report diário (o report em si não mud
         report, em paralelo com a consulta do D-1: fila cobrada em dia de crise ganha a linha 🚨 e a cobrança vira
         "o que a operação fez durante a crise". Nos status de hora em hora e prints: checagem das últimas 3h,
         reaproveitada por 30 min (CRISIS_CHECK_TTL). Falha na checagem nunca trava a cobrança.
+        ClubIA: dúvida e investigação de Clube vão para a ClubIA (também nas threads de melhorias). Variação do CSAT com
+        motivo pelo nome de negócio, lista na direção do efeito e, se o CSAT subiu, sem cobrança nem esteira. MOP pedido
+        na visão completa ("MOP da AeC") sai só da EPS citada. Pedido de plano fora da thread do report: a Lyra busca o
+        problema da fila sozinha. Na DM, só mensagem curta/de continuação puxa a conversa anterior.
 
 v5.12 — Visão de equipe ("minha equipe", "equipe da X", "por supervisor"): pelo MOP (supervisor/coordenador) e pela
         base de operadores do período (com o anterior para o Δ: D-1 x D-8, semana x semana, mês x mesmos dias), traz
@@ -2512,6 +2516,16 @@ def _eps_in_text(question: str) -> str | None:
     return next((e for e in EPS_CELULAS if _norm_text(e) in words), None)
 
 
+def _eps_of_question(question: str) -> str | None:
+    """EPS citada pelo nome ou pela fila (CX Suporte -> AeC). Visão completa sem EPS na pergunta: recorta mesmo assim,
+    para a consulta não trazer a base inteira do iFood."""
+    eps = _eps_in_text(question)
+    if eps:
+        return eps
+    fila = _fila_in_question(question, None)
+    return next((e for e, cel in EPS_CELULAS.items() if fila in cel), None) if fila else None
+
+
 def _operators_prompt(eps: str | None, period: str = "semana corrente (D-7 a D-1). Só operadores com 5+ avaliações.") -> str:
     return (
         f"{_scope_instruction(eps)}\n\n"
@@ -2520,7 +2534,8 @@ def _operators_prompt(eps: str | None, period: str = "semana corrente (D-7 a D-1
         f"'EPS: {eps or 'iFood'}', 'Pedido: base de operadores (CSV)' e 'Período: {period}'\n"
         f"Período: {period} Só filas da lista oficial da EPS.\n"
         "Quadrante pelo atingimento = CSAT do operador ÷ meta da fila: Q1 ≥ 100% · Q2 95–99% · Q3 90–94% · Q4 < 90%.\n"
-        "Responda APENAS um CSV separado por ';', sem markdown, com este cabeçalho exato:\n"
+        "Responda APENAS um CSV separado por ';', escrito no corpo da resposta (NUNCA salve em arquivo nem devolva nome "
+        "de arquivo ou link), sem markdown, com este cabeçalho exato:\n"
         "email;fila;avaliacoes;promotores;csat;meta;atingimento;quadrante\n"
         "Números com ponto decimal (csat, meta e atingimento em %, ex.: 72.5). Uma linha por operador.\n"
         "Última linha: TOTAL;<quantidade de operadores>\n"
@@ -2802,7 +2817,7 @@ def _operators_rows(eps: str | None, question: str) -> tuple[list[list[str]], in
     """Base de operadores do período pedido: (linhas, total, rótulo do período, EPS usada) ou texto de erro."""
     period, period_label = _operators_period(question)
     if eps is None:
-        eps = _eps_in_text(question)  # visão completa pedindo uma EPS: recorta nela
+        eps = _eps_of_question(question)  # visão completa pedindo uma EPS (ou fila): recorta nela
     answer = _ask_cached(_operators_prompt(eps, period))
     if _is_error_answer(answer):
         return "Não consegui puxar os dados dos operadores agora. Tenta de novo em alguns minutos?"
@@ -3082,7 +3097,7 @@ def _mop_people(eps: str | None) -> dict[str, dict[str, str]]:
         if eps and not _eps_matches(_row_eps(row, cols["EPS"], cols["Email"]), eps):
             continue
         people[email] = {"nome": cell("Nome"), "supervisor": cell("Supervisor"), "coordenador": cell("Coordenador"),
-                         "celula": cell("Célula")}
+                         "celula": cell("Célula"), "eps": _row_eps(row, cols["EPS"], cols["Email"])}
     return people
 
 
@@ -3178,11 +3193,32 @@ def _team_stats(rows: list[list[str]]) -> dict[str, Any]:
             "disp": (q4 / q1) if q1 and q4 is not None else None, "amp": amp, "below": below, "pareto": pareto}
 
 
-def _fetch_operator_rows(eps: str | None, period: str) -> list[list[str]] | None:
-    answer = _ask_cached(_operators_prompt(eps, f"{period}. Mínimo: 1 avaliação (o app marca amostra pequena)."))
+def _cached_only(prompt: str) -> str | None:
+    key = f"{_as_date(_today_brazil()).isoformat()}|{hash(prompt)}"
+    with _BASE_LOCK:
+        hit = _BASE_CACHE.get(key)
+    return hit[1] if hit and hit[0] > time.time() else None
+
+
+def _fetch_operator_rows(eps: str | None, period: str, emails: list[str] | None = None) -> list[list[str]] | None:
+    """Base de operadores do período. Com `emails` (equipe de um supervisor/coordenador): usa a base inteira da EPS se
+    ela já estiver em cache; senão pede só esses e-mails (consulta menor e mais rápida)."""
+    full = _operators_prompt(eps, f"{period}. Mínimo: 1 avaliação (o app marca amostra pequena).")
+    answer = _cached_only(full) if emails else None
+    if answer is None and emails:
+        lista = ", ".join(sorted(emails)[:400])
+        answer = _ask_cached(_operators_prompt(eps, f"{period}. Mínimo: 1 avaliação (o app marca amostra pequena). "
+                                                    f"Só estes operadores (e-mails): {lista}."))
+    elif answer is None:
+        answer = _ask_cached(full)
     if _is_error_answer(answer):
         return None
     rows, _ = _parse_operators_csv(answer)
+    if not rows:
+        _alert_unreadable("Base de operadores", eps, answer)
+        with _BASE_LOCK:
+            for k in [k for k, v in _BASE_CACHE.items() if v[1] == answer]:
+                _BASE_CACHE.pop(k, None)
     if eps:
         rows = [r for r in rows if _eps_pattern(eps) in r[0].lower()]
     return rows or None
@@ -3209,7 +3245,8 @@ def _weeks_prompt(eps: str | None) -> str:
         f"'EPS: {eps or 'iFood'}', 'Pedido: base de operadores por semana (CSV)' e 'Semanas: {sem}'.\n"
         f"Semanas (pela data de abertura do caso): {sem}. Só filas da lista oficial da EPS. Uma consulta só, agrupada "
         "por operador (use o SQL da seção 8.4b). Só operadores com 5+ avaliações em pelo menos 2 das 4 semanas.\n"
-        "Responda APENAS o CSV separado por ';', sem markdown e sem texto antes ou depois, com este cabeçalho:\n"
+        "Responda APENAS o CSV separado por ';', escrito no corpo da resposta (NUNCA salve em arquivo nem devolva nome de "
+        "arquivo ou link), sem markdown e sem texto antes ou depois, com este cabeçalho:\n"
         f"{';'.join(WEEKS_HEADER)}\n"
         "meta = meta de CSAT da fila em %. sN_aval = avaliações na semana N; sN_prom = promotoras (notas 4 e 5). "
         "Semana sem avaliação: 0. Uma linha por operador. Última linha: TOTAL;<quantidade de operadores>\n"
@@ -3280,6 +3317,16 @@ def _parse_weeks_csv(answer: str, eps: str | None) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _alert_unreadable(what: str, eps: str | None, answer: str | None) -> None:
+    raw = str(answer or "").strip()
+    masked = re.sub(r"[\w.+-]+@[\w.-]+", "<email>", raw)
+    if re.fullmatch(r"[\w\-. /]+\.(csv|xlsx|txt|json)", raw.strip("` \n"), re.I):
+        detail = f"o agente salvou um arquivo ({raw[:80]}) em vez de mandar o CSV na resposta"
+    else:
+        detail = f"início da resposta: {masked[:300] or '(vazia)'}"
+    _alert(f"{what} ({eps or 'iFood'}): não li a resposta do agente — {detail}")
+
+
 def _fetch_weekly_rows(eps: str | None) -> dict[str, dict[str, Any]] | None:
     """e-mail -> {q4: semanas no Q4, n: semanas com amostra, csats: CSAT s1..s4 (None sem amostra), fila}."""
     answer = _ask_cached(_weeks_prompt(eps))
@@ -3288,9 +3335,7 @@ def _fetch_weekly_rows(eps: str | None) -> dict[str, dict[str, Any]] | None:
         return None
     out = _parse_weeks_csv(answer, eps)
     if not out:
-        masked = re.sub(r"[\w.+-]+@[\w.-]+", "<email>", str(answer or "")).strip()
-        _alert(f"Reincidentes 4 semanas ({eps or 'iFood'}): não li a resposta do agente. Início da resposta: "
-               f"{masked[:300] or '(vazia)'}")
+        _alert_unreadable("Reincidentes 4 semanas", eps, answer)
         with _BASE_LOCK:  # não guarda resposta ilegível no cache
             for k in [k for k, v in _BASE_CACHE.items() if v[1] == answer]:
                 _BASE_CACHE.pop(k, None)
@@ -3308,7 +3353,7 @@ def _send_reincidentes(event: dict[str, Any], client: Any, eps: str | None, ques
                        say: Callable[..., Any], in_thread: bool) -> str | None:
     """Ranking de reincidência no Q4 nas 4 últimas semanas (semanas com 5+ pesquisas), por fila/EPS citada."""
     if eps is None:
-        eps = _eps_in_text(question)
+        eps = _eps_of_question(question)
     weeks = _fetch_weekly_rows(eps)
     if not weeks:
         return "Não consegui puxar as últimas 4 semanas dos operadores agora. Tenta de novo em alguns minutos?"
@@ -3350,7 +3395,7 @@ def _send_team_view(event: dict[str, Any], client: Any, eps: str | None, questio
                     say: Callable[..., Any], in_thread: bool) -> str | None:
     """Resultado da equipe de um supervisor/coordenador (ou de todos os supervisores), com Δ vs período anterior."""
     if eps is None:
-        eps = _eps_in_text(question)
+        eps = _eps_of_question(question)
     people = _mop_people(eps)
     if not people:
         return "Não consegui ler o MOP para montar as equipes agora. Tenta de novo em alguns minutos?"
@@ -3358,12 +3403,22 @@ def _send_team_view(event: dict[str, Any], client: Any, eps: str | None, questio
     if kind == "none":
         return ("Não achei você como supervisor(a) ou coordenador(a) no MOP. Me diz de quem é a equipe "
                 "(ex.: \"resultado da equipe da Supervisora 3\").")
+    if eps is None and kind in {"sup", "coord"}:  # equipe citada pelo nome: a EPS vem do MOP
+        field = "supervisor" if kind == "sup" else "coordenador"
+        team_eps = {p.get("eps") for p in people.values() if _norm_text(p[field]) == _norm_text(leader)} - {"", None}
+        if len(team_eps) == 1:
+            eps = team_eps.pop()
+            people = {e: p for e, p in people.items() if _eps_matches(p.get("eps") or "", eps)}
     spec = _period_spec(question)
     results: dict[str, Any] = {}
+    team_emails = None
+    if kind in {"sup", "coord"}:
+        field = "supervisor" if kind == "sup" else "coordenador"
+        team_emails = [e for e, p in people.items() if _norm_text(p[field]) == _norm_text(leader)] or None
 
     def load(key: str, period: str) -> None:
         try:
-            results[key] = _fetch_operator_rows(eps, period)
+            results[key] = _fetch_operator_rows(eps, period, team_emails)
         except Exception:
             logger.exception("Team view: operator base failed (%s)", key)
             results[key] = None
@@ -4174,7 +4229,7 @@ PLAN_INSTRUCTION = (
     "INFORMAÇÃO INTERNA PARA A LYRA: pedido de sugestão de plano de ação. Antes de responder, chame a *Lyra Conhecimento* "
     "com `Pedido: quais fluxos e políticas valem para <o motivo/problema da fila> e o que é decisão da operação x do iFood` "
     "e siga as regras de plano do seu prompt: nenhum passo de compensação/voucher/cupom/estorno/cancelamento fora da matriz "
-    "de decisão; causa só a que o dado mostra (use a Leitura do report desta thread); número no recorte certo (fila x motivo); "
+    "de decisão; causa só a que o dado mostra (use a Leitura do report desta thread; FORA de uma thread de report, NÃO peça a Leitura nem o motivo para a pessoa: busque você mesma — chame a *Lyra Indicadores* com `Pedido: problema da fila` (motivo de maior impacto no mês e no D-1, quadrantes e dispersão) e a *Lyra Qualidade* com `Pedido: plano de ação` — e monte o plano em cima disso, dizendo o recorte usado); número no recorte certo (fila x motivo); "
     "interações por ticket não é reabertura nem FCR; régua nova só como 'sugestão a validar'; não diga que tem/segue planilha "
     "ou arquivo; nada de sanção ou RH. No máximo 3 ações (o quê · quem · prazo · como medir), curtas.\n\n"
 )
@@ -4277,7 +4332,9 @@ def _variation_prompt(eps: str | None, fila: str, cur: tuple[date, date], ref: t
         '"top_performance": [{"motivo": "cobrança não reconhecida", "csat_ref": 92.0, "csat_atual": 88.0, "share_atual": 9.0, "efeito_pp": -0.36}], '
         '"rr_ref": 27.1, "rr_atual": 26.9, '
         '"leitura": "1 frase factual sobre o que os números mostram, sem afirmar nada que eles não mostrem"}\n'
-        "Percentuais em %, p.p. com sinal. Até 3 motivos em cada lista. Se a consulta falhar: só ERRO: <motivo>."
+        "Percentuais em %, p.p. com sinal. Até 3 motivos em cada lista: os que mais contribuíram NA DIREÇÃO do efeito "
+        "(efeito negativo: os que mais tiraram; positivo: os que mais somaram). motivo = nome de negócio em português "
+        "(ex.: 'Item errado'), nunca o código (order__wrong_item). Se a consulta falhar: só ERRO: <motivo>."
     )
 
 
@@ -4297,6 +4354,31 @@ def _mix_dominant(data: dict[str, Any]) -> bool:
     return abs(mix) >= MIX_DOMINANT_SHARE * abs(total) and perf >= -MIX_PERF_TOLERANCE_PP
 
 
+_MOTIVO_LABELS = {
+    "order__wrong_item": "Item errado", "order__missing_item": "Item faltante", "order__not_delivered": "Pedido não entregue",
+    "order__late": "Pedido atrasado", "order__late_order": "Pedido atrasado", "order__chat_ifood_vip": "Chat iFood VIP",
+    "order__want_to_exchange": "Quer trocar o pedido", "order__logistics_handshake": "Problema na entrega (handshake)",
+    "order__cancel": "Cancelamento de pedido", "order__cancel_order": "Cancelamento de pedido",
+    "order__inedible_item": "Item impróprio para consumo", "order__damaged_item": "Item danificado",
+    "order__refund": "Reembolso", "order__charge": "Cobrança do pedido", "ifood_box__cannot_unlock_box": "iFood Box não abre",
+    "club__unrecognized_charge": "Cobrança não reconhecida do Clube", "club__cancel": "Cancelamento do Clube",
+}
+
+
+def _motivo_label(raw: Any) -> str:
+    """Código do motivo de contato (order__wrong_item) -> nome de negócio. Código desconhecido vira texto legível."""
+    text = str(raw or "").strip()
+    key = text.lower()
+    if key in _MOTIVO_LABELS:
+        return _MOTIVO_LABELS[key]
+    if "__" in text or re.fullmatch(r"[a-z0-9_]+", text):
+        parts = [p for p in text.split("__") if p]
+        body = (parts[-1] if parts else text).replace("_", " ").strip()
+        prefix = parts[0].replace("_", " ") if len(parts) > 1 and parts[0] not in {"order"} else ""
+        return (f"{body} ({prefix})" if prefix else body).capitalize()
+    return text
+
+
 def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref: str) -> str | None:
     c_ref, c_cur = _num(data.get("csat_ref")), _num(data.get("csat_atual"))
     if c_ref is None or c_cur is None:
@@ -4313,10 +4395,10 @@ def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref
     if mix is not None:
         lines.append("")
         lines.append(f"🔀 *Efeito mix: {sign(mix)} p.p.* — mudou o tipo de contato que chegou")
-        for m in (data.get("top_mix") or [])[:3]:
-            if not isinstance(m, dict):
-                continue
-            part = f"• {m.get('motivo')}: {_bfmt(_num(m.get('share_ref')) or 0)}% → {_bfmt(_num(m.get('share_atual')) or 0)}% das avaliações"
+        top_mix = sorted([m for m in (data.get("top_mix") or []) if isinstance(m, dict)],
+                         key=lambda m: (_num(m.get("efeito_pp")) or 0) * (1 if mix > 0 else -1), reverse=True)
+        for m in top_mix[:3]:
+            part = f"• {_motivo_label(m.get('motivo'))}: {_bfmt(_num(m.get('share_ref')) or 0)}% → {_bfmt(_num(m.get('share_atual')) or 0)}% das avaliações"
             if m.get("csat_ref") is not None:
                 part += f" (CSAT {_bfmt(_num(m['csat_ref']) or 0)}%)"
             if m.get("efeito_pp") is not None:
@@ -4325,10 +4407,10 @@ def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref
     if perf is not None:
         lines.append("")
         lines.append(f"🎯 *Efeito performance: {sign(perf)} p.p.* — mudou o atendimento do mesmo motivo")
-        for m in (data.get("top_performance") or [])[:3]:
-            if not isinstance(m, dict):
-                continue
-            part = f"• {m.get('motivo')}: CSAT {_bfmt(_num(m.get('csat_ref')) or 0)}% → {_bfmt(_num(m.get('csat_atual')) or 0)}%"
+        top_perf = sorted([m for m in (data.get("top_performance") or []) if isinstance(m, dict)],
+                          key=lambda m: (_num(m.get("efeito_pp")) or 0) * (1 if perf > 0 else -1), reverse=True)
+        for m in top_perf[:3]:
+            part = f"• {_motivo_label(m.get('motivo'))}: CSAT {_bfmt(_num(m.get('csat_ref')) or 0)}% → {_bfmt(_num(m.get('csat_atual')) or 0)}%"
             if m.get("efeito_pp") is not None:
                 part += f" · {sign(_num(m['efeito_pp']) or 0)} p.p."
             lines.append(part)
@@ -4344,7 +4426,11 @@ def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref
     if leitura:
         lines.append("")
         lines.append(f"💡 {leitura}")
-    if _mix_dominant(data):
+    if total >= 0:
+        lines.append(f"👉 *Leitura:* o CSAT não caiu: {'subiu ' + sign(total) + ' p.p.' if total > 0 else 'ficou estável'} "
+                     f"contra {label_ref}" + (", puxado pelo atendimento (efeito performance positivo)" if perf and perf > 0
+                                               else "") + ". Nada a cobrar da EPS nessa comparação.")
+    elif _mix_dominant(data):
         lines.append(f"👉 *Leitura:* a queda vem do efeito mix ({sign(mix)} p.p.): chegou mais contato de motivo com CSAT "
                      "naturalmente menor, e o atendimento de cada motivo se manteve. Não é caso de plano de ação da EPS; "
                      "é contexto para acompanhar o volume desses motivos.")
@@ -5133,6 +5219,17 @@ DM_CONTEXT_MESSAGES = 12
 DM_CONTEXT_HOURS = 3
 
 
+_FOLLOWUP_RE = re.compile(r"^(e|e a|e o|e da|e do|e na|e no|e pra|e para|agora|mesma|mesmo|tambem|isso|dessa|desse|"
+                          r"desses|dessas|dela|dele|deles|ontem|hoje|no mes|na semana|da aec|da csu|e ontem)\b")
+
+
+def _is_followup_text(text: str) -> bool:
+    """Mensagem que só completa a anterior ("e a da CSU?", "ontem", "e no mês?"): curta ou começando como
+    continuação. Pergunta completa vira conversa nova, sem carregar as anteriores."""
+    t = _norm_text(_strip_mentions(text))
+    return len(t.split()) <= 3 or bool(_FOLLOWUP_RE.match(t))
+
+
 def _dm_context(event: dict[str, Any]) -> str:
     """DM: manda junto as últimas mensagens da conversa (ou da thread da DM), para 'ontem' ou 'da AeC' completar o
     pedido anterior em vez de virar pergunta nova."""
@@ -5144,6 +5241,8 @@ def _dm_context(event: dict[str, Any]) -> str:
         if thread_ts and thread_ts != str(event.get("ts") or ""):
             messages = _fetch_thread(channel, thread_ts)
         else:
+            if not _is_followup_text(str(event.get("text") or "")):
+                return ""  # pergunta completa na conversa principal: não mistura com as anteriores
             oldest = str(time.time() - DM_CONTEXT_HOURS * 3600)
             resp = slack_app.client.conversations_history(channel=channel, limit=DM_CONTEXT_MESSAGES + 1, oldest=oldest)
             messages = list(reversed(resp.get("messages") or []))
@@ -5302,7 +5401,9 @@ ANSWER_LAYOUT_INSTRUCTION = (
     "📍 *Resultado* · 👥 *Por supervisor* · 👤 *Operadores* · 💡 *Leitura* (1 a 3 linhas começando com ↳: o que o "
     "número quer dizer e onde agir).\n"
     "Linhas curtas: • <o quê> *<valor>* → 🔴/🟢 <vs meta ou vs período anterior> (n=<avaliações>). Ranking numerado "
-    "(1., 2., ...), um item por linha, no máximo 10. Operador: só o usuário do e-mail, sem crase (o app põe o nome). "
+    "(1., 2., ...), um item por linha, no máximo 10. A regra do recorte (mínimo de avaliações, quantos ficaram de fora) vai "
+    "em UMA linha em itálico logo abaixo do título, sem linha em branco antes da lista. A Leitura fala do resultado, nunca "
+    "do escopo ou da segregação entre EPSs. Operador: só o usuário do e-mail, sem crase (o app põe o nome). "
     "Nome de pessoa sem CAIXA ALTA. Sem crase em nada além do nome da fila/EPS no título. Não repita a mesma "
     "informação em duas seções. Não escreva mensagens de andamento ('processando', 'aguarde').\n\n")
 
@@ -5430,7 +5531,7 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             return
 
         if _is_mop_export_request(question):
-            problem = _send_mop_export(event, client, eps)
+            problem = _send_mop_export(event, client, eps or _eps_in_text(question))
             if problem:
                 _say(say, problem, event, in_thread)
             return
@@ -5468,7 +5569,8 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
                 rendered = _render_variation(fila_v, var_data, l_cur, l_ref) if var_data else None
                 if rendered:
                     _say_sections(say, rendered, event)
-                    if not _mix_dominant(var_data):
+                    rose = (_num(var_data.get("csat_atual")) or 0) >= (_num(var_data.get("csat_ref")) or 0)
+                    if not _mix_dominant(var_data) and not rose:
                         threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
                     return
                 threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
