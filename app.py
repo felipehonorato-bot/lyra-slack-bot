@@ -26,6 +26,11 @@ v5.13 — Respostas grandes no visual do report diário (o report em si não mud
         motivo pelo nome de negócio, lista na direção do efeito e, se o CSAT subiu, sem cobrança nem esteira. MOP pedido
         na visão completa ("MOP da AeC") sai só da EPS citada. Pedido de plano fora da thread do report: a Lyra busca o
         problema da fila sozinha. Na DM, só mensagem curta/de continuação puxa a conversa anterior.
+        Aprendizados: quem é do iFood pode ensinar a Lyra na conversa ("da próxima vez traz o n"); o app extrai o
+        aprendizado, guarda na aba "Aprendizados" (escopo Todos/AeC/CSU), confirma na thread, avisa no canal de alerta
+        e manda os ativos (até 30) junto de toda conversa do escopo. Meta, cálculo, política e cobrança não viram
+        aprendizado. "o que você aprendeu?" lista; "esquece o aprendizado N" desativa (só iFood). LEARNINGS=0 desliga.
+        Perguntas sobre a própria Lyra (quem é, nome/constelação, como aprende) têm instrução própria.
 
 v5.12 — Visão de equipe ("minha equipe", "equipe da X", "por supervisor"): pelo MOP (supervisor/coordenador) e pela
         base de operadores do período (com o anterior para o Δ: D-1 x D-8, semana x semana, mês x mesmos dias), traz
@@ -4207,6 +4212,68 @@ CLUBE_INSTRUCTION = (
     "Lyra Conhecimento para Clube e não complete com conhecimento geral.\n\n"
 )
 
+_IDENTITY_RE = re.compile(r"\b(quem (e|eh) (voce|vc|tu|a lyra)|quem (e|eh) a lyra|o que (voce|vc) faz|o que a lyra faz|"
+                          r"(por que|pq|porque) (o nome |seu nome |o seu nome )?lyra|de onde vem (o nome|seu nome)|"
+                          r"se apresenta|apresente se|me fala de voce|fala sobre voce|de onde (voce|vc|a lyra) (veio|vem|surgiu)|"
+                          r"quem (te )?(criou|fez|construiu|desenvolveu)|quem criou a lyra|como (voce|vc) (surgiu|nasceu)|"
+                          r"(qual|me conta) (e )?(a )?(sua )?historia|o que significa lyra|significado (do nome|de lyra))\b")
+
+
+_SELF_TOPIC_RE = re.compile(r"\b(constelacao|vega|orfeu|lira|seu nome|teu nome|nome lyra|aprende\w*|feedbacks?|memoria|"
+                            r"lembra\w*|criou|criada|criado|robo|bot|ia|inteligencia artificial|agente|funciona|"
+                            r"consegue fazer|sabe fazer|limitac\w*|erra|errou|treinad\w*|seus dados|de onde (tira|vem) (os|seus))\b")
+_SELF_REF_RE = re.compile(r"\b(voce|vc|tu|te|seu|sua|seus|suas|lyra)\b")
+
+
+def _is_identity_question(question: str) -> bool:
+    """Pergunta sobre a própria Lyra (quem é, origem do nome, como aprende, o que faz, limites). Nunca vai para a
+    base de processos."""
+    t = _norm_text(question).replace("-", " ")
+    if _IDENTITY_RE.search(t):
+        return True
+    return bool(_SELF_TOPIC_RE.search(t)) and (bool(_SELF_REF_RE.search(t)) or len(t.split()) <= 4)
+
+
+def _identity_thread(event: dict[str, Any], question: str) -> bool:
+    """Continuação curta numa thread que começou com "quem é você?" ("e a constelação?")."""
+    thread_ts = str(event.get("thread_ts") or "")
+    if not thread_ts or thread_ts == str(event.get("ts") or "") or len(_norm_text(question).split()) > 8:
+        return False
+    try:
+        root = next((m for m in _fetch_thread(str(event.get("channel") or ""), thread_ts) if m.get("ts") == thread_ts), {})
+    except Exception:
+        return False
+    return _is_identity_question(_strip_mentions(str(root.get("text") or "")))
+
+
+IDENTITY_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA — APRESENTAÇÃO: a pessoa quer saber quem você é. Responda sem chamar subagente, "
+    "em até 6 linhas, tom leve e próximo:\n"
+    "1) Você é a Lyra, a primeira agente que faz a gestão de EPS no iFood CX (hoje AeC e CSU): acompanha resultado, "
+    "cobra e critica plano de ação, registra compromissos e cuida da governança, para o time focar no estratégico sem "
+    "perder a governança das EPSs. Na apresentação completa, diga em meia frase que você aprende com o time do iFood. "
+    "Se perguntarem de onde você veio ou quem te criou: você foi criada pelo time de CX "
+    "do iFood, que gere as EPSs, para assumir o dia a dia dessa gestão (não diga que não sabe e não mande para o One Hub).\n"
+    "2) O nome: Lyra (Lira) é a constelação da lira de Orfeu, o músico da mitologia grega que encantava tudo com a sua "
+    "música. A estrela mais brilhante dela é a Vega, uma das mais brilhantes do céu, que já foi a estrela-guia do norte "
+    "e volta a ser daqui a uns 12 mil anos. Como a lira, você afina vários instrumentos juntos (seus especialistas de "
+    "indicadores, qualidade, processos, Clube e crises); como a Vega, ajuda a operação a se orientar.\n"
+    "Se a pergunta for sobre um ponto específico (o nome, a constelação, como você aprende, o que você faz, de onde vêm "
+    "seus números, seus limites), responda SÓ esse ponto, em 2 a 4 linhas, usando o que está aqui:\n"
+    "• Como você aprende: você aprende com o time do iFood. Quem é do iFood pode te corrigir ou ensinar direto na "
+    "conversa (ex.: \"da próxima vez traz o n junto do CSAT\", \"não chama de ofensor, chama de Q4\"): você anota e "
+    "passa a usar nas próximas conversas. Dá para ver o que você aprendeu (\"o que você aprendeu?\") e tirar um "
+    "aprendizado. Meta, regra de cálculo e política não mudam por aprendizado: são regras do iFood. Mudanças maiores "
+    "(coisas novas que você passa a fazer) vêm do time de CX que cuida de você.\n"
+    "• De onde vêm seus números: das bases oficiais de atendimento do iFood (as mesmas do Cockpit do time), do MOP e "
+    "dos controles que as EPSs postam. Você não inventa número: o que não tem, você diz que não tem.\n"
+    "• Limites: você não decide política nem compensação (isso é do iFood), não pune ninguém e não fala de uma EPS no "
+    "canal da outra.\n"
+    "NUNCA responda pergunta sobre você com 'não sei' nem mande para o One Hub.\n"
+    "3) Na apresentação completa, feche com 2 ou 3 exemplos curtos do que a pessoa pode te pedir (ex.: \"como está a CX Suporte ontem?\", "
+    "\"quem são os reincidentes da AeC?\", \"teve crise ontem?\").\n\n"
+)
+
 KNOWLEDGE_INSTRUCTION = (
     "INFORMAÇÃO INTERNA PARA A LYRA: esta é uma dúvida de processo, política ou agente de IA. Chame o subagente "
     "*Lyra Conhecimento* com `Pedido: <a pergunta, completa>` (uma chamada por pergunta, se houver mais de uma) e "
@@ -5438,6 +5505,196 @@ DEFAULTS_INSTRUCTION = (
     "frase o recorte que usou. Só pergunte quando for impossível responder sem a informação.\n\n")
 
 
+# ---------------------------------------------------------------------------
+# Aprendizados: quem é do iFood pode ensinar a Lyra na conversa ("da próxima vez traz o n", "não chama de ofensor,
+# chama de Q4"). O app guarda na aba "Aprendizados" e manda os ativos junto de toda conversa do escopo. Não vale para
+# meta, regra de cálculo, política nem regra de cobrança.
+# ---------------------------------------------------------------------------
+LEARNINGS_WORKSHEET_TITLE = "Aprendizados"
+LEARNINGS_HEADERS = ["ID", "Data", "Aprendizado", "Escopo", "Quem ensinou", "Origem", "Status"]
+LEARNINGS_MAX_ACTIVE = int(os.getenv("LEARNINGS_MAX_ACTIVE", "30"))
+LEARNINGS_ENABLED = os.getenv("LEARNINGS", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+_LEARNINGS_CACHE: dict[str, Any] = {"at": 0.0, "rows": None}
+_LEARNINGS_LOCK = threading.Lock()
+_TEACH_RE = re.compile(
+    r"\b(aprend[ae]|anota|anote|guarda|guarde|grava|lembr[ae] (que|disso|de)|da proxima vez|das proximas vezes|"
+    r"a partir de agora|de agora em diante|nao e assim|nao eh assim|na verdade|o certo e|o correto e|esta errad\w*|"
+    r"ta errad\w*|voce errou|vc errou|errou|corrig\w*|sempre que|nunca mais|nao chama de|chama de|chame de|"
+    r"prefiro que|quero que (voce|vc) (sempre|nunca))\b")
+_TEACH_STRONG_RE = re.compile(
+    r"\b(aprend[ae]|anota|anote|guarda|guarde|lembr[ae] (que|disso)|da proxima vez|das proximas vezes|a partir de agora|"
+    r"de agora em diante|nao e assim|nao eh assim|o certo e|o correto e|nao chama de|chame de|prefiro que|"
+    r"quero que (voce|vc) (sempre|nunca)|voce errou|vc errou)\b")
+_LEARN_LIST_RE = re.compile(r"\b(o que (voce|vc) (ja )?aprendeu|seus aprendizados|lista (os|de) aprendizados|"
+                            r"quais (sao )?(os )?(seus )?aprendizados)\b")
+_LEARN_FORGET_RE = re.compile(r"\b(esquece|esqueca|apaga|apague|remove|remova|desativa|desative)\b.*\baprendizado\s*#?(\d+)")
+
+
+def _is_ifood_user(user: str) -> bool:
+    if not user:
+        return False
+    try:
+        allowed, eps = _dm_scope(user)
+    except Exception:
+        return False
+    return allowed and eps is None
+
+
+def _learnings_ws() -> Any | None:
+    google_client = _safe_google_client()
+    if google_client is None:
+        return None
+    try:
+        return _ensure_worksheet(_open_spreadsheet(google_client), LEARNINGS_WORKSHEET_TITLE, LEARNINGS_HEADERS)
+    except Exception:
+        logger.warning("Could not open Aprendizados worksheet", exc_info=True)
+        return None
+
+
+def _learnings_rows(force: bool = False) -> list[tuple[int, dict[str, str]]]:
+    with _LEARNINGS_LOCK:
+        if not force and _LEARNINGS_CACHE["rows"] is not None and time.time() - _LEARNINGS_CACHE["at"] < 300:
+            return _LEARNINGS_CACHE["rows"]
+    ws = _learnings_ws()
+    rows = _worksheet_rows_with_header(ws) if ws is not None else []
+    with _LEARNINGS_LOCK:
+        _LEARNINGS_CACHE.update(at=time.time(), rows=rows)
+    return rows
+
+
+def _active_learnings(eps: str | None) -> list[dict[str, str]]:
+    """Ativos do escopo (Todos + a EPS do canal; visão completa vê todos), os mais recentes primeiro."""
+    out = []
+    for _, r in _learnings_rows():
+        if _norm_text(r.get("Status")) != "ativo":
+            continue
+        escopo = str(r.get("Escopo") or "Todos").strip()
+        if eps and _norm_text(escopo) not in {"todos", _norm_text(eps)}:
+            continue
+        out.append(r)
+    out.sort(key=lambda r: _to_int(r.get("ID")), reverse=True)
+    return out[:LEARNINGS_MAX_ACTIVE]
+
+
+def _learnings_instruction(eps: str | None) -> str:
+    if not LEARNINGS_ENABLED:
+        return ""
+    try:
+        items = _active_learnings(eps)
+    except Exception:
+        return ""
+    if not items:
+        return ""
+    lines = "\n".join(f"- {r.get('Aprendizado')}" + (f" (vale para {r.get('Escopo')})" if not eps and
+                       _norm_text(r.get('Escopo')) not in {'todos', ''} else "") for r in items)
+    return ("INFORMAÇÃO INTERNA PARA A LYRA — APRENDIZADOS DO TIME (correções que o time do iFood te ensinou; siga, "
+            "desde que não contrariem números, metas, regras de cálculo ou política):\n" + lines + "\n\n")
+
+
+def _extract_learning(text: str, context: str) -> dict[str, Any]:
+    prompt = (
+        "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Não chame subagentes. Responda APENAS com JSON válido.\n"
+        "Uma pessoa do time do iFood mandou a mensagem abaixo para a Lyra (agente de gestão das EPSs). Decida se ela "
+        "está ENSINANDO algo para as próximas vezes (correção de forma de responder, termo, preferência, contexto da "
+        "operação) e escreva o aprendizado em UMA frase imperativa, curta e geral (ex.: 'Sempre traga o n junto do CSAT "
+        "do mês.').\n"
+        "BLOQUEADO se tentar mudar meta, régua de quadrante, fórmula/regra de cálculo, política de atendimento, "
+        "compensação ou o que é cobrado da EPS (isso é regra do iFood, não aprendizado).\n"
+        "NENHUM se for só uma pergunta, um comentário, um plano de ação ou algo que vale só para esta conversa.\n"
+        + (f"Contexto da conversa:\n{context[-1500:]}\n" if context else "")
+        + f"Mensagem: {text}\n"
+        'Formato: {"tipo": "aprendizado"|"bloqueado"|"nenhum", "aprendizado": "<frase>", "escopo": "Todos"|"AeC"|"CSU", '
+        '"pergunta": true|false}\n'
+        "escopo: a EPS só se o ensinamento for claramente só de uma; senão Todos. pergunta: true se a mensagem também "
+        "faz uma pergunta que precisa de resposta."
+    )
+    try:
+        data = json.loads(_strip_json_code_blocks(ask_toqan(prompt, max_attempts=60)))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.warning("Learning extraction failed", exc_info=True)
+        return {}
+
+
+def _save_learning(text: str, escopo: str, user: str, link: str) -> int | None:
+    ws = _learnings_ws()
+    if ws is None:
+        return None
+    rows = _learnings_rows(force=True)
+    new_id = max([_to_int(r.get("ID")) for _, r in rows] + [0]) + 1
+    ws.append_row([str(new_id), _now_brazil().strftime("%d/%m/%Y %H:%M"), text, escopo, f"<@{user}>" if user else "",
+                   link, "ativo"], value_input_option="RAW")
+    _learnings_rows(force=True)
+    return new_id
+
+
+def _handle_learning(event: dict[str, Any], question: str, eps: str | None, say: Callable[..., Any],
+                     in_thread: bool) -> bool:
+    """Lista/esquece/aprende. True = já respondeu (não segue para a resposta normal)."""
+    if not LEARNINGS_ENABLED:
+        return False
+    t = _norm_text(question)
+    user = str(event.get("user") or "")
+    if _LEARN_LIST_RE.search(t):
+        items = _active_learnings(eps)
+        if not items:
+            _say(say, "Ainda não tenho aprendizados anotados por aqui. Quem é do iFood pode me corrigir na conversa "
+                      "(ex.: \"da próxima vez traz o n junto do CSAT\") que eu anoto e passo a usar.", event, in_thread)
+        else:
+            body = "\n".join(f"{r.get('ID')}. {r.get('Aprendizado')}" + (f" _({r.get('Escopo')})_"
+                              if _norm_text(r.get('Escopo')) not in {'todos', ''} else "") for r in items)
+            _say_sections(say, f"🧠 *Aprendizados ·* `{eps or 'todos'}` *—* {len(items)} ativos\n\n{body}\n\n"
+                               "_Para tirar um: \"esquece o aprendizado 3\"._", event, in_thread)
+        return True
+    m = _LEARN_FORGET_RE.search(t)
+    if m:
+        if not _is_ifood_user(user):
+            _say(say, "Só o time do iFood consegue mexer nos meus aprendizados.", event, in_thread)
+            return True
+        ws = _learnings_ws()
+        hit = next(((n, r) for n, r in _learnings_rows(force=True) if str(r.get("ID")) == m.group(2)), None)
+        if ws is None or not hit:
+            _say(say, f"Não achei o aprendizado {m.group(2)}.", event, in_thread)
+            return True
+        ws.update_cell(hit[0], LEARNINGS_HEADERS.index("Status") + 1, "inativo")
+        _learnings_rows(force=True)
+        _say(say, f"Pronto, esqueci o aprendizado {m.group(2)}: _{hit[1].get('Aprendizado')}_", event, in_thread)
+        return True
+    if not _TEACH_RE.search(t):
+        return False
+    if _is_question_like(question) and not _TEACH_STRONG_RE.search(t):
+        return False  # "quem errou mais?" é pergunta, não ensinamento
+    if not _is_ifood_user(user):
+        return False
+    context = _thread_context(event) or _dm_context(event)
+    got = _extract_learning(question, context)
+    tipo = str(got.get("tipo") or "").lower()
+    if tipo == "bloqueado":
+        _say(say, "Isso mexe em meta, regra de cálculo, política ou no que é cobrado da EPS, então não guardo como "
+                  "aprendizado: é regra do iFood e muda pelo time que cuida de mim.", event, in_thread)
+        return not got.get("pergunta")
+    texto = str(got.get("aprendizado") or "").strip()
+    if tipo != "aprendizado" or not texto:
+        return False
+    escopo = str(got.get("escopo") or "Todos").strip()
+    if escopo not in {"Todos", *EPS_CELULAS}:
+        escopo = "Todos"
+    if eps and escopo == "Todos" and str(event.get("channel_type")) != "im":
+        escopo = eps  # ensinado no canal de uma EPS vale para ela
+    new_id = None
+    try:
+        new_id = _save_learning(texto, escopo, user, _permalink(str(event.get("channel") or ""), str(event.get("ts") or "")))
+    except Exception:
+        logger.warning("Could not save learning", exc_info=True)
+    if new_id is None:
+        _alert(f"Aprendizado não foi salvo (planilha indisponível): {texto}")
+        return False
+    _say(say, f"Anotado ✅ Aprendizado {new_id}: _{texto}_" + (f" (vale para {escopo})" if escopo != "Todos" else ""),
+         event, in_thread)
+    _alert(f"Aprendizado {new_id} novo ({escopo}) por <@{user}>: {texto}")
+    return not got.get("pergunta")
+
+
 def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bool, client: Any = None) -> None:
     """Processa upload de MOP ou repassa a mensagem para o Toqan."""
     event_key = _event_key(event)
@@ -5482,6 +5739,11 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             _say(say, _agents_summary(_run_agent_checks(_now_brazil())), event, in_thread)
             return
 
+        try:
+            if _handle_learning(event, question, eps, say, in_thread):
+                return
+        except Exception:
+            logger.warning("Learning handling failed", exc_info=True)
         in_report_thread = bool(_report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or "")))
         asks = _is_question_like(question)
         analytical = _is_analytical(question)  # "por que", "quem piorou", "quanto contribuiu": análise livre
@@ -5578,7 +5840,9 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
                          "Produto) é postada separadamente pelo app nesta thread. NÃO chame a Lyra Qualidade e NÃO liste pilares: "
                          "chame só a Lyra Indicadores (Pedido: variação do CSAT) e responda a variação (efeito mix x performance "
                          "e response rate). Feche com 1 frase sobre o que é da EPS cobrar.\n\n")
-        if not extra and _is_plan_request(question):
+        if not extra and (_is_identity_question(question) or _identity_thread(event, question)):
+            extra = IDENTITY_INSTRUCTION
+        elif not extra and _is_plan_request(question):
             extra = PLAN_INSTRUCTION
         elif not extra and _is_clube_question(question) and not _DATA_WORDS_RE.search(_norm_text(question)):
             extra = CLUBE_INSTRUCTION
@@ -5587,7 +5851,7 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
         context = _thread_context(event) or _dm_context(event)
         prompt = (f"{_scope_instruction(eps)}\n\n{_date_context(question)}{context}{extra}"
                   f"{DEFAULTS_INSTRUCTION if not extra else ''}{FULL_ACCESS_INSTRUCTION if _operator_names_allowed(eps) else ''}"
-                  f"{ANSWER_LAYOUT_INSTRUCTION}{_inject_mop_context(question, eps)}")
+                  f"{ANSWER_LAYOUT_INSTRUCTION}{_learnings_instruction(eps)}{_inject_mop_context(question, eps)}")
         answer = _recent_answer(prompt)
         if answer is None:
             try:
