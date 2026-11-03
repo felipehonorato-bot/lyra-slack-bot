@@ -693,7 +693,11 @@ def _madrugada_line(eps: str | None) -> str:
 
 def _scope_instruction(eps: str | None) -> str:
     """Bloco de escopo injetado em toda mensagem enviada ao Toqan."""
-    return _scope_instruction_base(eps) + _madrugada_line(eps)
+    try:
+        metas = "\n" + _metas_text(eps)
+    except Exception:
+        metas = ""
+    return _scope_instruction_base(eps) + _madrugada_line(eps) + metas
 
 
 def _scope_instruction_base(eps: str | None) -> str:
@@ -4161,6 +4165,7 @@ def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str]
 
 
 _LAST_BLOCK_DATA: dict[str, dict[str, Any]] = {}
+REPORT_METAS_FROM_APP = os.getenv("REPORT_METAS_FROM_APP", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
 
 
 def _prepare_blocks(blocks: list[tuple[str, str]], day: date) -> list[tuple[str, str, str]]:
@@ -4169,6 +4174,9 @@ def _prepare_blocks(blocks: list[tuple[str, str]], day: date) -> list[tuple[str,
     prepared = []
     for fila, text in blocks:
         data = _block_data_from_json(text) or _block_data_from_text(text)
+        meta_mes = _meta_fila(fila, day)
+        if meta_mes is not None and REPORT_METAS_FROM_APP:
+            data["meta"] = meta_mes  # meta combinada do mês (a mesma de toda a Lyra)
         status = _block_status(data)
         if status == "sem_volume":
             continue
@@ -4257,12 +4265,82 @@ def _esteira_prompt(tenant: Tenant, fila: str, gap: float, day: date) -> str:
     )
 
 
-# Metas de CSAT por fila (as mesmas do prompt da Lyra Indicadores). Usadas na esteira sob demanda.
-FILA_METAS: dict[str, float] = {
-    "CX Suporte": 70, "Madrugada": 70, "CX Review - AeC": 70, "CX Super Cliente - AeC": 94,
-    "CX Review - CSU": 70, "CX Super Cliente - CSU": 94, "PF Cancelamento": 80, "PF Super Clientes": 88,
-    "PF Revisão Manual": 85, "CX Denúncia": 85,
+# Metas de CSAT combinadas (out/2026 a mar/2027), por grupo de meta e mês. Mês fora da tabela: usa o mais próximo.
+_META_MONTHS = [(2026, 10), (2026, 11), (2026, 12), (2027, 1), (2027, 2), (2027, 3)]
+META_GRUPOS: dict[str, list[float]] = {          # Out, Nov, Dez, Jan, Fev, Mar
+    "CX Suporte": [74, 74, 74, 75, 75, 75],
+    "Review": [71, 72, 72, 73, 73, 74],
+    "CX Madrugada": [53, 54, 55, 56, 57, 59],
+    "Revisão Manual": [92, 92, 92, 92, 92, 93],
+    "CX Super Cliente": [91, 92, 92, 92, 93, 93],
+    "Super clientes PF": [97, 97, 97, 97, 97, 97],
+    "PF Cancelamento": [91, 92, 92, 93, 93, 94],
+    "BKO PF": [69, 70, 71, 72, 72, 73],
+    "CX Denúncia": [68, 69, 70, 71, 71, 72],
+    "Geral": [79, 79, 79, 80, 80, 81],
 }
+FILA_GRUPO_META = {
+    "CX Suporte": "CX Suporte", "CX Review - AeC": "Review", "CX Review - CSU": "Review", "Madrugada": "CX Madrugada",
+    "PF Revisão Manual": "Revisão Manual", "CX Super Cliente - AeC": "CX Super Cliente",
+    "CX Super Cliente - CSU": "CX Super Cliente", "PF Super Clientes": "Super clientes PF",
+    "PF Cancelamento": "PF Cancelamento", "CX Denúncia": "CX Denúncia",
+    # BKO PF (tipo de atendimento BKO da query oficial, fora o CX Denúncia, que tem meta própria) — visão iFood
+    "Payments Experts (G+A)": "BKO PF", "Recuperação de Conta": "BKO PF", "MPOS - Início (Bloqueio a realizar)": "BKO PF",
+    "PF Account": "BKO PF",
+}
+# Metas combinadas com as EPSs por segmento (consolidado da EPS) e as filas de cada segmento.
+META_EPS_SEGMENTO: dict[str, dict[str, list[float]]] = {
+    "AeC": {"Alpha": [72, 72, 73, 73, 73, 74], "Super": [91, 92, 92, 92, 93, 93]},
+    "CSU": {"Alpha": [76, 77, 78, 78, 79, 79], "Super": [91, 92, 92, 92, 93, 93], "Super PF": [97, 97, 97, 97, 97, 97]},
+}
+FILA_SEGMENTO = {
+    "CX Suporte": "Alpha", "CX Review - AeC": "Alpha", "Madrugada": "Alpha", "CX Super Cliente - AeC": "Super",
+    "CX Review - CSU": "Alpha", "PF Cancelamento": "Alpha", "PF Revisão Manual": "Alpha", "CX Denúncia": "Alpha",
+    "CX Super Cliente - CSU": "Super", "PF Super Clientes": "Super PF",
+}
+
+
+def _meta_index(day: date | None = None) -> int:
+    day = day or (_as_date(_today_brazil()) - timedelta(days=1))
+    key = (day.year, day.month)
+    if key in _META_MONTHS:
+        return _META_MONTHS.index(key)
+    return 0 if key < _META_MONTHS[0] else len(_META_MONTHS) - 1
+
+
+def _meta_fila(fila: str, day: date | None = None) -> float | None:
+    """Meta de CSAT da fila no mês (tabela combinada). None = fila sem meta (Fraudes DX, Contestações)."""
+    grupo = FILA_GRUPO_META.get(fila) or next((g for f, g in FILA_GRUPO_META.items() if _norm_text(f) == _norm_text(fila)), None)
+    return float(META_GRUPOS[grupo][_meta_index(day)]) if grupo else None
+
+
+def _meta_segmento(eps: str, segmento: str, day: date | None = None) -> float | None:
+    seg = (META_EPS_SEGMENTO.get(eps) or {}).get(segmento)
+    return float(seg[_meta_index(day)]) if seg else None
+
+
+def _metas_text(eps: str | None = None, day: date | None = None) -> str:
+    """Bloco de metas do mês para os prompts (a Indicadores usa estas metas, não as antigas). Com EPS, só as dela."""
+    i = _meta_index(day)
+    filas_eps = set(_celulas_of(eps)) if eps else None
+    filas = " · ".join(f"{f} {META_GRUPOS[g][i]:.0f}%" for f, g in FILA_GRUPO_META.items()
+                       if filas_eps is None or f in filas_eps)
+    segs = " · ".join(f"{e} {s} {v[i]:.0f}%" for e, d in META_EPS_SEGMENTO.items() for s, v in d.items()
+                      if eps is None or _eps_matches(e, eps))
+    sem_meta = " Fraudes DX e Contestações: sem meta." if eps is None or _eps_matches("CSU", eps) else ""
+    geral = f" Meta geral do CX: {META_GRUPOS['Geral'][i]:.0f}%." if eps is None else ""
+    return (f"METAS DE CSAT DO MÊS (combinadas; substituem qualquer meta antiga): {filas}.{sem_meta} "
+            f"Metas combinadas da EPS por segmento: {segs}.{geral}")
+
+
+class _MetasNow(dict):
+    """Compatível com o antigo FILA_METAS: devolve a meta do mês corrente."""
+    def get(self, key: Any, default: Any = None) -> Any:  # type: ignore[override]
+        v = _meta_fila(str(key))
+        return v if v is not None else default
+
+
+FILA_METAS: dict[str, float] = _MetasNow()
 ESTEIRA_MAX_POLLS = 72  # 12 min: a esteira não pode segurar a conversa
 ESTEIRA_MIN_GAP_PP = 0.3  # abaixo disso o gap é pequeno demais para dividir em p.p.: mostra só %
 _CAUSE_RE = re.compile(
@@ -5985,7 +6063,7 @@ def _table_prompt(start: date, end: date, d1: date) -> str:
     )
 
 
-def _parse_table(answer: str) -> list[dict[str, Any]]:
+def _parse_table(answer: str, period_end: date | None = None) -> list[dict[str, Any]]:
     import csv as _csv
     text = _strip_json_code_blocks(answer or "").replace("```", "")
     lines = [l for l in text.splitlines() if l.strip()]
@@ -6003,7 +6081,9 @@ def _parse_table(answer: str) -> list[dict[str, Any]]:
         if not eps or not fila or "agentforce" in _norm_text(fila):
             continue
         num = lambda k: _to_float(str(d.get(k) or "").replace(",", ".")) or 0.0
-        out.append({"eps": eps, "fila": fila, "meta": _to_float(str(d.get("meta") or "").replace(",", ".")),
+        meta_app = _meta_fila(fila, period_end) if period_end else _meta_fila(fila)
+        out.append({"eps": eps, "fila": fila,
+                    "meta": meta_app if meta_app is not None else _to_float(str(d.get("meta") or "").replace(",", ".")),
                     "mes_aval": num("mes_aval"), "mes_prom": num("mes_prom"), "d1_aval": num("d1_aval"),
                     "d1_prom": num("d1_prom"), "motivo": _motivo_label(d.get("motivo_mes")) if d.get("motivo_mes") else "",
                     "motivo_pp": _to_float(str(d.get("motivo_mes_pp") or "").replace(",", "."))})
@@ -6029,7 +6109,7 @@ def _day_table(period: tuple[date, date] | None = None, fetch: bool = True) -> l
     answer = _ask_base(prompt) if fetch else _cached_only(prompt)
     if answer is None or _is_error_answer(answer):
         return None
-    rows = _parse_table(answer)
+    rows = _parse_table(answer, end)
     if not rows:
         _alert_unreadable("Tabela do dia", None, answer)
         with _BASE_LOCK:
@@ -6050,7 +6130,17 @@ def _agg(rows: list[dict[str, Any]], kind: str = "mes") -> tuple[float | None, f
 
 
 def _impact(rows: list[dict[str, Any]], target: list[dict[str, Any]], kind: str = "mes") -> float | None:
-    """CSAT do conjunto − CSAT do conjunto sem `target` (negativo = puxa para baixo)."""
+    """Régua do Cockpit: peso de `target` nas pesquisas do conjunto × (CSAT de `target` − meta consolidada do conjunto),
+    em p.p. Negativo = puxa o conjunto para baixo da meta. A soma das filas = CSAT do conjunto − meta consolidada."""
+    total_csat, n_total, meta = _agg(rows, kind)
+    t_csat, n_t, _ = _agg(target, kind)
+    if t_csat is None or meta is None or not n_total:
+        return None
+    return n_t / n_total * (t_csat - meta)
+
+
+def _without(rows: list[dict[str, Any]], target: list[dict[str, Any]], kind: str = "mes") -> float | None:
+    """CSAT do conjunto − CSAT do conjunto sem `target` (o "quanto iria sem a fila", usado na Leitura)."""
     total, _, _ = _agg(rows, kind)
     rest = [r for r in rows if r not in target]
     without, n_without, _ = _agg(rest, kind)
@@ -6059,10 +6149,12 @@ def _impact(rows: list[dict[str, Any]], target: list[dict[str, Any]], kind: str 
     return total - without
 
 
-def _ritmo(row_or_rows: Any, d1: date) -> dict[str, float] | None:
+def _ritmo(row_or_rows: Any, d1: date, meta_override: float | None = None) -> dict[str, float] | None:
     """Quanto precisa nos dias que faltam para fechar o mês na meta (pelo ritmo de avaliações do mês)."""
     rows = row_or_rows if isinstance(row_or_rows, list) else [row_or_rows]
     csat, aval, meta = _agg(rows, "mes")
+    if meta_override is not None:
+        meta = meta_override
     import calendar
     days_month = calendar.monthrange(d1.year, d1.month)[1]
     remaining = days_month - d1.day
@@ -6124,9 +6216,14 @@ def _table_intent(question: str, eps: str | None) -> tuple[str, str | None, str 
     return None
 
 
-def _table_answer(question: str, eps: str | None) -> str | None:
-    """Resposta pronta da tabela do dia (None = não é pergunta de tabela ou a tabela não está disponível)."""
-    intent = _table_intent(question, eps)
+_CAUSE_FOLLOW_RE = re.compile(r"\b(causa|causas|por que|porque|pq|explica\w*|o que (esta|ta) puxando|de onde vem)\b")
+
+
+def _table_answer(question: str, eps: str | None, focus: dict[str, Any] | None = None) -> str | None:
+    """Resposta pronta da tabela do dia (None = não é pergunta de tabela ou a tabela não está disponível).
+    `focus` recebe a fila em destaque (a que mais impacta / a citada), para emendar a análise de causa."""
+    nq = _norm_text(question)
+    intent = _table_intent(nq[:_CAUSE_FOLLOW_RE.search(nq).start()] if _CAUSE_FOLLOW_RE.search(nq) else question, eps)
     if not intent:
         return None
     kind_q, eps_q, fila_q = intent
@@ -6185,11 +6282,14 @@ def _table_answer(question: str, eps: str | None) -> str | None:
         lines.append("")
         lines.append("📍 *Resultado*")
         for imp, e, c, n in items:
-            lines.append(f"• {e} *{_bfmt(c)}%* (n={_fmt_int(n)})" + prev_of(None, e))
+            lines.append(f"• {e} *{_bfmt(c)}%* (n={_fmt_int(n)}) · impacto {'+' if imp >= 0 else '−'}{_bfmt(abs(imp), 2)} p.p."
+                         + prev_of(None, e))
         lines.append("")
         lines.append("💡 *Leitura*")
-        lines.append(f"↳ Sem a {worst[1]}, o consolidado iria de {_bfmt(total)}% para {_bfmt(without)}% "
-                     f"({'−' if worst[0] < 0 else '+'}{_bfmt(abs(worst[0]), 2)} p.p. de impacto). Agentforce CX (IA) fica fora.")
+        lines.append(f"↳ Impacto pela régua do Cockpit (peso × CSAT vs meta consolidada): {worst[1]} "
+                     f"{'+' if worst[0] >= 0 else '−'}{_bfmt(abs(worst[0]), 2)} p.p.")
+        lines.append(f"↳ Sem a {worst[1]}, o consolidado iria de {_bfmt(total)}% para {_bfmt(without)}%. "
+                     "Agentforce CX (IA) fica fora.")
         return "\n".join(lines)
 
     base = _scope_rows(rows, eps_q)
@@ -6199,6 +6299,8 @@ def _table_answer(question: str, eps: str | None) -> str | None:
         r = next((x for x in base if _norm_text(x["fila"]) == _norm_text(fila_q)), None)
         if not r:
             return None
+        if focus is not None:
+            focus.update(fila=r["fila"], eps=r["eps"])
         c, n, _ = _agg([r], kind)
         if c is None:
             return f"⚪ *{r['fila']} ·* `{r['eps']}` *— {when}* · sem avaliação de CSAT no período."
@@ -6232,10 +6334,14 @@ def _table_answer(question: str, eps: str | None) -> str | None:
             if not ranked:
                 continue
             worst_imp, worst = ranked[0]
+            if focus is not None and "fila" not in focus:
+                focus.update(fila=worst["fila"], eps=e)
             without, _, _ = _agg([r for r in g if r is not worst], kind)
             lines = [f"{'🔴' if (worst_imp or 0) < 0 else '🟢'} *Fila que mais impacta ·* `{e}` *— {when}* · "
-                     f"{worst['fila']}", "_impacto = quanto o CSAT da EPS mudaria sem a fila_", ""]
-            lines.append(f"📍 *Ranking* — CSAT da {e} {_bfmt(c)}% (n={_fmt_int(n)})")
+                     f"{worst['fila']}", f"_impacto = peso da fila × (CSAT da fila − meta consolidada da {e}, "
+                     f"{_bfmt(meta)}%) · régua do Cockpit_", ""]
+            lines.append(f"📍 *Ranking* — CSAT da {e} {_bfmt(c)}% (n={_fmt_int(n)}) · "
+                         f"{'+' if c - meta >= 0 else '−'}{_bfmt(abs(c - meta))} p.p. vs meta consolidada")
             for i, (imp, r) in enumerate(ranked, 1):
                 cr, nr, _ = _agg([r], kind)
                 lines.append(f"{i}. {r['fila']} · *{'+' if (imp or 0) >= 0 else '−'}{_bfmt(abs(imp or 0), 2)} p.p.* · "
@@ -6250,11 +6356,29 @@ def _table_answer(question: str, eps: str | None) -> str | None:
             lines.append(f"📍 *Por fila* — do maior impacto negativo para o menor")
             for r in sorted(g, key=lambda r: (_impact(g, [r], kind) or 0)):
                 lines.append(fila_line(r, g))
-            rt = _ritmo_text(_ritmo(g, d1)) if not use_d1 else ""
-            if rt:
-                lines += ["", "💡 *Leitura*", f"↳ {e}: {rt}."]
+            segs = _segment_lines(g, e, kind, d1, with_ritmo=not use_d1)
+            if segs:
+                lines += ["", f"🎯 *Metas combinadas da {e}*"] + segs
         out.append("\n".join(lines))
     return "\n\n".join(out) if out else None
+
+
+def _segment_lines(g: list[dict[str, Any]], eps: str, kind: str, d1: date, with_ritmo: bool = False) -> list[str]:
+    """Resultado por segmento contra a meta combinada da EPS (Alpha, Super, Super PF)."""
+    out = []
+    for seg in (META_EPS_SEGMENTO.get(eps) or {}):
+        sel = [r for r in g if FILA_SEGMENTO.get(r["fila"]) == seg]
+        c, n, _ = _agg(sel, kind)
+        meta = _meta_segmento(eps, seg, d1)
+        if c is None or meta is None:
+            continue
+        line = f"• {seg} *{_bfmt(c)}%* → {_vs_meta(c, meta)} (n={_fmt_int(n)})"
+        if with_ritmo:
+            rt = _ritmo(sel, d1, meta)
+            if rt and not (rt["need"] <= rt["meta"] and rt["csat"] >= rt["meta"]):
+                line += f" · {_ritmo_text(rt)}"
+        out.append(line)
+    return out
 
 
 def _table_context(eps: str | None) -> str:
@@ -6538,6 +6662,9 @@ def _month_close_text(tenant: Tenant, today: date) -> str | None:
     c, n, meta = _agg(g, "mes")
     lines = [f"📅 {_status_dot(c / meta * 100) if meta else '⚪'} *Fechamento de {mes} ·* `{eps}` *—* CSAT {_bfmt(c)}%"
              + (f" (meta {_bfmt(meta)}%)" if meta else "") + f" · n={_fmt_int(n)}", ""]
+    segs = _segment_lines(g, eps, "mes", end)
+    if segs:
+        lines += ["🎯 *Metas combinadas*"] + segs + [""]
     lines.append("📍 *Por fila*")
     ranked = sorted(g, key=lambda r: (_impact(g, [r]) or 0))
     for r in ranked:
@@ -6712,15 +6839,20 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
         except Exception:
             logger.warning("Learning handling failed", exc_info=True)
         if not _report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or "")):
+            focus: dict[str, Any] = {}
             try:
-                table = _table_answer(question, eps)
+                table = _table_answer(question, eps, focus)
             except Exception:
                 logger.warning("Day table answer failed", exc_info=True)
                 table = None
             if table:
                 event["_route"] = "tabela"
                 _say_sections(say, table, event)
-                return
+                if not (_CAUSE_FOLLOW_RE.search(_norm_text(question)) and focus.get("fila")):
+                    return
+                # pergunta dupla ("qual fila mais impacta e quais as causas?"): emenda a análise de causa da fila
+                event["_route"] = "tabela+causa"
+                question = f"Quais as principais causas do CSAT da {focus['fila']} no mês? Por que está assim?"
         in_report_thread = bool(_report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or "")))
         asks = _is_question_like(question)
         analytical = _is_analytical(question)  # "por que", "quem piorou", "quanto contribuiu": análise livre
