@@ -1,4 +1,15 @@
-"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.13).
+"""Lyra Slack bot — relay Slack <-> Toqan + rotinas de gestão das EPSs (v5.14).
+
+v5.14 — Tabela do dia (DAY_TABLE): CSAT do mês e do D-1 por fila das duas EPSs numa consulta só (Indicadores
+        v1.11, "tabela do dia"), em cache até a meia-noite e carregada junto com o report. "Resultado por fila",
+        "como está a <fila>", "qual fila/EPS mais impacta", "pior fila" saem dela em segundos, com o mesmo número em
+        toda resposta (as respostas livres recebem esses números como oficiais). Impacto = CSAT do conjunto com x
+        sem a fila; Agentforce fora. Ritmo do mês: quanto a fila precisa nos dias que faltam para fechar na meta (na
+        cobrança do report e nas respostas). Até o dia 5, o mês vem com o mês anterior fechado de contexto.
+        👍/👎 nas respostas (evento reaction_added): registra na aba "Avaliações"; 👎 de alguém do iFood pergunta "o
+        que ficou errado?" e a resposta vira aprendizado. Toda conversa vai para a aba "Conversas" (rota, tempo,
+        status). Auditoria diária às 18h (amostra de 10, regras da Lyra) e saúde semanal na segunda 9h40 no canal de
+        alerta. Fechamento do mês no 1º dia útil às 10h, no canal de cada EPS.
 
 v5.13 — Respostas grandes no visual do report diário (o report em si não muda): título "<status> *Rótulo ·* `fila/EPS`
         *— período* · número", seções com divisória (📍 Resultado · 👥 Por supervisor · 👤 Operadores · 💡 Leitura),
@@ -31,6 +42,11 @@ v5.13 — Respostas grandes no visual do report diário (o report em si não mud
         e manda os ativos (até 30) junto de toda conversa do escopo. Meta, cálculo, política e cobrança não viram
         aprendizado. "o que você aprendeu?" lista; "esquece o aprendizado N" desativa (só iFood). LEARNINGS=0 desliga.
         Perguntas sobre a própria Lyra (quem é, nome/constelação, como aprende) têm instrução própria.
+        Regras oficiais do CSAT (Indicadores v1.10): L3, data da avaliação, Madrugada pelos operadores da célula
+        Madrugada do MOP (o app manda a lista em todo pedido da AeC/iFood), filas normalizadas (PF Super Clientes,
+        PF Revisão Manual), Agentforce CX = IA (só WillNegativas, nunca somada a EPS), BU FOOD/MULTI, Front/BKO e
+        impacto da fila = CSAT do conjunto com x sem a fila. Recorte padrão = mês (resultado, ranking, pior, impacto);
+        D-1 só quando pedirem. Lembretes: "me lembra amanhã às 14h de X" vira DM no horário.
 
 v5.12 — Visão de equipe ("minha equipe", "equipe da X", "por supervisor"): pelo MOP (supervisor/coordenador) e pela
         base de operadores do período (com o anterior para o Δ: D-1 x D-8, semana x semana, mês x mesmos dias), traz
@@ -641,10 +657,49 @@ def _celulas_of(eps: str) -> list[str]:
     return []
 
 
+_MADRUGADA_CACHE: dict[str, Any] = {"at": 0.0, "emails": []}
+
+
+def _madrugada_emails() -> list[str]:
+    """E-mails da célula Madrugada no MOP (cache de 30 min). A fila Madrugada do CSAT é definida por esses operadores."""
+    if time.time() - _MADRUGADA_CACHE["at"] < 1800:
+        return _MADRUGADA_CACHE["emails"]
+    emails: list[str] = []
+    try:
+        values = _read_mop_values() or []
+        if len(values) > 1:
+            header = values[0]
+            c_cel, c_mail = _find_col(header, "Célula"), _find_col(header, "Email")
+            if c_cel is not None and c_mail is not None:
+                emails = sorted({str(r[c_mail]).strip().lower() for r in values[1:]
+                                 if c_cel < len(r) and c_mail < len(r) and _norm_text(r[c_cel]) == "madrugada"
+                                 and "@" in str(r[c_mail])})
+    except Exception:
+        logger.warning("Could not read Madrugada list from MOP", exc_info=True)
+    if emails or not _MADRUGADA_CACHE["emails"]:
+        _MADRUGADA_CACHE.update(at=time.time(), emails=emails)
+    return _MADRUGADA_CACHE["emails"]
+
+
+def _madrugada_line(eps: str | None) -> str:
+    if eps is not None and _compact(eps) != _compact("AeC"):
+        return ""
+    emails = _madrugada_emails()
+    if not emails:
+        return ""
+    return ("\nAo chamar a Lyra Indicadores (ou a Lyra Qualidade), inclua no pedido a linha: Madrugada: "
+            + ", ".join(emails) + " (operadores da célula Madrugada no MOP; tudo o que eles atendem é da fila Madrugada).")
+
+
 def _scope_instruction(eps: str | None) -> str:
     """Bloco de escopo injetado em toda mensagem enviada ao Toqan."""
+    return _scope_instruction_base(eps) + _madrugada_line(eps)
+
+
+def _scope_instruction_base(eps: str | None) -> str:
     if eps is None:
-        return "ESCOPO: visão interna iFood — todas as EPS. Pode comparar EPS."
+        return ("ESCOPO: visão interna iFood — todas as EPS. Pode comparar EPS. Agentforce CX é atendimento de IA: "
+                "nunca some em AeC ou CSU nem compare com uma EPS.")
     others = ", ".join(e for e in EPS_CELULAS if _compact(e) != _compact(eps)) or "outras EPS"
     celulas = _celulas_of(eps)
     return (
@@ -2498,7 +2553,17 @@ def _period_spec(question: str) -> dict[str, Any]:
             p_end = pm_end
         return {"label": "do mês", "cur": f"mês até o D-1: {f(start)} a {f(d1)}",
                 "prev": f"mesmos dias do mês anterior: {f(pm_end.replace(day=1))} a {f(p_end)}",
-                "prev_label": "mesmos dias do mês anterior", "min": 5, "short": f"mês 01 a {d1.strftime('%d/%m')}"}
+                "prev_label": "mesmos dias do mês anterior", "min": 5, "short": (f"mês 01 a {d1.strftime('%d/%m')}" if d1.day > 1 else f"mês ({d1.strftime('%d/%m')})")}
+    if not re.search(r"\b(semana|semanal|w 1|7 dias)\b", text):  # padrão do time: visão mês
+        start = d1.replace(day=1)
+        pm_end = start - timedelta(days=1)
+        try:
+            p_end = pm_end.replace(day=d1.day)
+        except ValueError:
+            p_end = pm_end
+        return {"label": "do mês", "cur": f"mês até o D-1: {f(start)} a {f(d1)}",
+                "prev": f"mesmos dias do mês anterior: {f(pm_end.replace(day=1))} a {f(p_end)}",
+                "prev_label": "mesmos dias do mês anterior", "min": 5, "short": (f"mês 01 a {d1.strftime('%d/%m')}" if d1.day > 1 else f"mês ({d1.strftime('%d/%m')})")}
     start = d1 - timedelta(days=6)
     return {"label": "da semana", "cur": f"últimos 7 dias: {f(start)} a {f(d1)}",
             "prev": f"7 dias anteriores: {f(start - timedelta(days=7))} a {f(start - timedelta(days=1))}",
@@ -3309,6 +3374,8 @@ def _parse_weeks_csv(answer: str, eps: str | None) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for email, op in raw.items():
         meta, q4, sampled, csats = op["meta"], 0, 0, []
+        avals = [op["w"].get(w, (0, 0))[0] for w in range(1, 5)]
+        proms = [op["w"].get(w, (0, 0))[1] for w in range(1, 5)]
         for w in range(1, 5):
             aval, prom = op["w"].get(w, (0, 0))
             if aval >= WEEK_MIN_AVAL and meta:
@@ -3318,7 +3385,8 @@ def _parse_weeks_csv(answer: str, eps: str | None) -> dict[str, dict[str, Any]]:
                 q4 += 1 if c / meta * 100 < 90 else 0
             else:
                 csats.append(None)
-        out[email] = {"q4": q4, "n": sampled, "csats": csats, "fila": op["fila"], "meta": meta}
+        out[email] = {"q4": q4, "n": sampled, "csats": csats, "fila": op["fila"], "meta": meta, "avals": avals,
+                      "proms": proms}
     return out
 
 
@@ -4600,6 +4668,10 @@ def _run_daily_report(now: datetime | None = None, tenant: Tenant | None = None)
 
     def check_crisis() -> None:  # em paralelo com a consulta do report
         crisis["c"] = _crisis_check(d1_start, d1_start + timedelta(hours=23, minutes=59), tenant.eps, ttl=None)
+        try:
+            crisis["table"] = _day_table()  # tabela do dia (ritmo do mês na cobrança e respostas rápidas)
+        except Exception:
+            logger.warning("Day table in report failed", exc_info=True)
 
     crisis_thread = threading.Thread(target=check_crisis, daemon=True)
     crisis_thread.start()
@@ -4611,6 +4683,13 @@ def _run_daily_report(now: datetime | None = None, tenant: Tenant | None = None)
     crisis_thread.join(timeout=300)
     if crisis.get("c"):
         blocks = [(fila, title, _apply_crisis_to_body(body, fila, crisis["c"])) for fila, title, body in blocks]
+    if crisis.get("table"):
+        def with_ritmo(fila: str, body: str) -> str:
+            line = _ritmo_for_report(fila, crisis["table"], d1)
+            if not line or "👉 *Cobrança:*" not in body:
+                return body
+            return body.replace("👉 *Cobrança:*", line + "\n👉 *Cobrança:*", 1)
+        blocks = [(fila, title, with_ritmo(fila, body)) for fila, title, body in blocks]
     if blocks:
         posted: list[dict[str, Any]] = []
         csat: dict[str, dict[str, float]] = {}
@@ -4922,11 +5001,11 @@ def _prewarm_bases(eps: str) -> None:
     eps_scope = eps if eps in EPS_CELULAS else None
     if eps_scope is None:
         return
-    spec = _period_spec("semana")
+    spec = _period_spec("mês")
     jobs = [lambda: _fetch_weekly_rows(eps_scope),
             lambda: _fetch_operator_rows(eps_scope, spec["cur"]),
             lambda: _fetch_operator_rows(eps_scope, spec["prev"]),
-            lambda: _ask_cached(_operators_prompt(eps_scope, _operators_period("semana")[0]))]
+            lambda: _ask_cached(_operators_prompt(eps_scope, _operators_period("mês")[0]))]
     for job in jobs:
         try:
             job()
@@ -5079,6 +5158,14 @@ def _scheduler_tick(now: datetime | None = None) -> None:
         _mop_missing_check(now)
     except Exception:
         logger.exception("MOP missing check failed")
+    try:
+        _reminders_tick(now)
+    except Exception:
+        logger.exception("Reminders tick failed")
+    try:
+        _team_routines_tick(now)
+    except Exception:
+        logger.exception("Team routines tick failed")
     try:
         _agent_health_tick(now)
     except Exception:
@@ -5501,8 +5588,9 @@ def _remember_answer(prompt: str, answer: str | None) -> None:
 
 DEFAULTS_INSTRUCTION = (
     "INFORMAÇÃO INTERNA PARA A LYRA — RESPONDA, NÃO DEVOLVA PERGUNTA: se faltar o indicador, use CSAT; se faltar o "
-    "período, use o D-1 (ontem) com o mês como contexto; se faltar a fila, traga todas as filas do escopo. Diga em meia "
-    "frase o recorte que usou. Só pergunte quando for impossível responder sem a informação.\n\n")
+    "período, use o MÊS (do dia 1 até ontem) — vale para resultado, ranking, 'qual mais impacta', 'qual a pior'; D-1 só "
+    "se pedirem ontem/D-1; se faltar a fila, traga todas as filas do escopo. Diga em meia frase o recorte que usou. "
+    "Só pergunte quando for impossível responder sem a informação.\n\n")
 
 
 # ---------------------------------------------------------------------------
@@ -5520,11 +5608,13 @@ _TEACH_RE = re.compile(
     r"\b(aprend[ae]|anota|anote|guarda|guarde|grava|lembr[ae] (que|disso|de)|da proxima vez|das proximas vezes|"
     r"a partir de agora|de agora em diante|nao e assim|nao eh assim|na verdade|o certo e|o correto e|esta errad\w*|"
     r"ta errad\w*|voce errou|vc errou|errou|corrig\w*|sempre que|nunca mais|nao chama de|chama de|chame de|"
-    r"prefiro que|quero que (voce|vc) (sempre|nunca))\b")
+    r"prefiro que|quero que (voce|vc) (sempre|nunca)|se atente|atente|considere sempre|sempre considere|"
+    r"sempre (use|olhe|traga|mostre|considere|veja)|nunca (use|traga|mostre|considere|chame)|nao e (uma|um|da|do)|"
+    r"nao eh (uma|um|da|do)|isso nao e|isso nao eh)\b|^nao (e|eh)\b")
 _TEACH_STRONG_RE = re.compile(
     r"\b(aprend[ae]|anota|anote|guarda|guarde|lembr[ae] (que|disso)|da proxima vez|das proximas vezes|a partir de agora|"
     r"de agora em diante|nao e assim|nao eh assim|o certo e|o correto e|nao chama de|chame de|prefiro que|"
-    r"quero que (voce|vc) (sempre|nunca)|voce errou|vc errou)\b")
+    r"quero que (voce|vc) (sempre|nunca)|voce errou|vc errou|se atente|considere sempre|sempre considere)\b")
 _LEARN_LIST_RE = re.compile(r"\b(o que (voce|vc) (ja )?aprendeu|seus aprendizados|lista (os|de) aprendizados|"
                             r"quais (sao )?(os )?(seus )?aprendizados)\b")
 _LEARN_FORGET_RE = re.compile(r"\b(esquece|esqueca|apaga|apague|remove|remova|desativa|desative)\b.*\baprendizado\s*#?(\d+)")
@@ -5660,10 +5750,12 @@ def _handle_learning(event: dict[str, Any], question: str, eps: str | None, say:
         _learnings_rows(force=True)
         _say(say, f"Pronto, esqueci o aprendizado {m.group(2)}: _{hit[1].get('Aprendizado')}_", event, in_thread)
         return True
-    if not _TEACH_RE.search(t):
-        return False
-    if _is_question_like(question) and not _TEACH_STRONG_RE.search(t):
-        return False  # "quem errou mais?" é pergunta, não ensinamento
+    forced = _feedback_pending(event)  # resposta ao "o que ficou errado?" depois de um 👎
+    if not forced:
+        if not _TEACH_RE.search(t):
+            return False
+        if _is_question_like(question) and not _TEACH_STRONG_RE.search(t):
+            return False  # "quem errou mais?" é pergunta, não ensinamento
     if not _is_ifood_user(user):
         return False
     context = _thread_context(event) or _dm_context(event)
@@ -5675,6 +5767,10 @@ def _handle_learning(event: dict[str, Any], question: str, eps: str | None, say:
         return not got.get("pergunta")
     texto = str(got.get("aprendizado") or "").strip()
     if tipo != "aprendizado" or not texto:
+        if forced:
+            _alert(f"👎 com comentário de <@{user}>: {question[:300]}")
+            _say(say, "Valeu pelo retorno, registrei para o time revisar.", event, in_thread)
+            return True
         return False
     escopo = str(got.get("escopo") or "Todos").strip()
     if escopo not in {"Todos", *EPS_CELULAS}:
@@ -5695,7 +5791,790 @@ def _handle_learning(event: dict[str, Any], question: str, eps: str | None, say:
     return not got.get("pergunta")
 
 
+# ---------------------------------------------------------------------------
+# Lembretes: "me lembra amanhã às 14h de auditar a conversa" -> DM no horário.
+# ---------------------------------------------------------------------------
+_REMIND_RE = re.compile(r"\b(me lembra|me lembre|lembra me|me avisa|me avise|me cobra|me cobre)\b")
+_WEEKDAYS = {"segunda": 0, "terca": 1, "quarta": 2, "quinta": 3, "sexta": 4, "sabado": 5, "domingo": 6}
+
+
+def _parse_reminder(text: str, now: datetime) -> tuple[datetime, str] | None:
+    """(quando, o quê) ou None se não deu para entender o horário."""
+    t = _norm_text(text)
+    m = _REMIND_RE.search(t)
+    if not m:
+        return None
+    rest = t[m.end():]
+    day = None
+    if re.search(r"\bdepois de amanha\b", rest):
+        day = now.date() + timedelta(days=2)
+    elif re.search(r"\bamanha\b", rest):
+        day = now.date() + timedelta(days=1)
+    elif re.search(r"\bhoje\b", rest):
+        day = now.date()
+    md = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", rest)
+    if md:
+        try:
+            year = int(md.group(3)) if md.group(3) else now.year
+            year = year + 2000 if year < 100 else year
+            day = date(year, int(md.group(2)), int(md.group(1)))
+            if day < now.date() and not md.group(3):
+                day = date(year + 1, day.month, day.day)
+        except ValueError:
+            return None
+    wd = re.search(r"\b(segunda|terca|quarta|quinta|sexta|sabado|domingo)\b", rest)
+    if day is None and wd:
+        delta = (_WEEKDAYS[wd.group(1)] - now.weekday()) % 7 or 7
+        day = now.date() + timedelta(days=delta)
+    hm = re.search(r"\b(?:as|a|para as|pras)?\s*(\d{1,2})(?:h|:)(\d{2})?\b|\bas (\d{1,2})\b", rest)
+    rel = re.search(r"\bdaqui a (\d{1,3}) ?(min|minuto|minutos|h|hora|horas)\b", rest)
+    if rel:
+        n = int(rel.group(1))
+        when = now + (timedelta(minutes=n) if rel.group(2).startswith("min") else timedelta(hours=n))
+    else:
+        if hm:
+            hh = int(hm.group(1) or hm.group(3))
+            mm = int(hm.group(2) or 0) if hm.group(1) else 0
+        elif day is not None:
+            hh, mm = 9, 0
+        else:
+            return None
+        if hh > 23 or mm > 59:
+            return None
+        if day is None:
+            day = now.date()
+        when = datetime(day.year, day.month, day.day, hh, mm, tzinfo=now.tzinfo)
+        if when <= now and not md and not re.search(r"\bhoje\b", rest):
+            when += timedelta(days=1)
+    what = re.sub(r"^\W*(de|da|do|que|pra|para|sobre)\s+", "", re.split(r"\b(?:de|da|do|que|pra|para|sobre)\b", rest, 1)[-1]
+                  if re.search(r"\b(?:de|da|do|que|pra|para|sobre)\b", rest) else rest).strip(" .?!")
+    original = re.sub(r"<@[A-Z0-9]+>", "", text).strip()
+    return when, (what or original)[:300]
+
+
+def _handle_reminder(event: dict[str, Any], question: str, say: Callable[..., Any], in_thread: bool) -> bool:
+    if not _REMIND_RE.search(_norm_text(question)):
+        return False
+    now = _now_brazil()
+    got = _parse_reminder(question, now)
+    if not got:
+        _say(say, "Consigo te lembrar, só me diz quando: ex. \"me lembra amanhã às 14h de auditar a conversa\" ou "
+                  "\"me lembra sexta às 10h de cobrar a AeC\".", event, in_thread)
+        return True
+    when, what = got
+    if when <= now:
+        _say(say, "Esse horário já passou. Me diz um horário daqui pra frente?", event, in_thread)
+        return True
+    # o que lembrar: o texto original da pessoa, para não perder detalhe
+    what_raw = re.sub(r"<@[A-Z0-9]+>", "", question).strip()
+    items = []
+    try:
+        items = json.loads(STATE.get("reminders") or "[]")
+    except ValueError:
+        items = []
+    items.append({"at": when.isoformat(), "user": event.get("user"), "channel": event.get("channel"),
+                  "ts": _reply_ts(event), "what": what_raw[:400]})
+    STATE.set("reminders", json.dumps(items, ensure_ascii=False))
+    dia = "hoje" if when.date() == now.date() else ("amanhã" if when.date() == now.date() + timedelta(days=1)
+                                                     else when.strftime("%d/%m"))
+    _say(say, f"Combinado ⏰ Te lembro {dia} às {when.strftime('%Hh%M').replace('h00', 'h')} por DM.", event, in_thread)
+    return True
+
+
+def _reminders_tick(now: datetime) -> None:
+    raw = STATE.get("reminders")
+    if not raw:
+        return
+    try:
+        items = json.loads(raw)
+    except ValueError:
+        return
+    keep, due = [], []
+    for it in items:
+        try:
+            (due if datetime.fromisoformat(it["at"]) <= now else keep).append(it)
+        except (KeyError, ValueError):
+            continue
+    if not due:
+        return
+    STATE.set("reminders", json.dumps(keep, ensure_ascii=False))
+    for it in due:
+        link = _permalink(str(it.get("channel") or ""), str(it.get("ts") or "")) if it.get("ts") else ""
+        text = f"⏰ *Lembrete:* {it.get('what')}" + (f"\n<{link}|ver a conversa>" if link else "")
+        try:
+            dm = slack_app.client.conversations_open(users=it.get("user"))
+            channel = (_resp_get(dm, "channel") or {}).get("id")
+            slack_app.client.chat_postMessage(channel=channel or it.get("channel"), text=text)
+        except Exception:
+            logger.warning("Reminder DM failed; posting in the original thread", exc_info=True)
+            try:
+                slack_app.client.chat_postMessage(channel=it.get("channel"), thread_ts=it.get("ts"), text=f"<@{it.get('user')}> {text}")
+            except Exception:
+                logger.exception("Reminder failed")
+
+
+# ---------------------------------------------------------------------------
+# Tabela do dia: CSAT do mês e do D-1 por fila (as duas EPSs) numa consulta só, guardada até a meia-noite.
+# Perguntas comuns (resultado por fila, como está uma fila, qual fila/EPS mais impacta, pior fila) saem daqui em
+# segundos e com o mesmo número em toda resposta. Impacto = CSAT do conjunto − CSAT do conjunto sem a fila.
+# ---------------------------------------------------------------------------
+TABLE_HEADER = ["eps", "fila", "meta", "mes_aval", "mes_prom", "d1_aval", "d1_prom", "motivo_mes", "motivo_mes_pp"]
+TABLE_ENABLED = os.getenv("DAY_TABLE", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+EARLY_MONTH_DAYS = 5  # até o dia 5, o mês vem com o mês anterior fechado de contexto
+_MESES = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro",
+          "novembro", "dezembro"]
+
+
+def _table_prompt(start: date, end: date, d1: date) -> str:
+    f = lambda d: d.strftime("%d/%m/%Y")
+    return (
+        f"{_scope_instruction(None)}\n\n"
+        "TAREFA INTERNA DO APP — tabela de CSAT por fila. Não é mensagem para o Slack.\n"
+        "Chame a *Lyra Indicadores* com 'EPS: iFood', 'Pedido: tabela do dia (CSV)', "
+        f"'Mês: {f(start)} a {f(end)}' e 'D-1: {f(d1)}' (e a linha Madrugada: se ela veio acima).\n"
+        "Uma linha por fila das EPSs (AeC e CSU, filas oficiais da seção 4 dela; NUNCA Agentforce CX). Responda APENAS o "
+        "CSV separado por ';', escrito no corpo da resposta (nunca arquivo), com este cabeçalho exato:\n"
+        f"{';'.join(TABLE_HEADER)}\n"
+        "meta em %; *_aval = avaliações; *_prom = promotoras (notas 4 e 5); motivo_mes = motivo de contato de maior "
+        "impacto negativo na fila no mês (nome de negócio); motivo_mes_pp = impacto dele em p.p. (negativo). Fila sem "
+        "avaliação no período: 0. Se a consulta falhar: só 'ERRO: <motivo>'."
+    )
+
+
+def _parse_table(answer: str) -> list[dict[str, Any]]:
+    import csv as _csv
+    text = _strip_json_code_blocks(answer or "").replace("```", "")
+    lines = [l for l in text.splitlines() if l.strip()]
+    i = next((n for n, l in enumerate(lines) if l.lower().startswith("eps") and "fila" in l.lower()), None)
+    if i is None:
+        return []
+    delim = max((";", ",", "\t"), key=lines[i].count)
+    rows = list(_csv.reader(io.StringIO("\n".join(lines[i:])), delimiter=delim))
+    head = [_norm_text(h).replace(" ", "_") for h in rows[0]]
+    out = []
+    for r in rows[1:]:
+        d = {h: (r[k].strip() if k < len(r) else "") for k, h in enumerate(head)}
+        eps = next((e for e in EPS_CELULAS if _norm_text(e) == _norm_text(d.get("eps"))), None)
+        fila = str(d.get("fila") or "").strip()
+        if not eps or not fila or "agentforce" in _norm_text(fila):
+            continue
+        num = lambda k: _to_float(str(d.get(k) or "").replace(",", ".")) or 0.0
+        out.append({"eps": eps, "fila": fila, "meta": _to_float(str(d.get("meta") or "").replace(",", ".")),
+                    "mes_aval": num("mes_aval"), "mes_prom": num("mes_prom"), "d1_aval": num("d1_aval"),
+                    "d1_prom": num("d1_prom"), "motivo": _motivo_label(d.get("motivo_mes")) if d.get("motivo_mes") else "",
+                    "motivo_pp": _to_float(str(d.get("motivo_mes_pp") or "").replace(",", "."))})
+    return out
+
+
+def _month_bounds(d1: date) -> tuple[date, date]:
+    return d1.replace(day=1), d1
+
+
+def _prev_month_bounds(d1: date) -> tuple[date, date]:
+    end = d1.replace(day=1) - timedelta(days=1)
+    return end.replace(day=1), end
+
+
+def _day_table(period: tuple[date, date] | None = None, fetch: bool = True) -> list[dict[str, Any]] | None:
+    """Tabela das duas EPSs. period=None: mês até o D-1 (com o D-1). fetch=False: só se já estiver em cache."""
+    if not TABLE_ENABLED:
+        return None
+    d1 = _as_date(_today_brazil()) - timedelta(days=1)
+    start, end = period or _month_bounds(d1)
+    prompt = _table_prompt(start, end, end if period else d1)
+    answer = _ask_cached(prompt) if fetch else _cached_only(prompt)
+    if answer is None or _is_error_answer(answer):
+        return None
+    rows = _parse_table(answer)
+    if not rows:
+        _alert_unreadable("Tabela do dia", None, answer)
+        with _BASE_LOCK:
+            for k in [k for k, v in _BASE_CACHE.items() if v[1] == answer]:
+                _BASE_CACHE.pop(k, None)
+        return None
+    return rows
+
+
+def _agg(rows: list[dict[str, Any]], kind: str = "mes") -> tuple[float | None, float, float | None]:
+    """(CSAT, n, meta consolidada pelo mix) de um conjunto de filas."""
+    aval = sum(r[f"{kind}_aval"] for r in rows)
+    prom = sum(r[f"{kind}_prom"] for r in rows)
+    with_meta = [r for r in rows if r.get("meta") is not None and r[f"{kind}_aval"] > 0]
+    am = sum(r[f"{kind}_aval"] for r in with_meta)
+    meta = sum(r[f"{kind}_aval"] * r["meta"] for r in with_meta) / am if am else None
+    return (prom / aval * 100 if aval else None), aval, meta
+
+
+def _impact(rows: list[dict[str, Any]], target: list[dict[str, Any]], kind: str = "mes") -> float | None:
+    """CSAT do conjunto − CSAT do conjunto sem `target` (negativo = puxa para baixo)."""
+    total, _, _ = _agg(rows, kind)
+    rest = [r for r in rows if r not in target]
+    without, n_without, _ = _agg(rest, kind)
+    if total is None or without is None or not n_without:
+        return None
+    return total - without
+
+
+def _ritmo(row_or_rows: Any, d1: date) -> dict[str, float] | None:
+    """Quanto precisa nos dias que faltam para fechar o mês na meta (pelo ritmo de avaliações do mês)."""
+    rows = row_or_rows if isinstance(row_or_rows, list) else [row_or_rows]
+    csat, aval, meta = _agg(rows, "mes")
+    import calendar
+    days_month = calendar.monthrange(d1.year, d1.month)[1]
+    remaining = days_month - d1.day
+    if csat is None or meta is None or remaining <= 0 or d1.day < 3 or aval <= 0:
+        return None
+    prom = sum(r["mes_prom"] for r in rows)
+    rem_aval = aval / d1.day * remaining
+    need = (meta / 100 * (aval + rem_aval) - prom) / rem_aval * 100
+    return {"need": need, "remaining": remaining, "csat": csat, "meta": meta}
+
+
+def _ritmo_text(rt: dict[str, float] | None) -> str:
+    if not rt:
+        return ""
+    n = int(rt["remaining"])
+    dias = f"{n} dia{'s' if n != 1 else ''} que falta{'m' if n != 1 else ''}"
+    if rt["need"] <= rt["meta"] and rt["csat"] >= rt["meta"]:
+        return f"no ritmo atual fecha o mês na meta (está {_bfmt(rt['csat'] - rt['meta'])} p.p. acima)"
+    if rt["need"] > 100:
+        return f"mesmo com 100% nos {dias} o mês não fecha na meta {_bfmt(rt['meta'])}%"
+    return f"para fechar o mês na meta precisa de *{_bfmt(max(rt['need'], 0))}%* nos {dias} (hoje está em {_bfmt(rt['csat'])}%)"
+
+
+def _scope_rows(rows: list[dict[str, Any]], eps: str | None) -> list[dict[str, Any]]:
+    return [r for r in rows if eps is None or _eps_matches(r["eps"], eps)]
+
+
+_TABLE_BLOCK_RE = re.compile(r"\b(motivo|motivos|operador|operadores|analista|supervisor|supervisora|coordenador|"
+                             r"equipe|por que|porque|pq|semana|semanal|tma|sla|nps|reabertura|volume|grafico|excel|"
+                             r"planilha|quadrante|q4|reincid\w*|ofensor\w*|dispersao|compar\w*|evolucao|tendencia|"
+                             r"\d{1,2}/\d{1,2}|bu|food|multi)\b")
+_TABLE_RESULT_RE = re.compile(r"\b(resultado|csat|como (esta|estao|ta|tao|foi|foram|anda|andam))\b")
+_TABLE_IMPACT_RE = re.compile(r"\b(mais impacta\w*|maior impacto|impacta mais|pior|piores|puxa\w* (pra|para) baixo)\b")
+
+
+def _table_intent(question: str, eps: str | None) -> tuple[str, str | None, str | None] | None:
+    """('resultado'|'fila'|'impacto_fila'|'impacto_eps', eps, fila) ou None (vai para a análise livre)."""
+    if not TABLE_ENABLED:
+        return None
+    t = _norm_text(question)
+    if _TABLE_BLOCK_RE.search(t) or _is_analytical(question) and not _TABLE_IMPACT_RE.search(t):
+        return None
+    eps_q = eps or _eps_in_text(question)
+    fila = _fila_in_question(question, eps_q)
+    if fila and not eps_q:
+        eps_q = next((e for e, cel in EPS_CELULAS.items() if fila in cel), None)
+    if _TABLE_IMPACT_RE.search(t):
+        if re.search(r"\beps\b", t) and not fila:
+            return ("impacto_eps", eps_q, None) if eps is None else None
+        if re.search(r"\bfila", t) or eps_q:
+            return ("impacto_fila", eps_q, None)
+        return None
+    if _TABLE_RESULT_RE.search(t):
+        if fila:
+            return ("fila", eps_q, fila)
+        if re.search(r"\b(por fila|das filas|filas|da aec|da csu|aec|csu|geral|consolidado)\b", t) or eps_q \
+                or len(t.split()) <= 6:
+            return ("resultado", eps_q, None)
+    return None
+
+
+def _table_answer(question: str, eps: str | None) -> str | None:
+    """Resposta pronta da tabela do dia (None = não é pergunta de tabela ou a tabela não está disponível)."""
+    intent = _table_intent(question, eps)
+    if not intent:
+        return None
+    kind_q, eps_q, fila_q = intent
+    rows = _day_table()
+    if not rows:
+        return None
+    d1 = _as_date(_today_brazil()) - timedelta(days=1)
+    use_d1 = bool(re.search(r"\b(ontem|d 1|d1)\b", _norm_text(question)))
+    kind = "d1" if use_d1 else "mes"
+    when = f"D-1 {d1.strftime('%d/%m')}" if use_d1 else (
+        f"mês 01 a {d1.strftime('%d/%m')}" if d1.day > 1 else f"mês ({d1.strftime('%d/%m')})")
+    prev_rows = None
+    if not use_d1 and d1.day <= EARLY_MONTH_DAYS:
+        prev_rows = _day_table(_prev_month_bounds(d1))
+    prev_name = _MESES[(d1.replace(day=1) - timedelta(days=1)).month - 1]
+
+    def prev_of(fila: str | None = None, eps_: str | None = None) -> str:
+        if not prev_rows:
+            return ""
+        sel = [r for r in prev_rows if (fila is None or _norm_text(r["fila"]) == _norm_text(fila))
+               and (eps_ is None or _eps_matches(r["eps"], eps_))]
+        c, n, _ = _agg(sel, "mes")
+        return f" · {prev_name} fechado {_bfmt(c)}% (n={_fmt_int(n)})" if c is not None else ""
+
+    def fila_line(r: dict[str, Any], base: list[dict[str, Any]]) -> str:
+        c, n, _ = _agg([r], kind)
+        if c is None:
+            return f"⚪ {r['fila']} · sem avaliação"
+        imp = _impact(base, [r], kind)
+        dot = _status_dot(c / r["meta"] * 100) if r.get("meta") else "⚪"
+        parts = [f"{dot} {r['fila']} · *{_bfmt(c)}%*", f"meta {_bfmt(r['meta'])}%" if r.get("meta") else "sem meta",
+                 f"n={_fmt_int(n)}"]
+        if imp is not None and len(base) > 1:
+            parts.append(f"impacto {'+' if imp >= 0 else '−'}{_bfmt(abs(imp), 2)} p.p.")
+        return " · ".join(parts) + prev_of(r["fila"])
+
+    if kind_q == "impacto_eps":
+        base = rows
+        lines = []
+        items = []
+        for e in EPS_CELULAS:
+            sel = [r for r in base if _eps_matches(r["eps"], e)]
+            if not sel:
+                continue
+            imp = _impact(base, sel, kind)
+            c, n, _ = _agg(sel, kind)
+            items.append((imp if imp is not None else 0, e, c, n))
+        if not items:
+            return None
+        total, n_total, _ = _agg(base, kind)
+        items.sort()
+        worst = items[0]
+        without, _, _ = _agg([r for r in base if not _eps_matches(r["eps"], worst[1])], kind)
+        lines.append(f"{'🔴' if worst[0] < 0 else '🟢'} *EPS que mais puxa o CSAT ·* `{worst[1]}` *— {when}* · "
+                     f"consolidado {_bfmt(total)}% (n={_fmt_int(n_total)})")
+        lines.append("")
+        lines.append("📍 *Resultado*")
+        for imp, e, c, n in items:
+            lines.append(f"• {e} *{_bfmt(c)}%* (n={_fmt_int(n)})" + prev_of(None, e))
+        lines.append("")
+        lines.append("💡 *Leitura*")
+        lines.append(f"↳ Sem a {worst[1]}, o consolidado iria de {_bfmt(total)}% para {_bfmt(without)}% "
+                     f"({'−' if worst[0] < 0 else '+'}{_bfmt(abs(worst[0]), 2)} p.p. de impacto). Agentforce CX (IA) fica fora.")
+        return "\n".join(lines)
+
+    base = _scope_rows(rows, eps_q)
+    if not base:
+        return None
+    if kind_q == "fila":
+        r = next((x for x in base if _norm_text(x["fila"]) == _norm_text(fila_q)), None)
+        if not r:
+            return None
+        c, n, _ = _agg([r], kind)
+        if c is None:
+            return f"⚪ *{r['fila']} ·* `{r['eps']}` *— {when}* · sem avaliação de CSAT no período."
+        lines = [f"{_status_dot(c / r['meta'] * 100) if r.get('meta') else '⚪'} *Resultado ·* `{r['fila']}` *— {when}* · "
+                 f"CSAT {_bfmt(c)}%" + (f" (meta {_bfmt(r['meta'])}%)" if r.get("meta") else ""), ""]
+        lines.append(f"📍 *Resultado · {when}*")
+        lines.append(f"• CSAT *{_bfmt(c)}%* → {_vs_meta(c, r.get('meta'))} (n={_fmt_int(n)})" + prev_of(r["fila"]))
+        if not use_d1 and r["d1_aval"]:
+            cd, nd, _ = _agg([r], "d1")
+            lines.append(f"• D-1 {d1.strftime('%d/%m')}: {_bfmt(cd)}% (n={_fmt_int(nd)})")
+        imp = _impact(base, [r], kind)
+        if imp is not None and len(base) > 1:
+            lines.append(f"• Impacto na {r['eps']}: {'+' if imp >= 0 else '−'}{_bfmt(abs(imp), 2)} p.p.")
+        if r.get("motivo") and not use_d1:
+            lines.append(f"• Motivo que mais tira: {r['motivo']}" + (f" (−{_bfmt(abs(r['motivo_pp']), 2)} p.p.)"
+                                                                   if r.get("motivo_pp") is not None else ""))
+        rt = _ritmo_text(_ritmo(r, d1)) if not use_d1 and r.get("meta") else ""
+        if rt:
+            lines += ["", "💡 *Leitura*", f"↳ {rt[0].upper() + rt[1:]}."]
+        return "\n".join(lines)
+
+    groups = [base] if eps_q else [[r for r in base if _eps_matches(r["eps"], e)] for e in EPS_CELULAS]
+    groups = [g for g in groups if g]
+    out = []
+    for g in groups:
+        e = g[0]["eps"]
+        c, n, meta = _agg(g, kind)
+        if kind_q == "impacto_fila":
+            ranked = sorted([(_impact(g, [r], kind), r) for r in g if r[f"{kind}_aval"] > 0],
+                            key=lambda x: (x[0] if x[0] is not None else 0))
+            if not ranked:
+                continue
+            worst_imp, worst = ranked[0]
+            without, _, _ = _agg([r for r in g if r is not worst], kind)
+            lines = [f"{'🔴' if (worst_imp or 0) < 0 else '🟢'} *Fila que mais impacta ·* `{e}` *— {when}* · "
+                     f"{worst['fila']}", "_impacto = quanto o CSAT da EPS mudaria sem a fila_", ""]
+            lines.append(f"📍 *Ranking* — CSAT da {e} {_bfmt(c)}% (n={_fmt_int(n)})")
+            for i, (imp, r) in enumerate(ranked, 1):
+                cr, nr, _ = _agg([r], kind)
+                lines.append(f"{i}. {r['fila']} · *{'+' if (imp or 0) >= 0 else '−'}{_bfmt(abs(imp or 0), 2)} p.p.* · "
+                             f"CSAT {_bfmt(cr)}% (n={_fmt_int(nr)})" + prev_of(r["fila"]))
+            leitura = [f"Sem a {worst['fila']}, a {e} iria de {_bfmt(c)}% para {_bfmt(without)}%."]
+            if worst.get("motivo") and not use_d1:
+                leitura.append(f"Na {worst['fila']}, o motivo que mais tira é {worst['motivo']}.")
+            lines += ["", "💡 *Leitura*"] + [f"↳ {x}" for x in leitura]
+        else:
+            lines = [f"{_status_dot(c / meta * 100) if meta else '⚪'} *Resultado por fila ·* `{e}` *— {when}* · "
+                     f"CSAT {_bfmt(c)}%" + (f" (meta {_bfmt(meta)}%)" if meta else ""), ""]
+            lines.append(f"📍 *Por fila* — do maior impacto negativo para o menor")
+            for r in sorted(g, key=lambda r: (_impact(g, [r], kind) or 0)):
+                lines.append(fila_line(r, g))
+            rt = _ritmo_text(_ritmo(g, d1)) if not use_d1 else ""
+            if rt:
+                lines += ["", "💡 *Leitura*", f"↳ {e}: {rt}."]
+        out.append("\n".join(lines))
+    return "\n\n".join(out) if out else None
+
+
+def _table_context(eps: str | None) -> str:
+    """Números oficiais do mês por fila (só se a tabela do dia já estiver em cache), para as respostas livres usarem
+    os mesmos números das respostas prontas."""
+    try:
+        rows = _day_table(fetch=False)
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    sel = _scope_rows(rows, eps)
+    if not sel:
+        return ""
+    body = "; ".join(f"{r['eps']} · {r['fila']}: {_bfmt(_agg([r])[0])}% (n={_fmt_int(r['mes_aval'])})"
+                     for r in sel if r["mes_aval"])
+    return ("INFORMAÇÃO INTERNA PARA A LYRA — NÚMEROS OFICIAIS DO MÊS ATÉ ONTEM (use estes; se o subagente trouxer outro "
+            f"número para a mesma fila e período, fique com este): {body}\n\n")
+
+
+def _ritmo_for_report(fila: str, rows: list[dict[str, Any]] | None, d1: date) -> str:
+    if not rows:
+        return ""
+    r = next((x for x in rows if _norm_text(x["fila"]) == _norm_text(fila)), None)
+    if not r or not r.get("meta"):
+        return ""
+    rt = _ritmo(r, d1)
+    return f"🎯 *Ritmo do mês:* {_ritmo_text(rt)}." if rt else ""
+
+
+# ---------------------------------------------------------------------------
+# Registro das conversas (auditoria e saúde) e avaliações 👍/👎
+# ---------------------------------------------------------------------------
+CONVERSAS_WORKSHEET_TITLE = "Conversas"
+CONVERSAS_HEADERS = ["Data", "Hora", "Quem", "Escopo", "Canal", "Rota", "Pergunta", "Resposta", "Segundos", "Status", "Link"]
+AVALIACOES_WORKSHEET_TITLE = "Avaliações"
+AVALIACOES_HEADERS = ["Data", "Quem", "Reação", "Pergunta", "Resposta", "Escopo", "Link"]
+CONVERSATION_LOG = os.getenv("CONVERSATION_LOG", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+_NAO_SEI_RE = re.compile(r"(nao esta na minha base|nao sei|nao consegui|nao tenho (essa|esse|a|o) |one hub)")
+_WS_CACHE: dict[str, Any] = {}
+
+
+def _lyra_ws(title: str, headers: list[str]) -> Any | None:
+    if title in _WS_CACHE:
+        return _WS_CACHE[title]
+    google_client = _safe_google_client()
+    if google_client is None:
+        return None
+    try:
+        ws = _ensure_worksheet(_open_spreadsheet(google_client), title, headers)
+        _WS_CACHE[title] = ws
+        return ws
+    except Exception:
+        logger.warning("Could not open worksheet %s", title, exc_info=True)
+        return None
+
+
+def _log_conversation(event: dict[str, Any], eps: str | None, question: str, answers: list[str], seconds: float,
+                      failed: bool) -> None:
+    if not CONVERSATION_LOG or not question:
+        return
+    answer = "\n---\n".join(a for a in answers if a)
+    route = str(event.get("_route") or "livre")
+    status = "erro" if failed or answer.strip() in {ERROR_MESSAGE, TIMEOUT_ERROR_MESSAGE, EMPTY_ANSWER_MESSAGE} else (
+        "nao_sei" if _NAO_SEI_RE.search(_norm_text(answer)) else "ok")
+    now = _now_brazil()
+
+    def run() -> None:
+        ws = _lyra_ws(CONVERSAS_WORKSHEET_TITLE, CONVERSAS_HEADERS)
+        if ws is None:
+            return
+        try:
+            link = _permalink(str(event.get("channel") or ""), str(event.get("ts") or ""))
+            ws.append_row([now.strftime("%d/%m/%Y"), now.strftime("%H:%M"), str(event.get("user") or ""),
+                           eps or "iFood", str(event.get("channel_type") or "canal"), route, question[:1500],
+                           answer[:3000], str(round(seconds)), status, link], value_input_option="RAW")
+        except Exception:
+            logger.warning("Could not log conversation", exc_info=True)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+_THUMBS = {"+1": "👍", "thumbsup": "👍", "-1": "👎", "thumbsdown": "👎"}
+
+
+def _handle_reaction(event: dict[str, Any]) -> None:
+    """👍/👎 numa resposta da Lyra: registra; 👎 de alguém do iFood abre a pergunta "o que ficou errado?"."""
+    name = str(event.get("reaction") or "").split("::")[0]
+    thumb = _THUMBS.get(name)
+    item = event.get("item") or {}
+    bot = _bot_user_id()
+    if not thumb or item.get("type") != "message" or (bot and event.get("item_user") != bot):
+        return
+    channel, ts, user = str(item.get("channel") or ""), str(item.get("ts") or ""), str(event.get("user") or "")
+    text, thread_ts = "", ""
+    try:
+        hist = slack_app.client.conversations_history(channel=channel, latest=ts, oldest=ts, inclusive=True, limit=1)
+        msgs = _resp_get(hist, "messages", []) or []
+        if not msgs:
+            hist = slack_app.client.conversations_replies(channel=channel, ts=ts, inclusive=True, limit=1)
+            msgs = [m for m in (_resp_get(hist, "messages", []) or []) if str(m.get("ts")) == ts]
+        if msgs:
+            text, thread_ts = str(msgs[0].get("text") or ""), str(msgs[0].get("thread_ts") or "")
+    except Exception:
+        logger.warning("Could not read rated message", exc_info=True)
+    question = ""
+    if thread_ts and thread_ts != ts:
+        try:
+            root = next((m for m in _fetch_thread(channel, thread_ts) if m.get("ts") == thread_ts), {})
+            question = _strip_mentions(str(root.get("text") or ""))
+        except Exception:
+            pass
+    allowed, scope = (False, None)
+    try:
+        allowed, scope = _dm_scope(user)
+    except Exception:
+        pass
+    ws = _lyra_ws(AVALIACOES_WORKSHEET_TITLE, AVALIACOES_HEADERS)
+    if ws is not None:
+        try:
+            ws.append_row([_now_brazil().strftime("%d/%m/%Y %H:%M"), f"<@{user}>", thumb, question[:1000], text[:2000],
+                           scope or ("iFood" if allowed else "?"), _permalink(channel, ts)], value_input_option="RAW")
+        except Exception:
+            logger.warning("Could not log rating", exc_info=True)
+    if thumb == "👎" and allowed and scope is None:
+        root = thread_ts or ts
+        STATE.set(f"fb_pending:{channel}:{root}", user)
+        try:
+            slack_app.client.chat_postMessage(channel=channel, thread_ts=root,
+                                              text=f"<@{user}> o que ficou errado? Me conta aqui que eu anoto para a próxima.")
+        except Exception:
+            logger.warning("Could not ask for feedback", exc_info=True)
+
+
+def _feedback_pending(event: dict[str, Any]) -> bool:
+    channel = str(event.get("channel") or "")
+    root = str(event.get("thread_ts") or "")
+    key = f"fb_pending:{channel}:{root}"
+    if root and STATE.get(key) and STATE.get(key) == str(event.get("user") or ""):
+        STATE.set(key, "")
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Rotinas do time: auditoria diária, saúde semanal, fechamento do mês
+# ---------------------------------------------------------------------------
+AUDIT_TIME = datetime_time(18, 0)
+AUDIT_SAMPLE = int(os.getenv("AUDIT_SAMPLE", "10"))
+WEEKLY_HEALTH_TIME = datetime_time(9, 40)
+MONTH_CLOSE_TIME = datetime_time(10, 0)
+
+
+def _rows_between(title: str, headers: list[str], start: date, end: date) -> list[dict[str, str]]:
+    ws = _lyra_ws(title, headers)
+    if ws is None:
+        return []
+    out = []
+    for _, r in _worksheet_rows_with_header(ws):
+        d = _parse_any_date(str(r.get("Data") or "").split(" ")[0])
+        if d and start <= d <= end:
+            out.append(r)
+    return out
+
+
+def _daily_audit(now: datetime) -> None:
+    import random
+    rows = [r for r in _rows_between(CONVERSAS_WORKSHEET_TITLE, CONVERSAS_HEADERS, now.date(), now.date())
+            if r.get("Resposta") and r.get("Rota") not in {"lembrete", "aprendizado"}]
+    if not rows:
+        return
+    sample = random.sample(rows, min(AUDIT_SAMPLE, len(rows)))
+    items = [{"id": i + 1, "escopo": r.get("Escopo"), "pergunta": str(r.get("Pergunta"))[:500],
+              "resposta": str(r.get("Resposta"))[:1500]} for i, r in enumerate(sample)]
+    prompt = (
+        "TAREFA INTERNA DO APP — auditoria de qualidade. Não chame subagentes. Responda APENAS com JSON válido.\n"
+        "Avalie cada resposta da Lyra (agente de gestão das EPSs AeC e CSU do iFood) contra estas regras:\n"
+        "1) respondeu o que foi perguntado; 2) percentual com n; 3) recorte dito (padrão: mês); 4) escopo 'AeC' ou 'CSU' "
+        "não mostra dado da outra EPS; 5) não promete o que não faz ('vou lembrar', 'te mando depois'); 6) não expõe "
+        "bastidor (subagente, SQL, tabela, inconsistência da conta); 7) não chuta política (sem base, diz que não sabe); "
+        "8) Agentforce CX não é tratada como fila de EPS; 9) formato limpo (negrito com um asterisco, sem tabela).\n"
+        f"Respostas: {json.dumps(items, ensure_ascii=False)}\n"
+        'Formato: {"itens": [{"id": 1, "ok": true, "regra": "<nº da regra violada ou vazio>", "motivo": "<1 frase>"}]}'
+    )
+    try:
+        data = json.loads(_strip_json_code_blocks(ask_toqan(prompt, max_attempts=60)))
+        res = data.get("itens") if isinstance(data, dict) else None
+    except Exception:
+        logger.warning("Audit failed", exc_info=True)
+        return
+    if not isinstance(res, list):
+        return
+    bad = [x for x in res if isinstance(x, dict) and not x.get("ok")]
+    lines = [f"🔎 *Auditoria do dia · {now.strftime('%d/%m')}* — {len(res) - len(bad)} de {len(res)} respostas ok "
+             f"(amostra de {len(rows)} conversas)"]
+    for x in bad[:8]:
+        i = int(x.get("id") or 0) - 1
+        link = sample[i].get("Link") if 0 <= i < len(sample) else ""
+        q = str(sample[i].get("Pergunta"))[:80] if 0 <= i < len(sample) else ""
+        lines.append(f"• _{q}_ — regra {x.get('regra')}: {x.get('motivo')}" + (f" <{link}|ver>" if link else ""))
+    _alert("\n".join(lines))
+
+
+def _weekly_health(now: datetime) -> None:
+    start = now.date() - timedelta(days=7)
+    end = now.date() - timedelta(days=1)
+    conv = _rows_between(CONVERSAS_WORKSHEET_TITLE, CONVERSAS_HEADERS, start, end)
+    rates = _rows_between(AVALIACOES_WORKSHEET_TITLE, AVALIACOES_HEADERS, start, end)
+    if not conv and not rates:
+        _alert(f"🩺 *Saúde da Lyra · {start.strftime('%d/%m')} a {end.strftime('%d/%m')}* — nenhuma conversa registrada.")
+        return
+    secs = sorted(_to_float(r.get("Segundos")) or 0 for r in conv)
+    avg = sum(secs) / len(secs) if secs else 0
+    p90 = secs[int(0.9 * (len(secs) - 1))] if secs else 0
+    by_scope: dict[str, int] = {}
+    by_route: dict[str, int] = {}
+    for r in conv:
+        by_scope[r.get("Escopo") or "?"] = by_scope.get(r.get("Escopo") or "?", 0) + 1
+        by_route[r.get("Rota") or "?"] = by_route.get(r.get("Rota") or "?", 0) + 1
+    errs = sum(1 for r in conv if r.get("Status") == "erro")
+    naosei = sum(1 for r in conv if r.get("Status") == "nao_sei")
+    up = sum(1 for r in rates if r.get("Reação") == "👍")
+    down = [r for r in rates if r.get("Reação") == "👎"]
+    lines = [f"🩺 *Saúde da Lyra · {start.strftime('%d/%m')} a {end.strftime('%d/%m')}*", "",
+             f"• Conversas: *{len(conv)}* de {len({r.get('Quem') for r in conv})} pessoas · "
+             + " · ".join(f"{k} {v}" for k, v in sorted(by_scope.items(), key=lambda x: -x[1])),
+             f"• Tempo de resposta: média {_bfmt(avg / 60)} min · 90% em até {_bfmt(p90 / 60)} min",
+             f"• Erros: {errs} · \"não sei\": {naosei} · 👍 {up} · 👎 {len(down)}",
+             "• Mais pedidas: " + " · ".join(f"{k} {v}" for k, v in sorted(by_route.items(), key=lambda x: -x[1])[:5])]
+    if down:
+        lines += ["", "👎 *Respostas para revisar*"]
+        for r in down[:8]:
+            lines.append(f"• _{str(r.get('Pergunta') or r.get('Resposta'))[:90]}_" +
+                         (f" <{r.get('Link')}|ver>" if r.get("Link") else ""))
+    _alert("\n".join(lines))
+
+
+def _first_business_day(year: int, month: int) -> date:
+    d = date(year, month, 1)
+    while not _is_business_day(d):
+        d += timedelta(days=1)
+    return d
+
+
+def _month_close_text(tenant: Tenant, today: date) -> str | None:
+    eps = tenant.eps
+    if not eps:
+        return None
+    start, end = _prev_month_bounds(today)
+    rows = _day_table((start, end))
+    if not rows:
+        return None
+    g = _scope_rows(rows, eps)
+    if not g:
+        return None
+    mes = _MESES[start.month - 1]
+    c, n, meta = _agg(g, "mes")
+    lines = [f"📅 {_status_dot(c / meta * 100) if meta else '⚪'} *Fechamento de {mes} ·* `{eps}` *—* CSAT {_bfmt(c)}%"
+             + (f" (meta {_bfmt(meta)}%)" if meta else "") + f" · n={_fmt_int(n)}", ""]
+    lines.append("📍 *Por fila*")
+    ranked = sorted(g, key=lambda r: (_impact(g, [r]) or 0))
+    for r in ranked:
+        cr, nr, _ = _agg([r])
+        if cr is None:
+            continue
+        lines.append(f"{_status_dot(cr / r['meta'] * 100) if r.get('meta') else '⚪'} {r['fila']} · *{_bfmt(cr)}%* · "
+                     + (f"meta {_bfmt(r['meta'])}%" if r.get("meta") else "sem meta") + f" · n={_fmt_int(nr)}")
+    weeks = None
+    try:
+        weeks = _fetch_weekly_rows(eps)
+    except Exception:
+        weeks = None
+    if weeks:
+        tot = [[0.0, 0.0] for _ in range(4)]  # [promotoras, avaliações] por semana (s1 = mais recente)
+        for w in weeks.values():
+            for i in range(4):
+                tot[i][0] += (w.get("proms") or [0, 0, 0, 0])[i]
+                tot[i][1] += (w.get("avals") or [0, 0, 0, 0])[i]
+        serie = [f"{_bfmt(p / a * 100)}%" for p, a in reversed(tot) if a]
+        if len(serie) >= 2:
+            lines += ["", "📈 *Últimas 4 semanas* (operadores com 5+ pesquisas em 2 semanas)", "• " + " → ".join(serie)]
+        rein = sum(1 for w in weeks.values() if w["n"] == 4 and w["q4"] == 4)
+        if rein:
+            lines.append(f"• 🔁 {rein} reincidente(s) 4 semanas no Q4")
+    try:
+        gc = _safe_google_client()
+        ws = _ensure_worksheet(_open_spreadsheet(gc), "Compromissos", COMPROMISSOS_HEADERS) if gc else None
+        comp = [r for _, r in _worksheet_rows_with_header(ws)] if ws is not None else []
+    except Exception:
+        comp = []
+    comp = [r for r in comp if _eps_matches(r.get("EPS") or "", eps)
+            and (_parse_any_date(str(r.get("Data Inicio") or "")) or date.min) >= start
+            and (_parse_any_date(str(r.get("Data Inicio") or "")) or date.max) <= end]
+    if comp:
+        ok = sum(1 for r in comp if _norm_text(r.get("Sucesso")) in {"sim", "ok", "cumprido", "melhorou"})
+        nr = sum(1 for r in comp if _norm_text(r.get("Ação Tomada")) == _norm_text(SEM_RESPOSTA))
+        lines += ["", "📌 *Compromissos do mês*",
+                  f"• {len(comp)} registrados · {ok} com resultado positivo · {nr} cobrança(s) sem resposta"]
+    pontos = []
+    for r in ranked[:2]:
+        imp = _impact(g, [r])
+        if imp is not None and imp < 0:
+            pontos.append(f"{r['fila']}: tirou {_bfmt(abs(imp), 2)} p.p. da {eps}"
+                          + (f", puxada por {r['motivo']}" if r.get("motivo") else "") + ".")
+    if weeks and any(w["n"] == 4 and w["q4"] == 4 for w in weeks.values()):
+        pontos.append("Reincidentes 4 semanas: plano individual com a supervisão (\"reincidentes da " + eps + "\" traz a lista).")
+    if pontos:
+        lines += ["", "🎯 *3 pontos para o mês*"] + [f"{i}. {p}" for i, p in enumerate(pontos[:3], 1)]
+    lines += ["", "_Plano do mês aqui na thread: *ação · responsável · prazo*._"]
+    return "\n".join(lines)
+
+
+def _team_routines_tick(now: datetime) -> None:
+    today = now.date()
+    if now.time() >= AUDIT_TIME and not STATE.get(f"audit:{today.isoformat()}"):
+        STATE.set(f"audit:{today.isoformat()}", "1")
+        threading.Thread(target=_daily_audit, args=(now,), daemon=True).start()
+    if today.weekday() == 0 and now.time() >= WEEKLY_HEALTH_TIME and not STATE.get(f"health:{today.isoformat()}"):
+        STATE.set(f"health:{today.isoformat()}", "1")
+        threading.Thread(target=_weekly_health, args=(now,), daemon=True).start()
+    if today == _first_business_day(today.year, today.month) and now.time() >= MONTH_CLOSE_TIME:
+        for tenant in TENANTS:
+            key = _skey("month_close", tenant, today)
+            if not tenant.eps or STATE.get(key):
+                continue
+            STATE.set(key, "1")
+
+            def run(t: Tenant = tenant) -> None:
+                try:
+                    text = _month_close_text(t, today)
+                    if text:
+                        _post_sections(t.channel, text)
+                    else:
+                        _alert(f"[{t.key}] Fechamento do mês não saiu (tabela do mês anterior indisponível).")
+                except Exception as exc:
+                    _alert(f"[{t.key}] Fechamento do mês falhou: {type(exc).__name__}")
+            threading.Thread(target=run, daemon=True).start()
+
+
 def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bool, client: Any = None) -> None:
+    """Processa a mensagem e registra a conversa (pergunta, resposta, tempo, rota) para auditoria e saúde."""
+    started = time.time()
+    said: list[str] = []
+    orig_say = say
+
+    def say(*args: Any, **kwargs: Any) -> Any:  # noqa: F811 — guarda o que foi respondido
+        text = kwargs.get("text") if "text" in kwargs else (args[0] if args else "")
+        said.append(str(text or ""))
+        return orig_say(*args, **kwargs)
+
+    failed = {"v": False}
+    try:
+        _process_event_inner(event, say, in_thread, client, failed)
+    finally:
+        if not event.get("_skip_log"):
+            try:
+                question = _strip_mentions(str(event.get("text") or ""))
+                _log_conversation(event, event.get("_eps"), question, said, time.time() - started, failed["v"])
+            except Exception:
+                logger.warning("Conversation log failed", exc_info=True)
+
+
+def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thread: bool, client: Any,
+                         failed: dict[str, bool]) -> None:
     """Processa upload de MOP ou repassa a mensagem para o Toqan."""
     event_key = _event_key(event)
     with _IN_FLIGHT_LOCK:
@@ -5706,6 +6585,9 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
     question = _strip_mentions(str(event.get("text") or ""))
     try:
         allowed, eps = _event_scope(event)
+        event["_eps"] = eps
+        if not allowed:
+            event["_skip_log"] = True
         if not allowed and str(event.get("channel") or "") in ALERT_CHANNEL_IDS:
             _monitoring_channel_reply(question, say, event, in_thread)
             return
@@ -5717,6 +6599,7 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             return
         mop_answer = _process_mop_upload(event, client, eps)
         if mop_answer is not None:
+            event["_route"] = "mop_upload"
             _say(say, mop_answer, event, in_thread=True)
             return
         if not question:
@@ -5740,15 +6623,33 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             return
 
         try:
+            if _handle_reminder(event, question, say, in_thread):
+                event["_route"] = "lembrete"
+                return
+        except Exception:
+            logger.warning("Reminder handling failed", exc_info=True)
+        try:
             if _handle_learning(event, question, eps, say, in_thread):
+                event["_route"] = "aprendizado"
                 return
         except Exception:
             logger.warning("Learning handling failed", exc_info=True)
+        if not _report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or "")):
+            try:
+                table = _table_answer(question, eps)
+            except Exception:
+                logger.warning("Day table answer failed", exc_info=True)
+                table = None
+            if table:
+                event["_route"] = "tabela"
+                _say_sections(say, table, event)
+                return
         in_report_thread = bool(_report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or "")))
         asks = _is_question_like(question)
         analytical = _is_analytical(question)  # "por que", "quem piorou", "quanto contribuiu": análise livre
         progress = _Progress(event)
         if _is_team_request(question) and not analytical and (asks or not in_report_thread):
+            event["_route"] = "equipe"
             progress("Vou montar o resultado da equipe, já te mando. ⏳")
             try:
                 problem = _send_team_view(event, client, eps, question, say, in_thread)
@@ -5759,6 +6660,7 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             return
 
         if _is_reincidentes_request(question) and not analytical and (asks or not in_report_thread):
+            event["_route"] = "reincidentes"
             progress("Vou puxar as últimas 4 semanas dos operadores, já te mando. ⏳")
             try:
                 problem = _send_reincidentes(event, client, eps, question, say, in_thread)
@@ -5777,6 +6679,7 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
         if (_is_operators_excel_request(op_question) and (wants_file or not analytical)
                 and (asks or not in_report_thread)):
             if _operator_names_allowed(eps) and not wants_file:  # direto no chat, com nome (cada EPS só vê os dela)
+                event["_route"] = "operadores"
                 progress("Vou puxar o resultado por operador, já te mando. ⏳")
                 try:
                     problem = _send_operators_inline(event, client, eps, op_question, say, in_thread)
@@ -5793,12 +6696,14 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             return
 
         if _is_mop_export_request(question):
+            event["_route"] = "mop"
             problem = _send_mop_export(event, client, eps or _eps_in_text(question))
             if problem:
                 _say(say, problem, event, in_thread)
             return
 
         if _is_chart_request(question):
+            event["_route"] = "grafico"
             _say(say, "Vou montar o gráfico, já te mando aqui. ⏳", event, in_thread=True)
             problem = _send_chart(event, client, eps, question, send_progress=lambda m: _say(say, m, event, in_thread=True))
             if problem:
@@ -5806,6 +6711,7 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             return
 
         if _is_data_excel_request(question):
+            event["_route"] = "planilha"
             _say(say, "Vou montar a planilha, já te mando aqui. ⏳", event, in_thread=True)
             problem = _send_data_excel(event, client, eps, question)
             if problem:
@@ -5842,6 +6748,7 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
                          "e response rate). Feche com 1 frase sobre o que é da EPS cobrar.\n\n")
         if not extra and (_is_identity_question(question) or _identity_thread(event, question)):
             extra = IDENTITY_INSTRUCTION
+            event["_route"] = "apresentacao"
         elif not extra and _is_plan_request(question):
             extra = PLAN_INSTRUCTION
         elif not extra and _is_clube_question(question) and not _DATA_WORDS_RE.search(_norm_text(question)):
@@ -5851,7 +6758,8 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
         context = _thread_context(event) or _dm_context(event)
         prompt = (f"{_scope_instruction(eps)}\n\n{_date_context(question)}{context}{extra}"
                   f"{DEFAULTS_INSTRUCTION if not extra else ''}{FULL_ACCESS_INSTRUCTION if _operator_names_allowed(eps) else ''}"
-                  f"{ANSWER_LAYOUT_INSTRUCTION}{_learnings_instruction(eps)}{_inject_mop_context(question, eps)}")
+                  f"{ANSWER_LAYOUT_INSTRUCTION}{_learnings_instruction(eps)}{_table_context(eps)}"
+                  f"{_inject_mop_context(question, eps)}")
         answer = _recent_answer(prompt)
         if answer is None:
             try:
@@ -5899,9 +6807,11 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
         logger.warning("MOP upload could not update Google Sheets: %s", exc)
         _say(say, MOP_SHEETS_ERROR_MESSAGE, event, in_thread=True)
     except ToqanAPIError as exc:
+        failed["v"] = True
         logger.exception("Lyra could not process Slack event")
         _say(say, TIMEOUT_ERROR_MESSAGE if "polling timed out" in str(exc) else ERROR_MESSAGE, event, in_thread)
     except Exception:
+        failed["v"] = True
         logger.exception("Lyra could not process Slack event")
         _say(say, ERROR_MESSAGE, event, in_thread)
     finally:
@@ -7014,6 +7924,17 @@ def _route_chamados_event(event: dict[str, Any]) -> bool:
         threading.Thread(target=_handle_rewards_reply, args=(event,), daemon=True).start()
         return True
     return False
+
+
+@slack_app.event("reaction_added")
+def handle_reaction_added(event, ack):
+    ack()
+    threading.Thread(target=_handle_reaction, args=(event,), daemon=True).start()
+
+
+@slack_app.event("reaction_removed")
+def handle_reaction_removed(event, ack):
+    ack()
 
 
 @slack_app.event("message")
