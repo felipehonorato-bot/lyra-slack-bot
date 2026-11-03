@@ -4541,6 +4541,16 @@ def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref
     sign = lambda v: ("+" if v > 0 else "−" if v < 0 else "") + _bfmt(abs(v), 2 if abs(v) < 0.1 else 1)
     arrow = "📉" if total < 0 else "📈" if total > 0 else "➖"
     lines = [f"{arrow} *Variação do CSAT ·* `{fila}` — {label_ref} → {label_cur}"]
+
+    def tag(label: str, fallback: str) -> str:  # "mês anterior (01/10–02/10)" -> "01–02/10"
+        m = re.search(r"\((\d{1,2})/(\d{1,2})\s*[–-]\s*(\d{1,2})/(\d{1,2})\)", label or "")
+        if m:
+            return f"{m.group(1)}–{m.group(3)}/{m.group(4)}" if m.group(2) == m.group(4) else \
+                f"{m.group(1)}/{m.group(2)}–{m.group(3)}/{m.group(4)}"
+        m = re.search(r"\((\d{1,2}/\d{1,2})\)", label or "")
+        return m.group(1) if m else fallback
+
+    t_ref, t_cur = tag(label_ref, "antes"), tag(label_cur, "agora")
     n_txt = ""
     if data.get("n_ref") is not None and data.get("n_atual") is not None:
         n_txt = f" · n {_fmt_int(_num(data['n_ref']) or 0)} → {_fmt_int(_num(data['n_atual']) or 0)}"
@@ -4548,10 +4558,12 @@ def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref
     if mix is not None:
         lines.append("")
         lines.append(f"🔀 *Efeito mix: {sign(mix)} p.p.* — mudou o tipo de contato que chegou")
+        lines.append(f"_participação de cada motivo nas avaliações: {t_ref} → {t_cur}_")
         top_mix = sorted([m for m in (data.get("top_mix") or []) if isinstance(m, dict)],
                          key=lambda m: (_num(m.get("efeito_pp")) or 0) * (1 if mix > 0 else -1), reverse=True)
         for m in top_mix[:3]:
-            part = f"• {_motivo_label(m.get('motivo'))}: {_bfmt(_num(m.get('share_ref')) or 0)}% → {_bfmt(_num(m.get('share_atual')) or 0)}% das avaliações"
+            part = (f"• {_motivo_label(m.get('motivo'))}: {_bfmt(_num(m.get('share_ref')) or 0)}% → "
+                    f"{_bfmt(_num(m.get('share_atual')) or 0)}% das avaliações")
             if m.get("csat_ref") is not None:
                 part += f" (CSAT {_bfmt(_num(m['csat_ref']) or 0)}%)"
             if m.get("efeito_pp") is not None:
@@ -4560,6 +4572,7 @@ def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref
     if perf is not None:
         lines.append("")
         lines.append(f"🎯 *Efeito performance: {sign(perf)} p.p.* — mudou o atendimento do mesmo motivo")
+        lines.append(f"_CSAT de cada motivo: {t_ref} → {t_cur} · p.p. = quanto isso mexeu no CSAT da fila_")
         top_perf = sorted([m for m in (data.get("top_performance") or []) if isinstance(m, dict)],
                           key=lambda m: (_num(m.get("efeito_pp")) or 0) * (1 if perf > 0 else -1), reverse=True)
         for m in top_perf[:3]:
@@ -4574,7 +4587,7 @@ def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref
         d = rr_cur - rr_ref
         note = "mudou a amostra: parte da variação pode ser de quem respondeu" if abs(d) >= 3 else "estável, não distorce a leitura"
         lines.append("")
-        lines.append(f"📨 *Response rate:* {_bfmt(rr_ref)}% → {_bfmt(rr_cur)}% ({sign(d)} p.p.) — {note}")
+        lines.append(f"📨 *Response rate ({t_ref} → {t_cur}):* {_bfmt(rr_ref)}% → {_bfmt(rr_cur)}% ({sign(d)} p.p.) — {note}")
     leitura = str(data.get("leitura") or "").strip()
     if leitura:
         lines.append("")
@@ -6633,8 +6646,22 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             return
         targets = _report_targets(question) if eps is None else None
         if targets:
-            _say(say, f"Rodando o report agora ({', '.join(t.key for t in targets)})… pode levar alguns minutos.", event, in_thread)
-            _say(say, "\n".join(_run_report_now(targets)), event, in_thread)
+            event["_route"] = "report_manual"
+            _say(say, f"Rodando o report agora ({', '.join(t.key for t in targets)}), as EPSs em paralelo. Te aviso aqui "
+                      "quando cada uma sair (costuma levar de 5 a 20 min).", event, in_thread)
+            results: dict[str, str] = {}
+
+            def run_one(t: Tenant) -> None:
+                results[t.key] = "\n".join(_run_report_now([t]))
+                _say(say, results[t.key], event, in_thread)
+                if PREWARM_BASES and "✅" in results[t.key]:
+                    _prewarm_bases(t.eps or "")
+
+            workers = [threading.Thread(target=run_one, args=(t,), daemon=True) for t in targets]
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join()
             return
         if eps is None and _is_data_test_request(question):
             _say(say, _agents_summary(_run_agent_checks(_now_brazil())), event, in_thread)
