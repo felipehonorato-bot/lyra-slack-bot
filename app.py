@@ -2888,7 +2888,7 @@ def _operators_rows(eps: str | None, question: str) -> tuple[list[list[str]], in
     period, period_label = _operators_period(question)
     if eps is None:
         eps = _eps_of_question(question)  # visão completa pedindo uma EPS (ou fila): recorta nela
-    answer = _ask_cached(_operators_prompt(eps, period))
+    answer = _ask_base(_operators_prompt(eps, period))
     if _is_error_answer(answer):
         return "Não consegui puxar os dados dos operadores agora. Tenta de novo em alguns minutos?"
     rows, total = _parse_operators_csv(answer)
@@ -3263,6 +3263,24 @@ def _team_stats(rows: list[list[str]]) -> dict[str, Any]:
             "disp": (q4 / q1) if q1 and q4 is not None else None, "amp": amp, "below": below, "pareto": pareto}
 
 
+_SQL_RETRY_RE = re.compile(r"(table_or_view_not_found|not found|syntax|parse|unresolved|cannot resolve|ambiguous|"
+                           r"nao foi encontrad|invalid|unrecognized)", re.I)
+
+
+def _ask_base(prompt: str) -> str:
+    """Base pesada (operadores, semanas, tabela do dia): se a consulta voltar com erro de SQL (tabela/CTE não
+    encontrada, sintaxe), tenta mais uma vez pedindo o SQL numa instrução só. Erro de token/acesso não repete."""
+    answer = _ask_cached(prompt)
+    if not _is_error_answer(answer) or _looks_like_token_error(answer) or not _SQL_RETRY_RE.search(str(answer)):
+        return answer
+    logger.warning("Base query SQL error, retrying once: %s", str(answer)[:200])
+    retry = (prompt + "\n\nA tentativa anterior falhou com: " + str(answer).strip()[:300] + "\nRode o SQL como UMA "
+             "instrução só (WITH ... SELECT ...) num único comando, sem criar nem referenciar tabela/view temporária e "
+             "sem dividir em etapas; cada CTE precisa estar no mesmo WITH em que é usada.")
+    second = _ask_cached(retry)
+    return second
+
+
 def _cached_only(prompt: str) -> str | None:
     key = f"{_as_date(_today_brazil()).isoformat()}|{hash(prompt)}"
     with _BASE_LOCK:
@@ -3277,10 +3295,10 @@ def _fetch_operator_rows(eps: str | None, period: str, emails: list[str] | None 
     answer = _cached_only(full) if emails else None
     if answer is None and emails:
         lista = ", ".join(sorted(emails)[:400])
-        answer = _ask_cached(_operators_prompt(eps, f"{period}. Mínimo: 1 avaliação (o app marca amostra pequena). "
+        answer = _ask_base(_operators_prompt(eps, f"{period}. Mínimo: 1 avaliação (o app marca amostra pequena). "
                                                     f"Só estes operadores (e-mails): {lista}."))
     elif answer is None:
-        answer = _ask_cached(full)
+        answer = _ask_base(full)
     if _is_error_answer(answer):
         return None
     rows, _ = _parse_operators_csv(answer)
@@ -3402,7 +3420,7 @@ def _alert_unreadable(what: str, eps: str | None, answer: str | None) -> None:
 
 def _fetch_weekly_rows(eps: str | None) -> dict[str, dict[str, Any]] | None:
     """e-mail -> {q4: semanas no Q4, n: semanas com amostra, csats: CSAT s1..s4 (None sem amostra), fila}."""
-    answer = _ask_cached(_weeks_prompt(eps))
+    answer = _ask_base(_weeks_prompt(eps))
     if _is_error_answer(answer):
         _alert(f"Reincidentes 4 semanas ({eps or 'iFood'}): a consulta voltou com erro — {str(answer).strip()[:200]}")
         return None
@@ -5982,7 +6000,7 @@ def _day_table(period: tuple[date, date] | None = None, fetch: bool = True) -> l
     d1 = _as_date(_today_brazil()) - timedelta(days=1)
     start, end = period or _month_bounds(d1)
     prompt = _table_prompt(start, end, end if period else d1)
-    answer = _ask_cached(prompt) if fetch else _cached_only(prompt)
+    answer = _ask_base(prompt) if fetch else _cached_only(prompt)
     if answer is None or _is_error_answer(answer):
         return None
     rows = _parse_table(answer)
