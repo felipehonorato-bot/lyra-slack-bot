@@ -4212,6 +4212,10 @@ def _report_blocks(value: str) -> list[dict[str, Any]]:
     return [{"fila": "", "ts": value, "cobranca": True}]
 
 
+REPORT_NO_TMA_NOTE = ("TMA FORA DO REPORT HOJE: NÃO rode o SQL de TMA. Na Lyra Indicadores, peça os dados do report "
+                      "diário SEM a seção TMA POR FILA (escreva 'TMA: não solicitado').")
+
+
 def _report_prompt(tenant: Tenant, compromissos_text: str) -> str:
     scope = _scope_instruction(tenant.eps)
     if tenant.eps:
@@ -4225,8 +4229,12 @@ def _report_prompt(tenant: Tenant, compromissos_text: str) -> str:
         parts.append(compromissos_text)
     filas_tenant = _celulas_of(tenant.eps) if tenant.eps else list(TMA_PLAN)
     plan_lines = [f"- {f}: {_fmt_tempo(TMA_PLAN[f][0])}" for f in filas_tenant if f in TMA_PLAN]
-    if plan_lines:
+    if not TMA_IN_REPORT:
+        parts.append(REPORT_NO_TMA_NOTE)
+    elif plan_lines:
         parts.append("PLAN DE TMA (TMA acima do plan = fora do alvo):\n" + "\n".join(plan_lines))
+    parts.append("SE O TMA FALHAR OU VIER VAZIO: não devolva ERRO por causa do TMA. Deixe o TMA da fila como 'sem dado' "
+                 "e siga com o CSAT; ERRO só se a consulta de CSAT falhar.")
     parts.append(DAILY_REPORT_PROMPT)
     return "\n\n".join(parts)
 
@@ -4707,6 +4715,10 @@ def _run_daily_report(now: datetime | None = None, tenant: Tenant | None = None)
     crisis_thread = threading.Thread(target=check_crisis, daemon=True)
     crisis_thread.start()
     answer = ask_toqan(_report_prompt(tenant, compromissos_text))
+    if _is_error_answer(answer) and "tma" in _norm_text(answer):
+        # o TMA não pode derrubar o report: tenta de novo sem TMA
+        logger.warning("[%s] Report failed on TMA, retrying without TMA: %s", tenant.key, answer.strip()[:200])
+        answer = ask_toqan(_report_prompt(tenant, compromissos_text) + "\n\n" + REPORT_NO_TMA_NOTE)
     if _is_error_answer(answer):
         raise ReportGenerationError(answer.strip()[:300] or "resposta vazia")
 
