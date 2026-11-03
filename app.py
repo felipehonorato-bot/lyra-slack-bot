@@ -3332,7 +3332,8 @@ def _weeks_prompt(eps: str | None) -> str:
         "Se você usa subagentes, peça ao subagente de indicadores com "
         f"'EPS: {eps or 'iFood'}', 'Pedido: base de operadores por semana (CSV)' e 'Semanas: {sem}'.\n"
         f"Semanas (pela data de abertura do caso): {sem}. Só filas da lista oficial da EPS. Uma consulta só, agrupada "
-        "por operador (use o SQL da seção 8.4b). Só operadores com 5+ avaliações em pelo menos 2 das 4 semanas.\n"
+        "por operador (use o SQL da seção 8.4b). Só operadores no Q4 (CSAT < 90% da meta da fila) em pelo menos 2 das 4 "
+        "semanas, contando só semanas com 5+ avaliações (o filtro vai no SQL; a saída precisa ser pequena).\n"
         "Responda APENAS o CSV separado por ';', escrito no corpo da resposta (NUNCA salve em arquivo nem devolva nome de "
         "arquivo ou link), sem markdown e sem texto antes ou depois, com este cabeçalho:\n"
         f"{';'.join(WEEKS_HEADER)}\n"
@@ -6491,6 +6492,30 @@ def _weekly_health(now: datetime) -> None:
     _alert("\n".join(lines))
 
 
+def _eps_weekly_series(eps: str) -> list[str]:
+    """CSAT da EPS nas 4 últimas semanas (s4 → s1), pela Indicadores (pedido 8.4c)."""
+    import csv as _csv
+    rng = _weeks_ranges()
+    sem = "; ".join(f"s{i + 1} = {a.strftime('%d/%m/%Y')} a {b.strftime('%d/%m/%Y')}" for i, (a, b) in enumerate(rng))
+    prompt = (f"{_scope_instruction(eps)}\n\nTAREFA INTERNA DO APP — CSAT por semana. Não é mensagem para o Slack.\n"
+              f"Chame a *Lyra Indicadores* com 'EPS: {eps}', 'Pedido: CSAT por semana (CSV)' e 'Semanas: {sem}'. "
+              "Responda APENAS o CSV no corpo da resposta, cabeçalho: semana;aval;prom. Falhou: 'ERRO: <motivo>'.")
+    try:
+        answer = _ask_base(prompt)
+    except Exception:
+        return []
+    if _is_error_answer(answer):
+        return []
+    vals: dict[int, float] = {}
+    for row in _csv.reader(io.StringIO(_strip_json_code_blocks(answer).replace("```", "")), delimiter=";"):
+        if len(row) >= 3:
+            m = re.search(r"([1-4])", row[0])
+            a, p = _to_float(row[1].replace(",", ".")), _to_float(row[2].replace(",", "."))
+            if m and a:
+                vals[int(m.group(1))] = (p or 0) / a * 100
+    return [f"{_bfmt(vals[i])}%" for i in (4, 3, 2, 1) if i in vals]
+
+
 def _first_business_day(year: int, month: int) -> date:
     d = date(year, month, 1)
     while not _is_business_day(d):
@@ -6526,15 +6551,10 @@ def _month_close_text(tenant: Tenant, today: date) -> str | None:
         weeks = _fetch_weekly_rows(eps)
     except Exception:
         weeks = None
+    serie = _eps_weekly_series(eps)
+    if len(serie) >= 2:
+        lines += ["", "📈 *Últimas 4 semanas* (CSAT da EPS, da mais antiga para a mais recente)", "• " + " → ".join(serie)]
     if weeks:
-        tot = [[0.0, 0.0] for _ in range(4)]  # [promotoras, avaliações] por semana (s1 = mais recente)
-        for w in weeks.values():
-            for i in range(4):
-                tot[i][0] += (w.get("proms") or [0, 0, 0, 0])[i]
-                tot[i][1] += (w.get("avals") or [0, 0, 0, 0])[i]
-        serie = [f"{_bfmt(p / a * 100)}%" for p, a in reversed(tot) if a]
-        if len(serie) >= 2:
-            lines += ["", "📈 *Últimas 4 semanas* (operadores com 5+ pesquisas em 2 semanas)", "• " + " → ".join(serie)]
         rein = sum(1 for w in weeks.values() if w["n"] == 4 and w["q4"] == 4)
         if rein:
             lines.append(f"• 🔁 {rein} reincidente(s) 4 semanas no Q4")
