@@ -540,7 +540,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.14.11"
+APP_VERSION = "5.14.14"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -7350,7 +7350,7 @@ def _status_fila(title: str, eps: str) -> str | None:
 
 # Formato "bloco" (ex.: Controle de SLA/CSAT Review da CSU): "20/10 – 9h:00 / CSAT: 87,05% / Promotoras: 14 /
 # Detratoras: 6 / SLA Primeira Resposta: 100% / Volume da fila: 0 / Cenário atual: ... / Ações em andamento: * ..."
-_BLOCK_HEAD_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*[–\-—]\s*(\d{1,2})\s*h\s*:?\s*(\d{2})?", re.IGNORECASE)
+_BLOCK_HEAD_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*[–\-—]\s*(\d{1,2})\s*(?:h\s*:?\s*(\d{2})?|:\s*(\d{2}))", re.IGNORECASE)
 _BLOCK_CSAT_RE = re.compile(r"\bCSAT\s*:\s*([\d.,]+)\s*%", re.IGNORECASE)
 _BLOCK_FIELDS = {
     "promotoras": re.compile(r"promotor\w*\s*:\s*(\d+)", re.IGNORECASE),
@@ -7372,7 +7372,7 @@ def _parse_block_status(raw: str) -> dict[str, Any] | None:
     if not cm or not _looks_like_status(raw):
         return None
     hm = _BLOCK_HEAD_RE.search(raw)
-    status: dict[str, Any] = {"hora": f"{int(hm.group(1)):02d}:{hm.group(2) or '00'}" if hm else "--:--",
+    status: dict[str, Any] = {"hora": f"{int(hm.group(1)):02d}:{hm.group(2) or hm.group(3) or '00'}" if hm else "--:--",
                               "csat": _num(cm.group(1)), "formato": "bloco", "previsao": None}
     for key, rx in _BLOCK_FIELDS.items():
         fm = rx.search(raw)
@@ -7406,6 +7406,112 @@ def _parse_status(text: str) -> dict[str, Any] | None:
     return status
 
 
+# --- Leitura livre de controle (qualquer formato, texto e/ou imagem) -------------------------------------------
+# Os formatos fixos acima são lidos por regra. Quando a EPS manda em outro formato (mudou o modelo, só imagem,
+# tópicos em vez de linha única), a Lyra lê com o agente e devolve os mesmos campos; as regras de cobrança são as
+# mesmas. A leitura de cada mensagem fica guardada (não lê de novo a cada status).
+LLM_CONTROL_READ = os.getenv("LLM_CONTROL_READ", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+_CONTROL_HINT_RE = re.compile(r"\b(csat|sla|nps|tma|tme|fila|volume|promotor\w*|detrator\w*|backlog|produtividade|"
+                              r"status|resultado|indicador\w*)\b")
+
+
+def _strip_md(text: str) -> str:
+    return re.sub(r"[*_`~]", "", str(text or ""))
+
+
+def _maybe_control(message: dict[str, Any]) -> bool:
+    """Mensagem com cara de atualização de indicador (número + indicador) ou com print anexado."""
+    text = _norm_text(_strip_md(message.get("text")))
+    return bool(_image_files(message)) or bool(_CONTROL_HINT_RE.search(text) and re.search(r"\d", text))
+
+
+def _status_complete(status: dict[str, Any] | None) -> bool:
+    """A leitura por regra pegou o essencial? Senão, vale a leitura livre."""
+    return bool(status and status.get("csat") is not None and status.get("hora") not in (None, "", "--:--")
+                and (status.get("motivo") or status.get("passos")))
+
+
+def _control_prompt(title: str, fila: str, text: str, has_images: bool) -> str:
+    meta, sla_meta = _meta_fila(fila), SLA_METAS.get(fila)
+    return (
+        "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. NÃO chame subagentes e NÃO consulte dados.\n"
+        f"Leia esta atualização de controle que a EPS postou na thread \"{_strip_md(title)[:80]}\" (fila {fila}). "
+        "O formato muda de pessoa para pessoa: pode ser linha única, tópicos, bloco, só imagem (print de painel) ou "
+        "texto + imagem. Extraia os números do texto E das imagens anexadas" + (" (há imagens)" if has_images else "")
+        + ". Nunca chute número: o que não estiver escrito é null.\n"
+        + (f"Meta de CSAT da fila: {_fmt_meta(meta)}%. " if meta is not None else "")
+        + (f"Meta de SLA: {_fmt_meta(sla_meta)}%. " if sla_meta is not None else "")
+        + "\nDevolva APENAS JSON válido, números com ponto decimal, percentuais sem %:\n"
+        '{"e_status": true, "hora": "11:00", "csat": 87.2, "sla": 90.64, "promotoras": null, "detratoras": null, '
+        '"volume_fila": null, "motivo": "resumo do motivo/cenário que a EPS deu", "acoes": ["ação 1"], '
+        '"previsao": null, "outros": [{"indicador": "TMA", "valor": "9 min"}], "ruim": [], "bom": []}\n'
+        "Regras:\n"
+        "- e_status=false se NÃO for atualização de indicadores (conversa, dúvida, agradecimento, aviso).\n"
+        "- hora = hora de referência do status (ex.: 'Status atual – 11h' → '11:00'; '04/11 – 09:00' → '09:00').\n"
+        "- sla = SLA de 1ª resposta; se só houver 'SLA', use esse.\n"
+        "- motivo = o porquê que a EPS deu (cenário, motivo da não entrega, pontos de atenção), em até 200 caracteres. "
+        "acoes = ações/próximos passos como a EPS escreveu. previsao = prazo que a EPS deu, se houver.\n"
+        "- ruim = até 3 problemas CONCRETOS, com número, que a EPS NÃO explicou ou que contradizem o próprio texto "
+        "(ex.: diz 'fila controlada' mas o print mostra 40 casos em espera; CSAT informado diferente do print; "
+        "indicador do print muito pior que o do texto). NÃO repita CSAT/SLA abaixo da meta (o app já cobra) nem o que "
+        "a EPS já justificou. Na dúvida, deixe vazio.\n"
+        "- bom = até 2 pontos positivos concretos.\n\n"
+        f"Texto da mensagem:\n{_strip_md(text)[:2500] or '(sem texto, só imagem)'}"
+    )
+
+
+def _llm_status(channel: str, title: str, fila: str, message: dict[str, Any]) -> dict[str, Any] | None:
+    """Leitura livre de uma mensagem de controle; guarda o resultado por mensagem (e por edição)."""
+    ts = str(message.get("ts") or "")
+    edited = str((message.get("edited") or {}).get("ts") or "")
+    key = f"llmstatus:{channel}:{ts}:{edited}"
+    cached = STATE.get(key)
+    if cached:
+        try:
+            got = json.loads(cached)
+            return got or None
+        except ValueError:
+            pass
+    images = _image_files(message)[:3]
+    try:
+        if images:
+            file_ids = []
+            for f in images:
+                content = _download_slack_bytes(f)
+                if content:
+                    file_ids.append(toqan_upload_file(content, str(f.get("name") or "print.png"),
+                                                      str(f.get("mimetype") or "image/png")))
+            prompt = _control_prompt(title, fila, str(message.get("text") or ""), bool(file_ids))
+            answer = (ask_toqan_with_files(prompt, file_ids, max_attempts=PRINT_MAX_POLLS) if file_ids
+                      else ask_toqan(prompt, max_attempts=PRINT_MAX_POLLS))
+        else:
+            answer = ask_toqan(_control_prompt(title, fila, str(message.get("text") or ""), False),
+                               max_attempts=PRINT_MAX_POLLS)
+    except Exception as exc:
+        logger.warning("Leitura livre de controle falhou (%s)", ts, exc_info=True)
+        _alert(f"Controle ({fila}): não consegui ler uma atualização fora do padrão ({type(exc).__name__}: "
+               f"{str(exc)[:120]}). Vou tentar de novo na próxima mensagem da thread.")
+        return None  # não guarda: tenta de novo depois
+    data = _block_data_from_json(answer) or {}
+    status: dict[str, Any] | None = None
+    if data.get("e_status") and (_num(data.get("csat")) is not None or _num(data.get("sla")) is not None):
+        hm = re.match(r"\s*(\d{1,2})(?:\s*[:h]\s*(\d{2}))?", str(data.get("hora") or ""))
+        acoes = [str(a).strip() for a in (data.get("acoes") or []) if str(a).strip()]
+        status = {
+            "hora": f"{int(hm.group(1)):02d}:{hm.group(2) or '00'}" if hm else "--:--",
+            "csat": _num(data.get("csat")), "sla": _num(data.get("sla")),
+            "promotoras": _num(data.get("promotoras")), "detratoras": _num(data.get("detratoras")),
+            "volume": _num(data.get("volume_fila")), "motivo": str(data.get("motivo") or "").strip(),
+            "acoes": acoes, "passos": " | ".join(acoes),
+            "previsao": (str(data.get("previsao")).strip() or None) if data.get("previsao") else None,
+            "formato": "livre",
+            "ruim": [str(r).strip() for r in (data.get("ruim") or []) if str(r).strip()][:3],
+            "bom": [str(b).strip() for b in (data.get("bom") or []) if str(b).strip()][:2],
+        }
+    STATE.set(key, json.dumps(status or {}))
+    return status
+
+
 def _status_issues(statuses: list[dict[str, Any]], fila: str) -> tuple[list[tuple[str, str]], dict[str, Any]]:
     """Pontos a cobrar no status mais recente: [(tipo, texto)]."""
     last = statuses[-1]
@@ -7425,6 +7531,8 @@ def _status_issues(statuses: list[dict[str, Any]], fila: str) -> tuple[list[tupl
         if abs(calc - last["csat"]) > STATUS_CSAT_CHECK_PP:
             issues.append(("dados", f"O CSAT informado ({_bfmt(last['csat'])}%) não bate com {int(prom)} promotoras e "
                                     f"{int(detr)} detratoras, que dão {_bfmt(calc)}%. Qual é o recorte de cada número?"))
+    if last.get("ruim"):  # leitura livre: o que está ruim e a EPS não explicou
+        issues.append(("leitura", "; ".join(r.rstrip(". ") for r in last["ruim"][:2]) + ". O que explica e qual a ação?"))
     if not (csat_off(last) or sla_off(last)):
         return issues, last
     if _NO_DATA_STATUS_RE.search(_norm_text(last.get("motivo"))):
@@ -7502,16 +7610,31 @@ def _read_status_thread(channel: str, thread_ts: str, eps: str) -> str | None:
                      once_key=f"shadow_nofila:{channel}:{thread_ts}")
         return None
     bot = _bot_user_id()
+    title = str(messages[0].get("text") or "")
     statuses: list[dict[str, Any]] = []
+    unread = 0
     for m in messages[1:]:
         if m.get("bot_id") or (bot and m.get("user") == bot):
             continue
-        for chunk in re.split(r"(?=s?tatus atual na [uú]ltima hora)", str(m.get("text") or ""), flags=re.IGNORECASE):
+        found: list[dict[str, Any]] = []
+        for chunk in re.split(r"(?=s?tatus atual na [uú]ltima hora)", _strip_md(m.get("text")), flags=re.IGNORECASE):
             parsed = _parse_status(chunk)
             if parsed:
-                parsed["user"] = m.get("user")
-                statuses.append(parsed)
+                found.append(parsed)
+        if LLM_CONTROL_READ and _maybe_control(m) and not (found and all(_status_complete(s) for s in found)):
+            livre = _llm_status(channel, title, fila, m)  # formato novo / só imagem / faltou campo na regra
+            if livre:
+                found = [livre]
+            elif not found:
+                unread += 1
+        for parsed in found:
+            parsed["user"] = m.get("user")
+            statuses.append(parsed)
     if not statuses:
+        if unread:
+            _shadow_note(channel, thread_ts, eps, title,
+                         "🤔 Vi a atualização, mas não achei CSAT nem SLA nela — não consigo cobrar ainda.",
+                         once_key=f"shadow_noread:{channel}:{thread_ts}:{len(messages)}")
         return None
     issues, last = _status_issues(statuses, fila)
     skey = f"status:{channel}:{thread_ts}"
@@ -7522,7 +7645,8 @@ def _read_status_thread(channel: str, thread_ts: str, eps: str) -> str | None:
     idx = len(statuses)
     if raised.get("_last_idx") == idx:
         return None  # este status já foi lido
-    field = {"passos": "passos", "prazo": "previsao"}
+    last["ruim_txt"] = " ".join(last.get("ruim") or [])
+    field = {"passos": "passos", "prazo": "previsao", "leitura": "ruim_txt"}
     new: list[tuple[str, str]] = []
     for kind, txt in issues:
         prev = raised.get(kind) if isinstance(raised.get(kind), dict) else None
@@ -7540,14 +7664,17 @@ def _read_status_thread(channel: str, thread_ts: str, eps: str) -> str | None:
     if not new:
         meta = _meta_fila(fila)
         below = meta is not None and last.get("csat") is not None and last["csat"] < meta
-        _shadow_note(channel, thread_ts, eps, str(messages[0].get("text") or ""),
-                     f"{'⏳' if below else '✅'} Li o status das {last['hora']} da {fila}: CSAT {_bfmt(last['csat'])}%"
-                     + (f" (meta {_bfmt(meta)}%)" if meta is not None else "")
+        csat_txt = f"CSAT {_bfmt(last['csat'])}%" if last.get("csat") is not None else "sem CSAT"
+        bom = f" Bom: {'; '.join(last['bom'])}." if last.get("bom") and not below else ""
+        _shadow_note(channel, thread_ts, eps, title,
+                     f"{'⏳' if below else '✅'} Li o status das {last['hora']} da {fila}: {csat_txt}"
+                     + (f" (meta {_bfmt(meta)}%)" if meta is not None and last.get("csat") is not None else "")
                      + (f" · SLA {_bfmt(last['sla'])}%" if last.get("sla") is not None else "")
                      + (" — segue abaixo da meta; já cobrei há pouco e aguardo a resposta antes de cobrar de novo."
-                        if below else " — nada a cobrar."))
+                        if below else " — nada a cobrar." + bom))
         return None
-    head = f"👀 *{fila} · status das {last['hora']}* — CSAT {_bfmt(last['csat'])}%"
+    head = f"👀 *{fila} · status das {last['hora']}*" + (f" — CSAT {_bfmt(last['csat'])}%"
+                                                         if last.get("csat") is not None else "")
     if last.get("sla") is not None:
         head += f" · SLA {_bfmt(last['sla'])}%"
     return _post_status_reply(channel, thread_ts, eps, str(messages[0].get("text") or ""), head,
@@ -7603,7 +7730,7 @@ HORA_SLA_PP = 2.0       # SLA 1ª resposta abaixo da meta (SLA_METAS) ou do P SL
 HORA_MIN_CASES = 10     # TMA/SLA só com pelo menos 10 casos tratados/recebidos na hora
 _HORA_SEGMENTOS = (("madrugada", "Madrugada"), ("review", "CX Review - AeC"), ("super", "CX Super Cliente - AeC"),
                    ("suporte", "CX Suporte"))
-PRINT_MAX_POLLS = 36  # 6 min
+PRINT_MAX_POLLS = int(os.getenv("PRINT_MAX_POLLS", "60"))  # 10 min
 # PRINT_READING=0 desliga a leitura dos prints (Volume/Produtividade). Falha técnica nunca vai para a EPS: só alerta.
 PRINT_READING = os.getenv("PRINT_READING", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
 VOL_BACKLOG_RATIO = float(os.getenv("VOL_BACKLOG_RATIO", "0.8"))  # produção < 80% da entrada = fila acumulando
@@ -7623,7 +7750,25 @@ def _image_files(message: dict[str, Any]) -> list[dict[str, Any]]:
             and str(f.get("mimetype") or "").startswith("image/")]
 
 
-def _print_prompt(kind: str) -> str:
+def _last_interval(data: dict[str, Any], fila: str) -> dict[str, Any]:
+    """Tabela de uma célula por intervalo: fica com o último intervalo que tem número (a hora mais recente)."""
+    rows = []
+    for l in data.get("linhas") or []:
+        iv = str(l.get("intervalo") or l.get("segmento") or "").strip()
+        if not re.match(r"\d{1,2}\s*[:h]", iv):
+            continue  # linha sem intervalo (total do dia)
+        if _num(l.get("r_vol")) is None and _num(l.get("tratados")) is None:
+            continue
+        rows.append((int(re.match(r"(\d{1,2})", iv).group(1)), l))
+    if not rows:
+        return {"tipo": "hora", "linhas": []}
+    hora, last = max(rows, key=lambda r: r[0])
+    last = dict(last)
+    last["segmento"] = fila
+    return {"tipo": "hora", "ate": f"{hora:02d}:00", "linhas": [last]}
+
+
+def _print_prompt(kind: str, by_interval: bool = False) -> str:
     common = (
         "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. NÃO chame subagentes e NÃO consulte dados: só LEIA as "
         "imagens anexadas (prints de um controle da EPS) e transcreva os números. Se não conseguir ler TODOS os números "
@@ -7638,7 +7783,10 @@ def _print_prompt(kind: str) -> str:
             '{"tipo": "hora", "linhas": [{"segmento": "IFOOD_CX_REVIEW", "p_sla": 99.43, "r_sla_1resp": 100, '
             '"r_sla_res": null, "p_vol": 52, "r_vol": 5, "tratados": 5, "p_tma": 589.34, "r_tma": 350, "p_hc": 15.48, '
             '"r_hc": 10, "p_prod_hc": 3.35, "r_prod_hc": 0.51}]}\n'
-            "Célula vazia: null. Uma linha por segmento ou intervalo que aparecer.")
+            "Célula vazia: null. Uma linha por segmento ou intervalo que aparecer."
+            + ("\nEste print é de UMA célula, uma linha por Intervalo (00:00, 01:00…). Em cada linha use "
+               '"intervalo": "07:00" no lugar de "segmento". A linha sem intervalo (total) pode ser ignorada. '
+               "Transcreva TODAS as linhas com intervalo, até a última que aparecer." if by_interval else ""))
     if kind == "volume":
         return common + (
             "Os prints trazem, por célula (ex.: CX Review, Super CX), por hora: volume projetado e real (tabela 'Volume por "
@@ -7749,6 +7897,11 @@ def _judge_hora(data: dict[str, Any]) -> list[tuple[str, str]]:
             issues.append((f"tma:{fila}", f"*{fila}:* TMA de {_fmt_int(v['r_tma'])} s{quando}, "
                                            f"{_bfmt((v['r_tma'] / v['p_tma'] - 1) * 100, 0)}% acima do plan de "
                                            f"{_fmt_int(v['p_tma'])} s. O que está alongando o atendimento?"))
+        if (v["r_vol"] or 0) >= HORA_MIN_CASES and v["tratados"] is not None \
+                and v["tratados"] < VOL_BACKLOG_RATIO * v["r_vol"]:
+            issues.append((f"fila:{fila}", f"*{fila}:* entraram {_fmt_int(v['r_vol'])} casos{quando} e foram tratados "
+                                           f"{_fmt_int(v['tratados'])} ({_bfmt(v['tratados'] / v['r_vol'] * 100, 0)}%). "
+                                           "A fila está acumulando: qual o plano para zerar?"))
         meta = SLA_METAS.get(fila) or v["p_sla"]
         casos = max(v["r_vol"] or 0, v["tratados"] or 0)
         if meta and v["r_sla_1resp"] is not None and casos >= HORA_MIN_CASES and v["r_sla_1resp"] < meta - HORA_SLA_PP:
@@ -7809,12 +7962,15 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
     if not images:
         return None
     hora_txt = ""
+    cell_fila = ""  # tabela de uma célula por intervalo (mensagem "CX REVIEW:", "CX SUPER:", "CX SUPORTE:")
     if kind == "hora":
         msg_text = _norm_text(msg.get("text"))
-        if "consolidado" not in msg_text:  # as tabelas por célula repetem o consolidado: lê só ele
-            return None
+        if "consolidado" not in msg_text:
+            cell_fila = _hora_fila(msg_text) or ""
+            if not cell_fila:
+                return None
         mh = re.search(r"(\d{1,2})\s*[:h]\s*(\d{2})?", str(msg.get("text") or ""))
-        hora_txt = f"{int(mh.group(1)):02d}:{mh.group(2) or '00'}" if mh else ""
+        hora_txt = f"{int(mh.group(1)):02d}:{mh.group(2) or '00'}" if mh and not cell_fila else ""
         images = images[:1]
     user = msg.get("user")
     head_base = f"📷 *{re.sub(r'[`*_]', '', title).strip()[:60]} · {eps}*"
@@ -7830,7 +7986,8 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
         if not file_ids:
             tech_problem = "não consegui baixar a imagem do Slack"
         else:
-            answer = ask_toqan_with_files(_print_prompt(kind), file_ids, max_attempts=PRINT_MAX_POLLS)
+            answer = ask_toqan_with_files(_print_prompt(kind, by_interval=bool(cell_fila)), file_ids,
+                                          max_attempts=PRINT_MAX_POLLS)
             if answer.strip().upper().startswith("ILEGIVEL") or answer.strip().upper().startswith("ILEGÍVEL"):
                 problem = answer.split(":", 1)[-1].strip()[:150] or "imagem ilegível"
             else:
@@ -7838,11 +7995,18 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
                 if not data:
                     tech_problem = "a resposta do Toqan não veio como tabela"
                 else:
+                    if cell_fila:
+                        data = _last_interval(data, cell_fila)
                     problem = _validate_print(kind, data) or ""
     except Exception as exc:
         logger.exception("[%s] Print read failed", eps)
-        tech_problem = f"falha ao ler a imagem ({type(exc).__name__})"
+        detail = str(exc)[:160]
+        hint = (" — o Toqan demorou mais que o limite para ler o print" if "timed out" in detail
+                else " — o upload da imagem para o Toqan falhou" if "upload" in detail.lower()
+                else " — parece o token do Databricks/Toqan" if _looks_like_token_error(detail) else "")
+        tech_problem = f"falha ao ler a imagem ({type(exc).__name__}: {detail}){hint}"
     if tech_problem:
+        STATE.set(done_key, "")  # falha nossa: libera para tentar de novo na próxima releitura
         _alert(f"Print de controle ({eps} · {re.sub(r'[`*_]', '', title).strip()[:60]}): {tech_problem}. Nada foi postado para a EPS.")
         return None
     if problem or not data:
@@ -7873,7 +8037,8 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
         ate0 = str(data.get("ate") or "").strip()
         _shadow_note(channel, thread_ts, eps, title,
                      f"✅ Li o print{(' até ' + ate0) if ate0 else ''}: nada a cobrar"
-                     + (" (o que já cobrei antes segue valendo)." if issues else "."))
+                     + (" (o que já cobrei antes segue valendo)." if issues else "."),
+                     once_key=f"shadow_ok:{channel}:{thread_ts}:{cell_fila or 'consolidado'}:{ate0 or msg_ts}")
         return None
     ate = str(data.get("ate") or "").strip()
     return _post_status_reply(channel, thread_ts, eps, title, head_base + (f" — até {ate}" if ate else ""),
