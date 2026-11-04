@@ -211,7 +211,8 @@ MAX_POLL_ATTEMPTS = 180  # 180 x 10s = 30 minutos
 PROCESSING_REACTION = "eyes"
 DONE_REACTION = "white_check_mark"
 ERROR_MESSAGE = "Não consegui processar agora, tente novamente"
-TIMEOUT_ERROR_MESSAGE = "Não consegui processar a tempo. Tente refazer a pergunta de forma mais específica."
+TIMEOUT_ERROR_MESSAGE = ("Essa demorou mais do que devia e eu parei para não te deixar esperando. Me pede em partes "
+                         "(ex.: primeiro o resultado da fila, depois o plano) que sai mais rápido.")
 EMPTY_ANSWER_MESSAGE = "Não consegui obter uma resposta agora."
 
 DAILY_REPORT_CHANNEL = os.getenv("DAILY_REPORT_CHANNEL", "C0BF6JVFG7N")
@@ -264,9 +265,9 @@ _DEFAULT_FILA_OWNERS: dict[str, list[str]] = {
     "CX Super Cliente - AeC": ["U09GNBTALNN"],
     "CX Super Cliente - CSU": ["U05EVUPKF0R"],
     # por nome: o app procura o usuário no Slack (escopo users:read) e marca o ID certo
-    "PF Cancelamento": ["@Adriana Ventura da Silva"],
-    "PF Super Clientes": ["@Adriana Ventura da Silva"],
-    "PF Revisão Manual": ["@Adriana Ventura da Silva"],
+    "PF Cancelamento": ["U0A6C135VK5"],
+    "PF Super Clientes": ["U0A6C135VK5"],
+    "PF Revisão Manual": ["U0A6C135VK5"],
     "CX Denúncia": ["U02CL56C46N"],
     "Fraudes DX": ["U02CL56C46N"],
 }
@@ -539,6 +540,8 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
+APP_VERSION = "5.14.11"
+_BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
 PORT = int(os.getenv("PORT", "3000"))
@@ -4458,11 +4461,54 @@ KNOWLEDGE_INSTRUCTION = (
 
 _PLAN_RE = re.compile(r"\b(sugir\w*|sugere|sugestao|sugestoes|monta|monte|montar|cria|crie|criar|estrutur\w*|propo\w*|"
                       r"me ajuda|ajuda a|ideia|ideias|o que (eu )?(faco|fazer|podemos fazer))\b.*\b(acao|acoes|plano|planos)\b"
-                      r"|\b(acao|acoes|plano)\b.*\b(sugir\w*|sugere|sugestao|ideia)")
+                      r"|\b(acao|acoes|plano)\b.*\b(sugir\w*|sugere|sugestao|ideia)"
+                      r"|\b(como|o que)\b.*\b(melhorar|melhoro|melhoramos|recuperar|subir|aumentar|atacar|resolver)\b.*"
+                      r"\b(csat|resultado|nota|fila|tma|sla)\b")
 
 
 def _is_plan_request(question: str) -> bool:
     return bool(_PLAN_RE.search(_norm_text(question)))
+
+
+PLAN_MAX_POLLS = 48  # 8 min: depois disso, plano rápido com os números da tabela do dia
+
+
+def _plan_fila_row(question: str, eps: str | None) -> dict[str, Any] | None:
+    fila = _fila_in_question(question, eps) or _fila_in_question(question, None)
+    if not fila:
+        return None
+    rows = _day_table(fetch=False) or []
+    return next((r for r in rows if _norm_text(r["fila"]) == _norm_text(fila)), None)
+
+
+def _plan_context(question: str, eps: str | None) -> str:
+    """Pedido de plano: os números da fila já vão prontos (tabela do dia), para a Lyra não gastar consulta com eles."""
+    r = _plan_fila_row(question, eps)
+    if not r:
+        return ""
+    c, n, _ = _agg([r])
+    if c is None:
+        return ""
+    return ("INFORMAÇÃO INTERNA PARA A LYRA — NÚMEROS DA FILA (oficiais, já calculados; NÃO chame a Lyra Indicadores para "
+            f"eles): {r['fila']} ({r['eps']}) no mês: CSAT {_bfmt(c)}% (n={_fmt_int(n)}), meta {_bfmt(r['meta'])}%"
+            + (f", motivo que mais tira: {r['motivo']} ({_bfmt(r['motivo_pp'], 2)} p.p.)" if r.get("motivo") else "")
+            + ". Para o plano, chame só a *Lyra Qualidade* com `Pedido: plano de ação` (fila e motivo acima) e, se alguma "
+            "ação tocar política (compensação, cupom, estorno, cancelamento), a *Lyra Conhecimento*.\n\n")
+
+
+def _plan_fallback_prompt(question: str, eps: str | None) -> str:
+    """Plano rápido sem subagentes, quando a análise completa estoura o tempo."""
+    r = _plan_fila_row(question, eps)
+    dados = ""
+    if r:
+        c, n, _ = _agg([r])
+        dados = (f"Fila {r['fila']} ({r['eps']}) no mês: CSAT {_bfmt(c)}% (n={_fmt_int(n)}), meta {_bfmt(r['meta'])}%"
+                 + (f", motivo que mais tira: {r['motivo']}" if r.get("motivo") else "") + ".")
+    return (f"{_scope_instruction(eps)}\n\nINFORMAÇÃO INTERNA PARA A LYRA: responda SEM chamar subagentes, em até 8 "
+            "linhas, um plano de ação inicial para a pergunta abaixo, usando só os números dados (não invente outros). "
+            "No máximo 3 ações da operação (o quê · para quem · responsável · prazo · como medir), sem política nem "
+            "compensação, sem RH. Termine dizendo que a análise detalhada por pilar (causa raiz) pode ser pedida em "
+            "seguida.\n" + (f"Dados: {dados}\n" if dados else "") + f"Pergunta: {question}")
 
 
 PLAN_INSTRUCTION = (
@@ -5017,6 +5063,7 @@ def _agents_summary(results: dict[str, tuple[str, str]]) -> str:
     expiry = _token_expiry()
     if expiry:
         lines.append(f"Token do Databricks: vence em {_format_date(expiry)} (lembro você na véspera).")
+    lines.append(f"_App v{APP_VERSION} · no ar desde {_BOOT_AT[:16].replace('T', ' ')}_")
     return "\n".join(lines)
 
 
@@ -5336,6 +5383,9 @@ def _scheduler_loop() -> None:
         logger.exception("MOP access check failed")
     if not STATE.persistent:
         logger.warning("State store em memória: um restart pode repetir rotinas do dia.")
+    threading.Thread(target=_status_catchup, name="lyra-status-catchup", daemon=True).start()
+    if TABLE_ENABLED:  # deploy/restart zera o cache: já monta a tabela do dia para a 1ª pergunta não esperar
+        threading.Thread(target=lambda: _day_table(), name="lyra-warm-table", daemon=True).start()
     logger.info("Scheduler started for %s", TENANTS)
     while True:
         try:
@@ -5427,9 +5477,53 @@ MONITORING_HELP = ("Aqui eu cuido do monitoramento dos agentes. Pode pedir *stat
                    "ou avisar *troquei o token* que eu testo todos na hora.")
 
 
+_DIAG_RE = re.compile(r"\b(diagnostico|diagnostica|diagnóstico|checa os canais|confere os canais)\b")
+
+
+def _diagnostics_text() -> str:
+    """Como a Lyra está ligada aos canais: versão, canais de controle (membro? modo teste?), o que viu e respondeu."""
+    def member(ch: str) -> str:
+        if not ch:
+            return "—"
+        try:
+            info = slack_app.client.conversations_info(channel=ch)
+            c = _resp_get(info, "channel", {}) or {}
+            return ("✅ está no canal" if c.get("is_member") else "❌ NÃO está no canal (adicione a @Lyra)") + \
+                (f" · #{c.get('name')}" if c.get("name") else "")
+        except Exception as exc:
+            msg = str(exc)
+            return "❌ sem acesso ao canal (adicione a @Lyra)" if "not_in_channel" in msg or "channel_not_found" in msg \
+                else f"⚠️ não consegui checar ({type(exc).__name__})"
+
+    lines = [f"🩺 *Diagnóstico da Lyra* · app v{APP_VERSION} · no ar desde {_BOOT_AT[:16].replace('T', ' ')}", ""]
+    lines.append("📍 *Controles das EPSs (STATUS_CHANNELS)*")
+    if not STATUS_CHANNELS:
+        lines.append("• ❌ STATUS_CHANNELS vazio no Railway: a Lyra não lê nenhum controle.")
+    for eps, ch in STATUS_CHANNELS.items():
+        modo = (f"teste → responde em <#{STATUS_TEST_CHANNELS.get(eps) or EPS_CHANNELS.get(eps)}>" if _status_shadow(eps)
+                else "oficial → responde na thread da EPS")
+        lines.append(f"• *{eps}* <#{ch}> · {member(ch)} · {modo}")
+        lines.append(f"   última mensagem vista: {STATE.get(f'seen:{ch}') or 'nenhuma desde o deploy/estado'} · "
+                     f"última resposta: {STATE.get(f'replied:{ch}') or 'nenhuma'}")
+    lines.append(f"• Leitura de prints: {'ligada' if PRINT_READING else 'DESLIGADA (PRINT_READING=0)'}")
+    lines += ["", "📣 *Report e conversa (EPS_CHANNELS)*"]
+    for eps, ch in EPS_CHANNELS.items():
+        lines.append(f"• *{eps}* <#{ch}> · {member(ch)}")
+    if MELHORIAS_CHANNELS:
+        lines += ["", "🛠️ *Canais de melhorias*"]
+        for eps, ch in MELHORIAS_CHANNELS.items():
+            lines.append(f"• *{eps}* <#{ch}> · {member(ch)} · chamado de moedas vai para "
+                         f"{('<#' + _chamado_destino(eps)[0] + '>') if _chamado_destino(eps)[0] else '—'}"
+                         f"{' (teste)' if _chamado_destino(eps)[1] else ''}"
+                         f" · respostas da thread: {'no canal de teste (modo teste)' if MELHORIAS_SHADOW else 'na própria thread'}")
+    return "\n".join(lines)
+
+
 def _monitoring_channel_reply(question: str, say: Callable[..., Any], event: dict[str, Any], in_thread: bool) -> None:
     """Canal de alerta do time: só comandos de monitoramento (sem dados de EPS)."""
-    if _is_token_renewed_message(question):
+    if _DIAG_RE.search(_norm_text(question)):
+        _say(say, _diagnostics_text(), event, True)
+    elif _is_token_renewed_message(question):
         expiry = _mark_token_renewed(_now_brazil().date())
         _say(say, f"Anotado ✅ Token novo vale até {_format_date(expiry)}; lembro um dia antes. "
                   "Vou testar os agentes agora…", event, True)
@@ -6187,7 +6281,8 @@ _TABLE_BLOCK_RE = re.compile(r"\b(motivo|motivos|operador|operadores|analista|su
                              r"planilha|quadrante|q4|reincid\w*|ofensor\w*|dispersao|compar\w*|evolucao|tendencia|"
                              r"\d{1,2}/\d{1,2}|bu|food|multi)\b")
 _TABLE_RESULT_RE = re.compile(r"\b(resultado|csat|como (esta|estao|ta|tao|foi|foram|anda|andam))\b")
-_TABLE_IMPACT_RE = re.compile(r"\b(mais impacta\w*|maior impacto|impacta mais|pior|piores|puxa\w* (pra|para) baixo)\b")
+_TABLE_IMPACT_RE = re.compile(r"\b(mais impacta\w*|maior impacto|mais impacto|impacta mais|pior|piores|"
+                              r"puxa\w* (pra|para) baixo)\b")
 
 
 def _table_intent(question: str, eps: str | None) -> tuple[str, str | None, str | None] | None:
@@ -6462,6 +6557,16 @@ def _log_conversation(event: dict[str, Any], eps: str | None, question: str, ans
 
 
 _THUMBS = {"+1": "👍", "thumbsup": "👍", "-1": "👎", "thumbsdown": "👎"}
+FEEDBACK_REACTIONS = os.getenv("FEEDBACK_REACTIONS", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+
+
+def _add_feedback_reactions(channel: str, ts: str) -> None:
+    """Deixa 👍 e 👎 prontos na resposta: quem leu só clica (o voto da própria Lyra não conta)."""
+    for name in ("+1", "-1"):
+        try:
+            slack_app.client.reactions_add(channel=channel, timestamp=ts, name=name)
+        except Exception:
+            logger.debug("Could not add feedback reaction", exc_info=True)
 
 
 def _handle_reaction(event: dict[str, Any]) -> None:
@@ -6470,7 +6575,8 @@ def _handle_reaction(event: dict[str, Any]) -> None:
     thumb = _THUMBS.get(name)
     item = event.get("item") or {}
     bot = _bot_user_id()
-    if not thumb or item.get("type") != "message" or (bot and event.get("item_user") != bot):
+    if not thumb or item.get("type") != "message" or (bot and event.get("item_user") != bot) \
+            or (bot and event.get("user") == bot):
         return
     channel, ts, user = str(item.get("channel") or ""), str(item.get("ts") or ""), str(event.get("user") or "")
     text, thread_ts = "", ""
@@ -6744,16 +6850,27 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
     """Processa a mensagem e registra a conversa (pergunta, resposta, tempo, rota) para auditoria e saúde."""
     started = time.time()
     said: list[str] = []
+    said_ts: list[str] = []
     orig_say = say
 
     def say(*args: Any, **kwargs: Any) -> Any:  # noqa: F811 — guarda o que foi respondido
         text = kwargs.get("text") if "text" in kwargs else (args[0] if args else "")
         said.append(str(text or ""))
-        return orig_say(*args, **kwargs)
+        resp = orig_say(*args, **kwargs)
+        try:
+            ts = _resp_get(resp, "ts") if resp is not None else None
+            if ts:
+                said_ts.append(str(ts))
+        except Exception:
+            pass
+        return resp
 
     failed = {"v": False}
     try:
         _process_event_inner(event, say, in_thread, client, failed)
+        if FEEDBACK_REACTIONS and said_ts and not failed["v"] and \
+                str(event.get("_route") or "livre") not in {"lembrete", "aprendizado", "report_manual", "mop_upload"}:
+            _add_feedback_reactions(str(event.get("channel") or ""), said_ts[-1])
     finally:
         if not event.get("_skip_log"):
             try:
@@ -6821,6 +6938,10 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 w.start()
             for w in workers:
                 w.join()
+            return
+        if eps is None and _DIAG_RE.search(_norm_text(question)):
+            event["_route"] = "diagnostico"
+            _say_sections(say, _diagnostics_text(), event, in_thread)
             return
         if eps is None and _is_data_test_request(question):
             _say(say, _agents_summary(_run_agent_checks(_now_brazil())), event, in_thread)
@@ -6969,10 +7090,22 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                   f"{DEFAULTS_INSTRUCTION if not extra else ''}{FULL_ACCESS_INSTRUCTION if _operator_names_allowed(eps) else ''}"
                   f"{ANSWER_LAYOUT_INSTRUCTION}{_learnings_instruction(eps)}{_table_context(eps)}"
                   f"{_inject_mop_context(question, eps)}")
+        is_plan = extra == PLAN_INSTRUCTION
+        if is_plan:
+            prompt = _plan_context(question, eps) + prompt
         answer = _recent_answer(prompt)
         if answer is None:
             try:
-                answer = ask_toqan(prompt, progress_callback=send_progress)
+                if is_plan:
+                    try:
+                        answer = ask_toqan(prompt, progress_callback=send_progress, max_attempts=PLAN_MAX_POLLS)
+                    except ToqanAPIError as exc:
+                        if "timed out" not in str(exc):
+                            raise
+                        send_progress("A análise completa está pesada agora; vou te mandar o plano com o que já tenho. ⏳")
+                        answer = ask_toqan(_plan_fallback_prompt(question, eps), max_attempts=60)
+                else:
+                    answer = ask_toqan(prompt, progress_callback=send_progress)
             finally:
                 progress.done()
             _remember_answer(prompt, answer)
@@ -7342,6 +7475,21 @@ def _status_issues(statuses: list[dict[str, Any]], fila: str) -> tuple[list[tupl
     return issues, last
 
 
+SHADOW_ACK = os.getenv("SHADOW_ACK", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+
+
+def _shadow_note(channel: str, thread_ts: str, eps: str, title: str, text: str, once_key: str | None = None) -> None:
+    """Modo teste: mostra no canal de teste o que a Lyra leu mesmo quando não há cobrança (ou quando não sabe ler
+    aquele controle), para o time ver que ela está acompanhando. Na operação oficial não posta nada."""
+    if not SHADOW_ACK or not _status_shadow(eps):
+        return
+    if once_key:
+        if STATE.get(once_key):
+            return
+        STATE.set(once_key, "1")
+    _post_status_reply(channel, thread_ts, eps, title, text, [], None, crisis_check=False)
+
+
 def _read_status_thread(channel: str, thread_ts: str, eps: str) -> str | None:
     """Lê a thread de status e, se houver o que cobrar, responde. Devolve o texto postado (ou None)."""
     messages = _fetch_thread(channel, thread_ts)
@@ -7349,6 +7497,9 @@ def _read_status_thread(channel: str, thread_ts: str, eps: str) -> str | None:
         return None
     fila = _status_fila(str(messages[0].get("text") or ""), eps)
     if not fila:
+        _shadow_note(channel, thread_ts, eps, str(messages[0].get("text") or ""),
+                     "🤔 Vi este controle, mas não reconheci a fila no título — não consigo cobrar ainda.",
+                     once_key=f"shadow_nofila:{channel}:{thread_ts}")
         return None
     bot = _bot_user_id()
     statuses: list[dict[str, Any]] = []
@@ -7387,6 +7538,14 @@ def _read_status_thread(channel: str, thread_ts: str, eps: str) -> str | None:
     raised["_last_idx"] = idx
     STATE.set(skey, json.dumps(raised))
     if not new:
+        meta = _meta_fila(fila)
+        below = meta is not None and last.get("csat") is not None and last["csat"] < meta
+        _shadow_note(channel, thread_ts, eps, str(messages[0].get("text") or ""),
+                     f"{'⏳' if below else '✅'} Li o status das {last['hora']} da {fila}: CSAT {_bfmt(last['csat'])}%"
+                     + (f" (meta {_bfmt(meta)}%)" if meta is not None else "")
+                     + (f" · SLA {_bfmt(last['sla'])}%" if last.get("sla") is not None else "")
+                     + (" — segue abaixo da meta; já cobrei há pouco e aguardo a resposta antes de cobrar de novo."
+                        if below else " — nada a cobrar."))
         return None
     head = f"👀 *{fila} · status das {last['hora']}* — CSAT {_bfmt(last['csat'])}%"
     if last.get("sla") is not None:
@@ -7400,6 +7559,10 @@ def _post_status_reply(channel: str, thread_ts: str, eps: str, thread_title: str
     """Responde a um controle da EPS. Fase de testes (STATUS_SHADOW): vai para o canal de testes da EPS, numa
     thread por controle, sem marcar ninguém; senão, na própria thread da EPS marcando quem postou.
     Antes de cobrar, confere crise nas últimas horas (checagem reaproveitada por 30 min)."""
+    try:
+        STATE.set(f"replied:{channel}", f"{_now_brazil().strftime('%d/%m %H:%M')} · {head[:60]}")
+    except Exception:
+        pass
     lines = [f"• {b}" for b in bullets]
     if crisis_check and bullets:
         now = _now_brazil()
@@ -7432,7 +7595,7 @@ def _post_status_reply(channel: str, thread_ts: str, eps: str, thread_title: str
 
 
 # --- Controles em print (Volume, Produtividade): a Lyra lê a imagem e cobra; se não der pra ler, avisa -----------
-PRINT_CONTROLS = (("hora", re.compile(r"acompanhamento de fila|hora ?/ ?hora")),
+PRINT_CONTROLS = (("hora", re.compile(r"acompanhamento de fila|hora ?/ ?hora|intra ?hora|intrahora")),
                   ("volume", re.compile(r"\bvolume\b")), ("produtividade", re.compile(r"\bprodutividade\b")))
 # Acompanhamento de Fila da AeC (print de hora em hora, P = planejado, R = realizado). Lê só o CONSOLIDADO da hora.
 HORA_TMA_RATIO = 1.10   # TMA realizado > 110% do planejado
@@ -7624,13 +7787,23 @@ def _judge_produtividade(data: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> str | None:
+    done_key = f"printread:{channel}:{msg_ts}"
+    if STATE.get(done_key):
+        return None  # esse print já foi lido (evita cobrar de novo depois de um restart)
     messages = _fetch_thread(channel, thread_ts)
     if not messages:
         return None
+    STATE.set(done_key, "1")
     title = str(messages[0].get("text") or "")
     kind = _print_control_kind(title)
     msg = next((m for m in messages if str(m.get("ts")) == msg_ts), None)
-    if not kind or not msg:
+    if not msg:
+        return None
+    if not kind:
+        _shadow_note(channel, thread_ts, eps, title,
+                     f"🤔 Vi um print em _{re.sub(r'[`*_]', '', title).strip()[:60]}_, mas ainda não sei ler esse "
+                     "controle. Me manda um exemplo para eu aprender o formato.",
+                     once_key=f"shadow_unknown:{channel}:{thread_ts}")
         return None
     images = _image_files(msg)
     if not images:
@@ -7697,16 +7870,84 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
         raised[k] = idx
     STATE.set(skey, json.dumps(raised))
     if not new:
+        ate0 = str(data.get("ate") or "").strip()
+        _shadow_note(channel, thread_ts, eps, title,
+                     f"✅ Li o print{(' até ' + ate0) if ate0 else ''}: nada a cobrar"
+                     + (" (o que já cobrei antes segue valendo)." if issues else "."))
         return None
     ate = str(data.get("ate") or "").strip()
     return _post_status_reply(channel, thread_ts, eps, title, head_base + (f" — até {ate}" if ate else ""),
                               [txt for _, txt in new], user)
 
 
+STATUS_CATCHUP_HOURS = float(os.getenv("STATUS_CATCHUP_HOURS", "2"))
+
+
+def _status_catchup() -> None:
+    """Depois de um deploy/restart: relê os controles das últimas horas que chegaram enquanto o app estava fora
+    (status e prints). O que já foi lido não é lido de novo."""
+    time.sleep(45)
+    oldest = str(time.time() - STATUS_CATCHUP_HOURS * 3600)
+    for eps, channel in STATUS_CHANNELS.items():
+        try:
+            hist = slack_app.client.conversations_history(channel=channel, oldest=str(time.time() - 24 * 3600), limit=100)
+        except Exception:
+            logger.warning("[%s] Status catch-up: could not read channel", eps, exc_info=True)
+            continue
+        for parent in (_resp_get(hist, "messages", []) or []):
+            if not parent.get("reply_count") or float(parent.get("latest_reply") or 0) < float(oldest):
+                continue
+            thread_ts = str(parent.get("ts") or "")
+            try:
+                replies = _fetch_thread(channel, thread_ts)
+            except Exception:
+                continue
+            recent = [m for m in replies if float(m.get("ts") or 0) >= float(oldest) and str(m.get("ts")) != thread_ts
+                      and not m.get("bot_id")]
+            try:
+                for m in recent:
+                    if _image_files(m) and PRINT_READING:
+                        _read_print_message(channel, thread_ts, str(m.get("ts")), eps)
+                if any(_looks_like_status(str(m.get("text") or "")) for m in recent):
+                    _read_status_thread(channel, thread_ts, eps)
+            except Exception:
+                logger.exception("[%s] Status catch-up failed for %s", eps, thread_ts)
+    logger.info("Status catch-up done")
+
+
+def _mark_seen(channel: str, what: str) -> None:
+    try:
+        STATE.set(f"seen:{channel}", f"{_now_brazil().strftime('%d/%m %H:%M')} · {what}")
+    except Exception:
+        pass
+
+
 def _maybe_status_reply(event: dict[str, Any]) -> bool:
     channel = str(event.get("channel") or "")
     eps = _STATUS_CHANNEL_EPS.get(channel)
     thread_ts = str(event.get("thread_ts") or "")
+    if eps:
+        kind = ("print" if _image_files(event) else "status" if _looks_like_status(str(event.get("text") or ""))
+                else "mensagem fora do padrão de status") if thread_ts and thread_ts != str(event.get("ts") or "") \
+            else ("post novo com print" if _image_files(event) else "post novo (não é resposta em thread)")
+        _mark_seen(channel, kind)
+        if not thread_ts and _image_files(event) and not event.get("bot_id") and PRINT_READING:
+            thread_ts = str(event.get("ts") or "")  # print postado direto no canal (sem thread): lê do mesmo jeito
+            msg_ts = thread_ts
+            with _LIVE_LOCK:
+                if msg_ts in _PRINT_PENDING:
+                    return True
+                _PRINT_PENDING.add(msg_ts)
+
+            def run_top() -> None:
+                try:
+                    time.sleep(min(STATUS_REPLY_DELAY_SECONDS, 30))
+                    _read_print_message(channel, thread_ts, msg_ts, eps)
+                except Exception:
+                    logger.exception("[%s] Print control read failed", eps)
+
+            threading.Thread(target=run_top, daemon=True).start()
+            return True
     if not eps or not thread_ts or thread_ts == str(event.get("ts") or ""):
         return False
     if event.get("bot_id"):
@@ -7828,8 +8069,22 @@ def _is_moedas_flow(fields: dict[str, str], parent_fields: dict[str, str]) -> bo
     return "moeda" in _norm_text(topic)
 
 
-def _chamado_from_flow(fields: dict[str, str], parent_fields: dict[str, str], parent_text: str) -> dict[str, str]:
-    ids = _MENTION_ID_RE.findall(parent_text or "")
+def _flow_requester(parent: dict[str, Any] | None, parent_text: str) -> str:
+    """Quem abriu o chamado: menção antes do primeiro campo do fluxo ("<@U..> enviou…"), ou o autor da mensagem quando
+    não é o bot do fluxo. Menções no fim da descrição são os owners marcados, não o solicitante."""
+    head = re.split(r"\*[^*\n]+\*", parent_text or "", maxsplit=1)[0]
+    ids = _MENTION_ID_RE.findall(head)
+    if ids:
+        return ids[0]
+    user = str((parent or {}).get("user") or "")
+    if user and not (parent or {}).get("bot_id") and user != _bot_user_id():
+        return user
+    return ""
+
+
+def _chamado_from_flow(fields: dict[str, str], parent_fields: dict[str, str], parent_text: str,
+                       parent: dict[str, Any] | None = None) -> dict[str, str]:
+    ids = [_flow_requester(parent, parent_text)] if _flow_requester(parent, parent_text) else []
     return {
         "ticket": re.sub(r"\D", "", _flow_value(fields, "ticket sf", "ticket", "numero do ticket")),
         "cliente": _flow_value(fields, "id do cliente"),
@@ -7963,6 +8218,31 @@ def _chamados_ws() -> Any | None:
         return None
 
 
+MELHORIAS_SHADOW = os.getenv("MELHORIAS_SHADOW", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+
+
+def _flow_post(channel: str, thread_ts: str, text: str) -> None:
+    """Resposta numa thread dos canais de melhorias. Em modo teste (MELHORIAS_SHADOW), vai para o canal de teste da
+    EPS, numa thread por chamado com o link da original — nada aparece no canal de melhorias."""
+    eps = _flow_eps(channel)
+    test_ch = (STATUS_TEST_CHANNELS.get(eps or "") or EPS_CHANNELS.get(eps or "") or CHAMADOS_DESTINO.get(eps or "")) \
+        if (MELHORIAS_SHADOW and eps) else ""
+    if not test_ch:
+        slack_app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+        return
+    key = f"melh_shadow:{channel}:{thread_ts}"
+    parent = STATE.get(key)
+    if not parent:
+        link = _permalink(channel, thread_ts)
+        resp = slack_app.client.chat_postMessage(
+            channel=test_ch, text=f"🧪 *Teste · Melhorias {eps}* — o que eu responderia na thread"
+                                  + (f" <{link}|do canal de melhorias>" if link else "") + ". Nada foi postado lá.")
+        parent = str(_resp_get(resp, "ts") or "")
+        if parent:
+            STATE.set(key, parent)
+    slack_app.client.chat_postMessage(channel=test_ch, thread_ts=parent or None, text=text)
+
+
 def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "") -> None:
     """Lê o chamado do Fluxo Owners CX (mensagem + thread). Moedas: triagem e chamado no Rewards. Outros tópicos:
     responde na thread pela base de conhecimento (e de novo quando marcarem a Lyra na thread)."""
@@ -8000,14 +8280,14 @@ def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "") ->
         replies = [str(m.get("text") or "") for m in messages
                    if m.get("ts") != thread_ts and not (m.get("bot_id") or m.get("subtype") == "bot_message")
                    and m.get("user") != bot]
-        chamado = _chamado_from_flow(fields, parent_fields, parent_text)
+        chamado = _chamado_from_flow(fields, parent_fields, parent_text, parent)
         triage = _triage_chamado(chamado, replies)
         if triage["faltando"]:
             if state != "aguardando":
                 quem = f"<@{chamado['solicitante']}> " if chamado.get("solicitante") else ""
                 pergunta = triage["pergunta"] or ("Pra eu abrir o chamado no time de Rewards, me manda aqui: "
                                                  + ", ".join(triage["faltando"]) + ".")
-                slack_app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f"{quem}{pergunta}")
+                _flow_post(channel, thread_ts, f"{quem}{pergunta}")
             STATE.set(key, "aguardando")
             return
         origin = _permalink(channel, thread_ts)
@@ -8024,15 +8304,17 @@ def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "") ->
                     except Exception:
                         logger.warning("Could not upload evidence", exc_info=True)
         link = _permalink(dest, rewards_ts) if rewards_ts else ""
-        slack_app.client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts,
-            text=(("🧪 [teste] " if teste else "") + "Chamado aberto no time de Rewards ✅"
+        _flow_post(
+            channel, thread_ts,
+            (("🧪 [teste] " if teste else "") + (f"<@{chamado['solicitante']}> " if chamado.get("solicitante") else "")
+             + "Caso escalado para o time de Rewards ✅"
                   + (f" <{link}|ver chamado>" if link else f" (<#{dest}>)")
                   + f"\n*Tipo:* {triage['tipo_problema']}" + (f" · *Missão:* {triage['missao']}" if triage["missao"] else "")
                   + "\nTe aviso aqui quando o Rewards responder."))
         STATE.set(key, "aberto")
         if rewards_ts:
-            STATE.set(f"rewards:{rewards_ts}", json.dumps({"channel": channel, "ts": thread_ts}))
+            STATE.set(f"rewards:{rewards_ts}", json.dumps({"channel": channel, "ts": thread_ts,
+                                                            "solicitante": chamado.get("solicitante", "")}))
             STATE.set(f"rewards_dest:{dest}", "1")
         ws = _chamados_ws()
         if ws is not None:
@@ -8074,7 +8356,7 @@ def _answer_flow_question(channel: str, thread_ts: str, eps: str | None, message
     if _is_error_answer(answer) or not answer.strip():
         _alert(f"Canal de melhorias {eps or ''}: não consegui responder a thread {thread_ts} ({str(answer)[:120]})")
         return
-    slack_app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=_strip_file_promises(answer))
+    _flow_post(channel, thread_ts, _strip_file_promises(answer))
 
 
 def _handle_rewards_reply(event: dict[str, Any]) -> None:
@@ -8094,8 +8376,13 @@ def _handle_rewards_reply(event: dict[str, Any]) -> None:
     is_flow = bool(event.get("bot_id") or event.get("subtype") == "bot_message")
     if is_flow and not finished:
         return  # avisos automáticos do fluxo (início de atendimento etc.)
-    msg = "✅ O time de Rewards finalizou o chamado." if finished else f"💬 *Retorno do time de Rewards:*\n{text[:1500]}"
-    slack_app.client.chat_postMessage(channel=origin["channel"], thread_ts=origin["ts"], text=msg)
+    quem = f"<@{origin['solicitante']}> " if origin.get("solicitante") else ""
+    if finished:
+        msg = f"✅ {quem}o time de Rewards finalizou o chamado."
+    else:
+        quoted = "\n".join("> " + l for l in text[:1500].splitlines() if l.strip())
+        msg = f"{quem}segue retorno do time de Rewards:\n{quoted}"
+    _flow_post(origin["channel"], origin["ts"], msg)
     if finished:
         ws = _chamados_ws()
         if ws is not None:
@@ -8187,6 +8474,8 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "lyra-slack-bot",
+        "version": APP_VERSION,
+        "started_at": _BOOT_AT,
         "scheduler_alive": alive,
         "last_tick": _scheduler_last_tick.isoformat() if _scheduler_last_tick else None,
     }), 200
