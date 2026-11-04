@@ -540,7 +540,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.15.4"
+APP_VERSION = "5.16.1"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -780,6 +780,10 @@ def _require_toqan_key() -> str:
     return api_key
 
 
+TOQAN_RETRY_CODES = {409, 429, 500, 502, 503, 504}
+TOQAN_RETRY_WAITS = (5, 15, 30)
+
+
 def _toqan_request(method: str, payload: dict[str, Any], api_key: str | None = None,
                    http_method: str | None = None) -> dict[str, Any]:
     """Make one authenticated JSON request to the Toqan Agent API (chave da Lyra por padrão)."""
@@ -790,15 +794,23 @@ def _toqan_request(method: str, payload: dict[str, Any], api_key: str | None = N
         headers={"X-Api-Key": api_key or _require_toqan_key(), "Content-Type": "application/json"},
         method=http_method or ("POST" if method in {"create_conversation", "continue_conversation"} else "GET"),
     )
-    try:
-        with urllib.request.urlopen(req, timeout=TOQAN_TIMEOUT_SECONDS) as response:
-            raw = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        logger.error("Toqan API returned HTTP %s for %s", exc.code, method)
-        raise ToqanAPIError(f"Toqan HTTP {exc.code}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        logger.error("Toqan API request failed for %s: %s", method, exc)
-        raise ToqanAPIError("Toqan request failed") from exc
+    raw = ""
+    for attempt in range(len(TOQAN_RETRY_WAITS) + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=TOQAN_TIMEOUT_SECONDS) as response:
+                raw = response.read().decode("utf-8")
+            break
+        except urllib.error.HTTPError as exc:
+            # 409 (conflito: arquivo/conversa ainda processando), 429 (limite) e 5xx: espera e tenta de novo
+            if exc.code in TOQAN_RETRY_CODES and attempt < len(TOQAN_RETRY_WAITS):
+                logger.warning("Toqan HTTP %s for %s; nova tentativa em %ss", exc.code, method, TOQAN_RETRY_WAITS[attempt])
+                time.sleep(TOQAN_RETRY_WAITS[attempt])
+                continue
+            logger.error("Toqan API returned HTTP %s for %s", exc.code, method)
+            raise ToqanAPIError(f"Toqan HTTP {exc.code} ({method})") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            logger.error("Toqan API request failed for %s: %s", method, exc)
+            raise ToqanAPIError("Toqan request failed") from exc
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -5495,7 +5507,8 @@ def _diagnostics_text() -> str:
         except Exception as exc:
             msg = str(exc)
             return "❌ sem acesso ao canal (adicione a @Lyra)" if "not_in_channel" in msg or "channel_not_found" in msg \
-                else f"⚠️ não consegui checar ({type(exc).__name__})"
+                else ("⚠️ não consegui checar (falta o escopo channels:read/groups:read no app do Slack)"
+                      if "missing_scope" in msg else f"⚠️ não consegui checar ({type(exc).__name__}: {msg[:80]})")
 
     lines = [f"🩺 *Diagnóstico da Lyra* · app v{APP_VERSION} · no ar desde {_BOOT_AT[:16].replace('T', ' ')}", ""]
     lines.append("📍 *Controles das EPSs (STATUS_CHANNELS)*")
@@ -7464,6 +7477,17 @@ def _control_prompt(title: str, fila: str, text: str, has_images: bool) -> str:
     )
 
 
+_CONTROL_READ_SEM = threading.BoundedSemaphore(int(os.getenv("CONTROL_READ_PARALLEL", "2")))
+LLM_READ_LAST = 2  # só as últimas mensagens da thread vão para a leitura livre (as antigas ficam com a regra)
+_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock(key: str) -> threading.Lock:
+    with _THREAD_LOCKS_GUARD:
+        return _THREAD_LOCKS.setdefault(key, threading.Lock())
+
+
 def _llm_status(channel: str, title: str, fila: str, message: dict[str, Any]) -> dict[str, Any] | None:
     """Leitura livre de uma mensagem de controle; guarda o resultado por mensagem (e por edição)."""
     ts = str(message.get("ts") or "")
@@ -7478,6 +7502,7 @@ def _llm_status(channel: str, title: str, fila: str, message: dict[str, Any]) ->
             pass
     images = _image_files(message)[:3]
     try:
+        _CONTROL_READ_SEM.acquire()
         if images:
             file_ids = []
             for f in images:
@@ -7493,9 +7518,14 @@ def _llm_status(channel: str, title: str, fila: str, message: dict[str, Any]) ->
                                max_attempts=PRINT_MAX_POLLS)
     except Exception as exc:
         logger.warning("Leitura livre de controle falhou (%s)", ts, exc_info=True)
-        _alert(f"Controle ({fila}): não consegui ler uma atualização fora do padrão ({type(exc).__name__}: "
-               f"{str(exc)[:120]}). Vou tentar de novo na próxima mensagem da thread.")
+        akey = f"llmstatus_alert:{channel}:{_now_brazil().strftime('%Y%m%d%H')}"
+        if not STATE.get(akey):  # um alerta por canal por hora, não um por mensagem
+            STATE.set(akey, "1")
+            _alert(f"Controle ({fila}): não consegui ler uma atualização fora do padrão ({type(exc).__name__}: "
+                   f"{str(exc)[:120]}). Tento de novo na próxima mensagem da thread.")
         return None  # não guarda: tenta de novo depois
+    finally:
+        _CONTROL_READ_SEM.release()
     data = _block_data_from_json(answer) or {}
     status: dict[str, Any] | None = None
     if data.get("e_status") and (_num(data.get("csat")) is not None or _num(data.get("sla")) is not None):
@@ -7603,31 +7633,41 @@ def _shadow_note(channel: str, thread_ts: str, eps: str, title: str, text: str, 
 
 
 def _read_status_thread(channel: str, thread_ts: str, eps: str) -> str | None:
-    """Lê a thread de status e, se houver o que cobrar, responde. Devolve o texto postado (ou None)."""
+    """Lê a thread de status e, se houver o que cobrar, responde. Devolve o texto postado (ou None).
+    Uma leitura por thread por vez: vários prints chegando juntos esperam a vez e reaproveitam a leitura."""
+    with _thread_lock(f"{channel}:{thread_ts}"):
+        return _read_status_thread_locked(channel, thread_ts, eps)
+
+
+def _read_status_thread_locked(channel: str, thread_ts: str, eps: str) -> str | None:
     messages = _fetch_thread(channel, thread_ts)
     if not messages:
         return None
     fila = _status_fila(str(messages[0].get("text") or ""), eps)
     if not fila:
-        _shadow_note(channel, thread_ts, eps, str(messages[0].get("text") or ""),
-                     "🤔 Vi este controle, mas não reconheci a fila no título — não consigo cobrar ainda.",
-                     once_key=f"shadow_nofila:{channel}:{thread_ts}")
+        # Thread que não é controle (conversa, caso, alinhamento): ignora calada. Só avisa quando é claramente um
+        # status no formato da EPS e o título não diz a fila.
+        if any(_looks_like_status(_strip_md(m.get("text"))) for m in messages[1:]):
+            _shadow_note(channel, thread_ts, eps, str(messages[0].get("text") or ""),
+                         "🤔 Vi este controle, mas não reconheci a fila no título — não consigo cobrar ainda.",
+                         once_key=f"shadow_nofila:{channel}:{thread_ts}")
         return None
     bot = _bot_user_id()
     title = str(messages[0].get("text") or "")
     print_thread = bool(_print_control_kind(title))  # Volume/Produtividade/Acompanhamento: quem lê é o leitor de print
     statuses: list[dict[str, Any]] = []
     unread = 0
-    for m in messages[1:]:
-        if m.get("bot_id") or (bot and m.get("user") == bot):
-            continue
+    human = [m for m in messages[1:] if not (m.get("bot_id") or (bot and m.get("user") == bot))]
+    recent_ts = {str(m.get("ts")) for m in human[-LLM_READ_LAST:]}
+    for m in human:
         found: list[dict[str, Any]] = []
         for chunk in re.split(r"(?=s?tatus atual na [uú]ltima hora)", _strip_md(m.get("text")), flags=re.IGNORECASE):
             parsed = _parse_status(chunk)
             if parsed:
                 found.append(parsed)
         complete = bool(found) and all(_status_complete(s) for s in found)
-        if LLM_CONTROL_READ and not print_thread and _maybe_control(m) and (not complete or _image_files(m)):
+        if LLM_CONTROL_READ and not print_thread and str(m.get("ts")) in recent_ts and _maybe_control(m) \
+                and (not complete or _image_files(m)):
             livre = _llm_status(channel, title, fila, m)  # formato novo / só imagem / faltou campo / print junto
             if livre and complete:  # a regra leu o texto: mantém os números dela e soma o que veio do print
                 for k, v in livre.items():
@@ -7966,10 +8006,11 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
         if LLM_CONTROL_READ and _status_fila(title, eps):
             STATE.set(done_key, "")
             return _read_status_thread(channel, thread_ts, eps)  # controle com print (ou texto + print): leitura livre
-        _shadow_note(channel, thread_ts, eps, title,
-                     f"🤔 Vi um print em _{re.sub(r'[`*_]', '', title).strip()[:60]}_, mas não reconheci a fila no "
-                     "título — não consigo cobrar ainda.",
-                     once_key=f"shadow_unknown:{channel}:{thread_ts}")
+        if _looks_like_status(_strip_md(msg.get("text"))):  # conversa com imagem (caso, dúvida): ignora calada
+            _shadow_note(channel, thread_ts, eps, title,
+                         f"🤔 Vi um controle com print em _{re.sub(r'[`*_]', '', title).strip()[:60]}_, mas não reconheci "
+                         "a fila no título — não consigo cobrar ainda.",
+                         once_key=f"shadow_unknown:{channel}:{thread_ts}")
         return None
     images = _image_files(msg)
     if not images:
@@ -8516,6 +8557,70 @@ def _melhorias_poll_loop() -> None:
         time.sleep(MELHORIAS_POLL_SECONDS)
 
 
+# --- Sugestões de melhoria (tópico "Melhorias" do Fluxo Owners CX): vão para a planilha "Melhorias sugeridas" ------
+MELHORIAS_WORKSHEET_TITLE = "Melhorias sugeridas"
+MELHORIAS_HEADERS = ["Data", "EPS", "Segmento", "Solicitante", "Título", "Descrição", "Resumo", "Categoria",
+                     "Prioridade", "Ticket SF", "ID do Cliente", "ID do Pedido", "Thread", "Status", "Retorno iFood"]
+MELHORIA_CATEGORIAS = ("App/Produto", "Política/Processo", "Ferramenta interna", "Comunicação com o cliente",
+                       "Logística/Entrega", "Parceiro/Restaurante", "Outro")
+
+
+def _is_melhoria_flow(fields: dict[str, str], parent_fields: dict[str, str]) -> bool:
+    return "melhoria" in _norm_text(_flow_topic(fields, parent_fields))
+
+
+def _melhoria_resumo(titulo: str, descricao: str) -> tuple[str, str]:
+    """(resumo de 1 linha, categoria). Sem resposta do agente: título e 'Outro'."""
+    prompt = ("TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. NÃO chame subagentes. Responda APENAS com JSON.\n"
+              "Uma operação de atendimento sugeriu uma melhoria ao iFood. Resuma em UMA linha (até 140 caracteres: o "
+              "problema e a sugestão) e classifique numa categoria desta lista: "
+              + json.dumps(list(MELHORIA_CATEGORIAS), ensure_ascii=False)
+              + '.\nFormato: {"resumo": "...", "categoria": "..."}\n'
+              f"Título: {titulo[:200]}\nDescrição: {descricao[:2500]}")
+    try:
+        data = _block_data_from_json(ask_toqan(prompt, max_attempts=60)) or {}
+    except Exception:
+        logger.warning("Resumo de melhoria falhou", exc_info=True)
+        data = {}
+    cat = str(data.get("categoria") or "").strip()
+    return (str(data.get("resumo") or titulo).strip()[:200], cat if cat in MELHORIA_CATEGORIAS else "Outro")
+
+
+def _register_melhoria(channel: str, thread_ts: str, eps: str | None, fields: dict[str, str],
+                       parent_fields: dict[str, str], parent_text: str, parent: dict[str, Any] | None) -> None:
+    """Registra a sugestão na planilha e avisa na thread (no modo teste, no canal de teste)."""
+    solicitante = _flow_requester(parent, parent_text)
+    titulo = _flow_value(fields, "titulo") or _flow_value(parent_fields, "titulo")
+    descricao = _MENTION_RE.sub("", _flow_value(fields, "descricao", "descreva")).strip()
+    resumo, categoria = _melhoria_resumo(titulo, descricao)
+    nome = ""
+    if solicitante:
+        try:
+            info = _resp_get(slack_app.client.users_info(user=solicitante), "user", {}) or {}
+            nome = str((info.get("profile") or {}).get("real_name") or info.get("real_name") or "")
+        except Exception:
+            nome = ""
+    ws = None
+    google_client = _safe_google_client()
+    if google_client is not None:
+        try:
+            ws = _ensure_worksheet(_open_spreadsheet(google_client), MELHORIAS_WORKSHEET_TITLE, MELHORIAS_HEADERS)
+        except Exception:
+            logger.warning("Could not open Melhorias worksheet", exc_info=True)
+    if ws is None:
+        _alert(f"Melhoria sugerida ({eps}) não foi registrada: sem acesso à planilha. Título: {titulo[:80]}")
+        return
+    ws.append_row([_format_date(_now_brazil()), eps or "", _flow_value(fields, "qual segmento", "segmento"),
+                   nome or solicitante, titulo, descricao, resumo, categoria,
+                   _flow_value(fields, "prioridade") or _flow_value(parent_fields, "prioridade"),
+                   re.sub(r"\D", "", _flow_value(fields, "ticket sf", "ticket")), _flow_value(fields, "id do cliente"),
+                   _flow_value(fields, "id do pedido"), _permalink(channel, thread_ts), "nova", ""],
+                  value_input_option="RAW")
+    quem = f"<@{solicitante}> " if solicitante else ""
+    _flow_post(channel, thread_ts, f"{quem}Sugestão registrada ✅ Entrou na planilha de melhorias do time iFood "
+                                   f"(*{categoria}*: {resumo}). O time avalia e o retorno vem por aqui.")
+
+
 def _flow_mark(channel: str, what: str) -> None:
     logger.info("[melhorias %s] %s", channel, what)
     try:
@@ -8554,6 +8659,11 @@ def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "") ->
         if not _is_moedas_flow(fields, parent_fields):
             if eps is None:  # canal antigo do fluxo (OWNERS_FLOW_CHANNEL): só moedas
                 STATE.set(key, "fora")
+                return
+            if _is_melhoria_flow(fields, parent_fields) and not mention_text:
+                _register_melhoria(channel, thread_ts, eps, fields, parent_fields, parent_text, parent)
+                STATE.set(key, "respondido")
+                _flow_mark(channel, "melhoria registrada na planilha")
                 return
             _answer_flow_question(channel, thread_ts, eps, messages, fields, parent_fields, mention_text)
             STATE.set(key, "respondido")
