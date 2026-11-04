@@ -540,7 +540,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.14.14"
+APP_VERSION = "5.15.4"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -5384,6 +5384,8 @@ def _scheduler_loop() -> None:
     if not STATE.persistent:
         logger.warning("State store em memória: um restart pode repetir rotinas do dia.")
     threading.Thread(target=_status_catchup, name="lyra-status-catchup", daemon=True).start()
+    if MELHORIAS_POLL_SECONDS > 0 and MELHORIAS_CHANNELS:
+        threading.Thread(target=_melhorias_poll_loop, name="lyra-melhorias-poll", daemon=True).start()
     if TABLE_ENABLED:  # deploy/restart zera o cache: já monta a tabela do dia para a 1ª pergunta não esperar
         threading.Thread(target=lambda: _day_table(), name="lyra-warm-table", daemon=True).start()
     logger.info("Scheduler started for %s", TENANTS)
@@ -5516,6 +5518,8 @@ def _diagnostics_text() -> str:
                          f"{('<#' + _chamado_destino(eps)[0] + '>') if _chamado_destino(eps)[0] else '—'}"
                          f"{' (teste)' if _chamado_destino(eps)[1] else ''}"
                          f" · respostas da thread: {'no canal de teste (modo teste)' if MELHORIAS_SHADOW else 'na própria thread'}")
+            lines.append(f"   última mensagem vista: {STATE.get(f'seen:{ch}') or 'nenhuma desde o deploy/estado'} · "
+                         f"último chamado: {STATE.get(f'flowlast:{ch}') or 'nenhum'}")
     return "\n".join(lines)
 
 
@@ -7611,6 +7615,7 @@ def _read_status_thread(channel: str, thread_ts: str, eps: str) -> str | None:
         return None
     bot = _bot_user_id()
     title = str(messages[0].get("text") or "")
+    print_thread = bool(_print_control_kind(title))  # Volume/Produtividade/Acompanhamento: quem lê é o leitor de print
     statuses: list[dict[str, Any]] = []
     unread = 0
     for m in messages[1:]:
@@ -7621,9 +7626,14 @@ def _read_status_thread(channel: str, thread_ts: str, eps: str) -> str | None:
             parsed = _parse_status(chunk)
             if parsed:
                 found.append(parsed)
-        if LLM_CONTROL_READ and _maybe_control(m) and not (found and all(_status_complete(s) for s in found)):
-            livre = _llm_status(channel, title, fila, m)  # formato novo / só imagem / faltou campo na regra
-            if livre:
+        complete = bool(found) and all(_status_complete(s) for s in found)
+        if LLM_CONTROL_READ and not print_thread and _maybe_control(m) and (not complete or _image_files(m)):
+            livre = _llm_status(channel, title, fila, m)  # formato novo / só imagem / faltou campo / print junto
+            if livre and complete:  # a regra leu o texto: mantém os números dela e soma o que veio do print
+                for k, v in livre.items():
+                    if k in ("ruim", "bom") or found[-1].get(k) in (None, "", []):
+                        found[-1][k] = v
+            elif livre:
                 found = [livre]
             elif not found:
                 unread += 1
@@ -7953,9 +7963,12 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
     if not msg:
         return None
     if not kind:
+        if LLM_CONTROL_READ and _status_fila(title, eps):
+            STATE.set(done_key, "")
+            return _read_status_thread(channel, thread_ts, eps)  # controle com print (ou texto + print): leitura livre
         _shadow_note(channel, thread_ts, eps, title,
-                     f"🤔 Vi um print em _{re.sub(r'[`*_]', '', title).strip()[:60]}_, mas ainda não sei ler esse "
-                     "controle. Me manda um exemplo para eu aprender o formato.",
+                     f"🤔 Vi um print em _{re.sub(r'[`*_]', '', title).strip()[:60]}_, mas não reconheci a fila no "
+                     "título — não consigo cobrar ainda.",
                      once_key=f"shadow_unknown:{channel}:{thread_ts}")
         return None
     images = _image_files(msg)
@@ -8073,7 +8086,8 @@ def _status_catchup() -> None:
                 for m in recent:
                     if _image_files(m) and PRINT_READING:
                         _read_print_message(channel, thread_ts, str(m.get("ts")), eps)
-                if any(_looks_like_status(str(m.get("text") or "")) for m in recent):
+                if any(_looks_like_status(str(m.get("text") or "")) or (LLM_CONTROL_READ and _maybe_control(m)
+                                                                         and not _image_files(m)) for m in recent):
                     _read_status_thread(channel, thread_ts, eps)
             except Exception:
                 logger.exception("[%s] Status catch-up failed for %s", eps, thread_ts)
@@ -8135,7 +8149,7 @@ def _maybe_status_reply(event: dict[str, Any]) -> bool:
 
         threading.Thread(target=run_print, daemon=True).start()
         return True
-    if not _looks_like_status(str(event.get("text") or "")):
+    if not (_looks_like_status(str(event.get("text") or "")) or (LLM_CONTROL_READ and _maybe_control(event))):
         return False
     with _LIVE_LOCK:
         if thread_ts in _STATUS_PENDING:
@@ -8181,6 +8195,47 @@ _FIELD_LINE_RE = re.compile(r"^\s*\*(?P<label>[^*]+?)\*\s*:?\s*(?P<value>.*)$")
 _UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
 _EMOJI_CODE_RE = re.compile(r":[a-z0-9_+\-]+:")
 _CHAMADOS_LOCK = threading.Lock()
+
+
+def _blocks_flat(blocks: Any) -> str:
+    """Texto dos blocks do Slack (mensagem de fluxo de trabalho), com negrito como *rótulo*."""
+    out: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, list):
+            for n in node:
+                walk(n)
+            return
+        if not isinstance(node, dict):
+            return
+        t = node.get("type")
+        if t == "text":
+            txt = str(node.get("text") or "")
+            bold = (node.get("style") or {}).get("bold")
+            out.append("\n".join(f"*{part.strip()}*" if bold and part.strip() else part for part in txt.split("\n")))
+        elif t == "user":
+            out.append(f"<@{node.get('user_id')}>")
+        elif t == "emoji":
+            out.append(f":{node.get('name')}:")
+        elif t == "link":
+            out.append(str(node.get("text") or node.get("url") or ""))
+        elif t in ("section", "header", "context") and isinstance(node.get("text"), dict):
+            out.append(str(node["text"].get("text") or "") + "\n")
+        for key in ("elements", "fields"):
+            if key in node:
+                walk(node[key])
+        if t in ("rich_text_section", "rich_text_list", "rich_text_preformatted", "rich_text_quote"):
+            out.append("\n")
+
+    walk(blocks)
+    return re.sub(r"\n{3,}", "\n\n", "".join(out)).strip()
+
+
+def _flow_text(message: dict[str, Any] | None) -> str:
+    """Texto da mensagem do fluxo: o campo text ou, se ele vier resumido, o conteúdo dos blocks."""
+    text = str((message or {}).get("text") or "")
+    blocks = _blocks_flat((message or {}).get("blocks") or [])
+    return blocks if len(_parse_flow_fields(blocks)) > len(_parse_flow_fields(text)) else text
 
 
 def _parse_flow_fields(text: str) -> dict[str, str]:
@@ -8408,6 +8463,67 @@ def _flow_post(channel: str, thread_ts: str, text: str) -> None:
     slack_app.client.chat_postMessage(channel=test_ch, thread_ts=parent or None, text=text)
 
 
+# Rede de segurança: o Slack nem sempre entrega o evento da mensagem do fluxo de trabalho. A Lyra também relê os
+# canais de melhorias a cada MELHORIAS_POLL_SECONDS e trata o chamado novo ou a thread que mudou desde a última leitura.
+MELHORIAS_POLL_SECONDS = int(os.getenv("MELHORIAS_POLL_SECONDS", "0"))  # 0 = desligado (só evento)
+MELHORIAS_POLL_HOURS = float(os.getenv("MELHORIAS_POLL_HOURS", "24"))
+
+
+def _melhorias_poll_once() -> None:
+    oldest = str(time.time() - MELHORIAS_POLL_HOURS * 3600)
+    for eps, channel in MELHORIAS_CHANNELS.items():
+        try:
+            hist = slack_app.client.conversations_history(channel=channel, oldest=oldest, limit=100)
+        except Exception:
+            logger.warning("[melhorias %s] não consegui ler o canal", eps, exc_info=True)
+            continue
+        for parent in (_resp_get(hist, "messages", []) or []):
+            ts = str(parent.get("ts") or "")
+            if not ts or not (parent.get("bot_id") or parent.get("subtype") == "bot_message"):
+                continue  # chamado = mensagem do fluxo
+            stamp = str(parent.get("latest_reply") or ts)
+            seen_key = f"flowpoll:{channel}:{ts}"
+            if STATE.get(seen_key) == stamp:
+                continue  # nada novo nessa thread desde a última leitura
+            STATE.set(seen_key, stamp)
+            if STATE.get(f"chamado:{ts}") in {"aberto", "fora", "respondido", "processando"}:
+                continue
+            try:
+                _handle_owners_flow(channel, ts)
+            except Exception:
+                logger.exception("[melhorias %s] releitura falhou (%s)", eps, ts)
+
+
+def _melhorias_poll_loop() -> None:
+    time.sleep(60)
+    first = True
+    while True:
+        try:
+            if first:  # na subida só marca o que já existe como visto, para não reprocessar o histórico inteiro
+                cutoff = time.time() - 2 * 3600
+                for eps, channel in MELHORIAS_CHANNELS.items():
+                    try:
+                        hist = slack_app.client.conversations_history(channel=channel, oldest=str(time.time() - MELHORIAS_POLL_HOURS * 3600), limit=100)
+                    except Exception:
+                        continue
+                    for m in (_resp_get(hist, "messages", []) or []):
+                        if float(m.get("latest_reply") or m.get("ts") or 0) < cutoff:
+                            STATE.set(f"flowpoll:{channel}:{m.get('ts')}", str(m.get("latest_reply") or m.get("ts")))
+                first = False
+            _melhorias_poll_once()
+        except Exception:
+            logger.exception("Melhorias poll failed")
+        time.sleep(MELHORIAS_POLL_SECONDS)
+
+
+def _flow_mark(channel: str, what: str) -> None:
+    logger.info("[melhorias %s] %s", channel, what)
+    try:
+        STATE.set(f"flowlast:{channel}", f"{_now_brazil().strftime('%d/%m %H:%M')} · {what}")
+    except Exception:
+        pass
+
+
 def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "") -> None:
     """Lê o chamado do Fluxo Owners CX (mensagem + thread). Moedas: triagem e chamado no Rewards. Outros tópicos:
     responde na thread pela base de conhecimento (e de novo quando marcarem a Lyra na thread)."""
@@ -8424,15 +8540,16 @@ def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "") ->
     try:
         messages = _fetch_thread(channel, thread_ts)
         parent = next((m for m in messages if m.get("ts") == thread_ts), {})
-        parent_text = str(parent.get("text") or "")
+        parent_text = _flow_text(parent)
         flow_msgs = [m for m in messages if m.get("bot_id") or m.get("subtype") == "bot_message"]
-        details = next((m for m in flow_msgs if m.get("ts") != thread_ts and "descri" in _norm_text(m.get("text"))), None)
+        details = next((m for m in flow_msgs if m.get("ts") != thread_ts and "descri" in _norm_text(_flow_text(m))), None)
         if details is None and "descri" in _norm_text(parent_text):
             details = parent  # fluxo que posta tudo na mensagem principal
         if details is None:
             STATE.set(key, state or "")
+            _flow_mark(channel, "esperando o fluxo postar os detalhes (campo Descrição) na thread")
             return  # o fluxo ainda não postou os detalhes na thread
-        fields = _parse_flow_fields(str(details.get("text") or ""))
+        fields = _parse_flow_fields(_flow_text(details))
         parent_fields = _parse_flow_fields(parent_text)
         if not _is_moedas_flow(fields, parent_fields):
             if eps is None:  # canal antigo do fluxo (OWNERS_FLOW_CHANNEL): só moedas
@@ -8453,6 +8570,7 @@ def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "") ->
                 pergunta = triage["pergunta"] or ("Pra eu abrir o chamado no time de Rewards, me manda aqui: "
                                                  + ", ".join(triage["faltando"]) + ".")
                 _flow_post(channel, thread_ts, f"{quem}{pergunta}")
+            _flow_mark(channel, "moedas: pedi os dados que faltam (" + ", ".join(triage["faltando"])[:80] + ")")
             STATE.set(key, "aguardando")
             return
         origin = _permalink(channel, thread_ts)
@@ -8477,6 +8595,7 @@ def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "") ->
                   + f"\n*Tipo:* {triage['tipo_problema']}" + (f" · *Missão:* {triage['missao']}" if triage["missao"] else "")
                   + "\nTe aviso aqui quando o Rewards responder."))
         STATE.set(key, "aberto")
+        _flow_mark(channel, "moedas: chamado aberto")
         if rewards_ts:
             STATE.set(f"rewards:{rewards_ts}", json.dumps({"channel": channel, "ts": thread_ts,
                                                             "solicitante": chamado.get("solicitante", "")}))
@@ -8492,6 +8611,7 @@ def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "") ->
     except Exception as exc:
         logger.exception("Owners flow handling failed")
         STATE.set(key, "")
+        _flow_mark(channel, f"falhou ({type(exc).__name__})")
         _alert(f"Falha ao abrir chamado de moedas ({thread_ts}): {type(exc).__name__}: {str(exc)[:150]}")
 
 
@@ -8565,6 +8685,8 @@ def _route_chamados_event(event: dict[str, Any]) -> bool:
     channel = str(event.get("channel") or "")
     if _is_flow_channel(channel):
         root = str(event.get("thread_ts") or event.get("ts") or "")
+        _mark_seen(channel, ("fluxo (bot)" if event.get("bot_id") else "mensagem") + (" na thread" if event.get("thread_ts") else " nova"))
+        logger.info("[melhorias %s] evento recebido (thread %s, bot=%s)", channel, root, bool(event.get("bot_id")))
         bot = _bot_user_id()
         if event.get("user") != bot and root and event.get("subtype") not in {"message_changed", "message_deleted"}:
             text = str(event.get("text") or "")
@@ -8600,6 +8722,9 @@ def handle_reaction_removed(event, ack):
 
 @slack_app.event("message")
 def handle_message(event, say, client, ack):
+    logger.info("evento message · canal=%s · %s · subtype=%s · thread=%s", event.get("channel"),
+                "bot" if event.get("bot_id") else "pessoa", event.get("subtype") or "-",
+                "sim" if event.get("thread_ts") and event.get("thread_ts") != event.get("ts") else "não")
     if _route_chamados_event(event):
         ack()
         return
