@@ -540,7 +540,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.19.2"
+APP_VERSION = "5.20.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -4607,6 +4607,52 @@ def _kb_context(query: str) -> str:
             + "\n".join(out) + "\n\n")
 
 
+# --- Pedido de treinamento: começa pelo problema da fila, não pela lista do Q4 --------------------------------------
+_TRAINING_RE = re.compile(
+    r"\bquem\b[^?]{0,40}\b(trein\w*|reciclag\w*|capacit\w*|feedback|acompanhar|desenvolver)\b"
+    r"|\b(lista|prioridade|plano|sugest\w*|indica\w*)\b[^?]{0,20}\b(treinamento|reciclagem|capacitacao)\b"
+    r"|\b(preciso|quero|vou|devo|bora)\b[^?]{0,20}\b(treinar|reciclar|capacitar)\b")
+TRAINING_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA — PEDIDO DE TREINAMENTO da fila {fila}. Treinamento bom ataca um problema da "
+    "operação; não entregue só a lista dos piores. Faça nesta ordem:\n"
+    "1. *Problema:* chame a Lyra Indicadores para a fila {fila}: CSAT vs meta e os motivos de contato que mais tiram "
+    "CSAT (impacto por motivo). Se o mês tiver menos de 10 dias, use os últimos 30 dias para ter amostra e diga isso.\n"
+    "2. *Causa:* chame a Lyra Qualidade para os detratores desses motivos na fila: o que é do *Operador* (conduta, "
+    "procedimento, comunicação) e o que não é (Política iFood, Parceiro/logística, Produto). Se o problema principal "
+    "NÃO for do operador, diga com franqueza que treinamento não resolve e o que resolve.\n"
+    "3. *Quem:* peça à Lyra Indicadores os operadores da fila com mais detratores nesses motivos (mínimo de 10 "
+    "avaliações no período), com supervisor. Se a pessoa pediu lista nominal/completa, traga todos; se passar de 25, "
+    "diga que manda a planilha completa e mostre os 10 primeiros.\n"
+    "4. *Monte:* problema (com número) → o que treinar (conteúdo concreto, a partir dos comentários) → quem (nominal) → "
+    "como medir (indicador e prazo, ex.: CSAT do motivo em 2 semanas).\n"
+    "Seja crítica: amostra pequena, operador com n baixo, ou causa fora do operador precisam ser ditos.\n\n")
+
+
+def _training_question(eps: str | None) -> str | None:
+    """Pergunta de volta, com dado: qual fila? Mostra as filas que mais tiram CSAT no mês."""
+    try:
+        rows = _scope_rows(_day_table() or [], eps)
+    except Exception:
+        rows = []
+    items = []
+    for r in rows:
+        c, n, _ = _agg([r], "mes")
+        imp = _impact(rows, [r], "mes") if len(rows) > 1 else None
+        if c is not None and r.get("meta") and c < r["meta"]:
+            items.append((imp if imp is not None else c - r["meta"], r, c, n))
+    items.sort(key=lambda x: x[0])
+    linhas = [f"• *{r['fila']}* · {_bfmt(c)}% contra meta {_bfmt(r['meta'])}% (n={_fmt_int(n)})"
+              for _, r, c, n in items[:3]]
+    base = ("Bora, mas antes me ajuda a mirar: treinamento que funciona ataca um problema específico, não só quem "
+            "está no fim da lista. ")
+    if linhas:
+        return (base + "Pelo mês, quem mais está puxando o CSAT pra baixo é:\n" + "\n".join(linhas)
+                + "\n\nQual fila você quer atacar? Com ela, eu levanto o motivo que mais gera detrator, se a causa é "
+                  "mesmo do operador (ou é política/parceiro), quem concentra esses casos e o que treinar.")
+    return (base + "Qual fila você quer atacar? Com ela, eu levanto o motivo que mais gera detrator, se a causa é "
+                   "do operador, quem concentra esses casos e o que treinar.")
+
+
 CHAT_INSTRUCTION = (
     "INFORMAÇÃO INTERNA PARA A LYRA: esta é uma mensagem de conversa, não um pedido de análise. Responda como você "
     "(seção Personalidade): gente do time, bem-humorada quando couber (uma tirada, no máximo), sem frase de robô. "
@@ -7264,6 +7310,20 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 return
         except Exception:
             logger.warning("Learning handling failed", exc_info=True)
+        if _TRAINING_RE.search(_norm_text(question)):
+            thread_txt = _thread_context(event) if event.get("thread_ts") else ""
+            fila_t = (_fila_in_question(question, eps) or (_status_fila(question, eps) if eps else None)
+                      or _fila_in_question(thread_txt[-2000:], eps))
+            if not fila_t:  # "quem eu treino?": treinamento começa pelo problema, não pela lista
+                ask = _training_question(eps)
+                if ask:
+                    event["_route"] = "treinamento:pergunta"
+                    _say(say, ask, event, in_thread)
+                    return
+            else:
+                event["_route"] = "treinamento"
+                question = (f"{question}\n(Fila: {fila_t})")
+                event["_training"] = fila_t
         if _NEWS_RE.search(_norm_text(question)) and not _is_analytical(question):
             news = None
             try:
@@ -7400,6 +7460,8 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             extra = CLUBE_INSTRUCTION
         elif not extra and _is_knowledge_question(question):
             extra = KNOWLEDGE_INSTRUCTION
+        elif not extra and event.get("_training"):
+            extra = TRAINING_INSTRUCTION.format(fila=event["_training"])
         elif not extra and _is_small_talk(question):
             extra = CHAT_INSTRUCTION  # conversa curta: responde rápido, sem subagentes
             event["_route"] = "conversa"
