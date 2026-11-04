@@ -540,7 +540,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.16.1"
+APP_VERSION = "5.17.1"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -781,7 +781,7 @@ def _require_toqan_key() -> str:
 
 
 TOQAN_RETRY_CODES = {409, 429, 500, 502, 503, 504}
-TOQAN_RETRY_WAITS = (5, 15, 30)
+TOQAN_RETRY_WAITS = (10, 30, 60)
 
 
 def _toqan_request(method: str, payload: dict[str, Any], api_key: str | None = None,
@@ -5558,6 +5558,8 @@ THREAD_CONTEXT_MAX_CHARS = 4000
 def _thread_context(event: dict[str, Any]) -> str:
     """Conversa dentro de uma thread: manda junto o que já foi dito ali (ex.: o bloco do report da fila),
     para a Lyra não perguntar o que já está na tela. Marca a mensagem como respondida (sem crítica duplicada depois)."""
+    if event.get("_thread_ctx") is not None:  # menção espelhada no canal de teste: contexto é o da thread original
+        return str(event["_thread_ctx"])
     thread_ts = str(event.get("thread_ts") or "")
     channel = str(event.get("channel") or "")
     if not thread_ts or thread_ts == str(event.get("ts") or "") or event.get("channel_type") == "im":
@@ -7211,8 +7213,52 @@ def _dispatch(event: dict[str, Any], say: Callable[..., Any], client: Any, ack: 
         logger.exception("Could not start Lyra worker")
 
 
+def _shadow_mention(event: dict[str, Any], client: Any, ack: Callable[[], Any]) -> bool:
+    """Fase de testes: menção à Lyra no canal de indicadores da EPS. A pergunta e a resposta vão para o canal de
+    testes da EPS (uma thread espelho por conversa, com o link da original); nada aparece no canal da EPS."""
+    channel = str(event.get("channel") or "")
+    eps = _STATUS_CHANNEL_EPS.get(channel)
+    if not eps or not _status_shadow(eps):
+        return False
+    test_ch = STATUS_TEST_CHANNELS.get(eps) or EPS_CHANNELS.get(eps)
+    if not test_ch:
+        return False
+    ack()
+    root = str(event.get("thread_ts") or event.get("ts") or "")
+    try:
+        ctx = _thread_context(event) if event.get("thread_ts") else ""
+        key = f"mention_shadow:{channel}:{root}"
+        parent = STATE.get(key)
+        if not parent:
+            link = _permalink(channel, root)
+            resp = slack_app.client.chat_postMessage(
+                channel=test_ch, text=f"🧪 *Teste · {eps}* — marcaram a Lyra no canal de indicadores"
+                                      + (f" (<{link}|thread original>)" if link else "")
+                                      + ". Eu responderia aqui; nada foi postado no canal da EPS.")
+            parent = str(_resp_get(resp, "ts") or "")
+            if parent:
+                STATE.set(key, parent)
+        question = _strip_mentions(str(event.get("text") or "")).strip()
+        user = str(event.get("user") or "")
+        q = slack_app.client.chat_postMessage(channel=test_ch, thread_ts=parent or None,
+                                              text=f"🗨️ {('<@' + user + '>') if user else 'Pergunta'}: {question[:1500]}")
+        mirror = dict(event)
+        mirror.update({"channel": test_ch, "ts": str(_resp_get(q, "ts") or parent), "thread_ts": parent,
+                       "_thread_ctx": ctx, "channel_type": "channel"})
+
+        def mirror_say(text: str = "", thread_ts: str | None = None, **kwargs: Any) -> Any:
+            return slack_app.client.chat_postMessage(channel=test_ch, text=text, thread_ts=thread_ts or parent, **kwargs)
+
+        _dispatch(mirror, mirror_say, client, lambda: None)
+    except Exception:
+        logger.exception("[%s] Menção espelhada falhou", eps)
+    return True
+
+
 @slack_app.event("app_mention")
 def handle_app_mention(event, say, client, ack):
+    if _shadow_mention(event, client, ack):
+        return
     if _is_flow_channel(str(event.get("channel") or "")):
         ack()  # o evento "message" do mesmo post já trata (chamado de moedas ou resposta pela base)
         return
@@ -7294,6 +7340,10 @@ def _maybe_live_thread_reply(event: dict[str, Any]) -> None:
 # (cupom, Rosie, sistema) fica só no registro da EPS: não vira cobrança de SLA.
 STATUS_CHANNELS = _parse_channel_map(os.getenv("STATUS_CHANNELS", ""))  # "CSU:C0...,AeC:C0..."
 _STATUS_CHANNEL_EPS = {channel: eps for eps, channel in STATUS_CHANNELS.items()}
+# Canais de indicadores das EPSs: fora dos controles, a Lyra só fala quando marcada — e aí responde na thread, com o
+# contexto daquela conversa e só com dados da EPS do canal.
+for _eps, _channel in STATUS_CHANNELS.items():
+    CHANNEL_SCOPE.setdefault(_channel, next((k for k in EPS_CELULAS if k.casefold() == _eps.casefold()), _eps))
 STATUS_REPLY_DELAY_SECONDS = int(os.getenv("STATUS_REPLY_DELAY_SECONDS", "90"))
 # Fase de testes: lê o canal real da EPS, mas responde no canal de testes da EPS (EPS_CHANNELS), sem marcar ninguém.
 # STATUS_SHADOW=0 = responde na própria thread da EPS, marcando quem postou.
@@ -7477,7 +7527,7 @@ def _control_prompt(title: str, fila: str, text: str, has_images: bool) -> str:
     )
 
 
-_CONTROL_READ_SEM = threading.BoundedSemaphore(int(os.getenv("CONTROL_READ_PARALLEL", "2")))
+_CONTROL_READ_SEM = threading.BoundedSemaphore(int(os.getenv("CONTROL_READ_PARALLEL", "1")))
 LLM_READ_LAST = 2  # só as últimas mensagens da thread vão para a leitura livre (as antigas ficam com a regra)
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
 _THREAD_LOCKS_GUARD = threading.Lock()
@@ -7486,6 +7536,20 @@ _THREAD_LOCKS_GUARD = threading.Lock()
 def _thread_lock(key: str) -> threading.Lock:
     with _THREAD_LOCKS_GUARD:
         return _THREAD_LOCKS.setdefault(key, threading.Lock())
+
+
+def _safe_status_retry(channel: str, thread_ts: str, eps: str) -> None:
+    try:
+        skey = f"status:{channel}:{thread_ts}"
+        try:
+            raised = json.loads(STATE.get(skey) or "{}")
+        except ValueError:
+            raised = {}
+        raised.pop("_last_idx", None)  # força reler a última atualização (mantém o histórico de cobranças)
+        STATE.set(skey, json.dumps(raised))
+        _read_status_thread(channel, thread_ts, eps)
+    except Exception:
+        logger.exception("[%s] Status retry failed", eps)
 
 
 def _llm_status(channel: str, title: str, fila: str, message: dict[str, Any]) -> dict[str, Any] | None:
@@ -7518,6 +7582,14 @@ def _llm_status(channel: str, title: str, fila: str, message: dict[str, Any]) ->
                                max_attempts=PRINT_MAX_POLLS)
     except Exception as exc:
         logger.warning("Leitura livre de controle falhou (%s)", ts, exc_info=True)
+        rkey = f"llmretry:{channel}:{ts}"
+        tries = int(STATE.get(rkey) or 0)
+        thread_ts = str(message.get("thread_ts") or "")
+        eps = _STATUS_CHANNEL_EPS.get(channel)
+        if tries < PRINT_RETRY_MAX and thread_ts and eps:  # tenta sozinha de novo daqui a pouco
+            STATE.set(rkey, str(tries + 1))
+            threading.Timer(PRINT_RETRY_SECONDS, lambda: _safe_status_retry(channel, thread_ts, eps)).start()
+            return None
         akey = f"llmstatus_alert:{channel}:{_now_brazil().strftime('%Y%m%d%H')}"
         if not STATE.get(akey):  # um alerta por canal por hora, não um por mensagem
             STATE.set(akey, "1")
@@ -7632,6 +7704,79 @@ def _shadow_note(channel: str, thread_ts: str, eps: str, title: str, text: str, 
     _post_status_reply(channel, thread_ts, eps, title, text, [], None, crisis_check=False)
 
 
+# --- Threads de assunto nos canais de indicadores (não são controle): ex. "Palitagem - Cálculo do SLA" ------------
+# A Lyra lê uma vez quando a EPS abre o assunto. Se for dúvida/divergência para o iFood e a base tiver a resposta,
+# responde; se não tiver, marca o dono do tema (experiência: Gustavo; eficiência: Michael). Conversa/ritual sem
+# pergunta: fica quieta. Depois disso, só responde quando marcada.
+OWNER_EXPERIENCIA = os.getenv("OWNER_EXPERIENCIA", "").strip()   # CSAT, aderência
+OWNER_EFICIENCIA = os.getenv("OWNER_EFICIENCIA", "").strip()     # TMA, SLA, volume, fila, produtividade...
+OWNER_EXPERIENCIA_NOME = os.getenv("OWNER_EXPERIENCIA_NOME", "Gustavo")
+OWNER_EFICIENCIA_NOME = os.getenv("OWNER_EFICIENCIA_NOME", "Michael")
+TOPIC_THREADS = os.getenv("TOPIC_THREADS", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+
+
+def _topic_prompt(eps: str, title: str, conversa: str, n_imgs: int) -> str:
+    return (
+        f"{_scope_instruction(eps)}\n\n"
+        f"INFORMAÇÃO INTERNA PARA A LYRA — a {eps} abriu esta thread no canal de indicadores. NÃO é um controle de "
+        "hora em hora. Título: \"" + _strip_md(title)[:150] + "\"\n"
+        f"Conversa na thread:\n{conversa[-3000:]}\n"
+        + (f"(Há {n_imgs} imagem(ns) anexada(s) que você não vê.)\n" if n_imgs else "")
+        + "Decida e responda em UM destes formatos, sem nada antes:\n"
+        "1. `SILENCIO` — se for só informativo, ritual, aviso ou conversa entre a operação, sem dúvida, divergência "
+        "ou pedido para o iFood.\n"
+        "2. A resposta, em até 6 linhas, se for dúvida/divergência (ex.: como o iFood calcula um indicador, por que o "
+        "número deles difere do nosso, regra de processo) E a base responder: consulte a *Lyra Conhecimento* (regras, "
+        "definições, processos) e, se for número ou cálculo, a *Lyra Indicadores*. Use só o que elas devolverem.\n"
+        "3. `ESCALAR: experiencia: <a dúvida em 1 linha>` ou `ESCALAR: eficiencia: <a dúvida em 1 linha>` — se a base "
+        "não tiver a resposta (NÃO SEI) ou depender de decisão do time. experiencia = CSAT, avaliações, detratoras, "
+        "aderência a processo/política. eficiencia = TMA, SLA, volume, fila, produtividade, HC, palitagem e o resto.\n"
+        "Nunca chute número nem regra."
+    )
+
+
+def _topic_thread(channel: str, thread_ts: str, eps: str, messages: list[dict[str, Any]]) -> str | None:
+    if not TOPIC_THREADS or not messages:
+        return None
+    key = f"topic:{channel}:{thread_ts}"
+    if STATE.get(key):
+        return None  # já avaliou esta thread; daqui pra frente só quando marcada
+    parent = messages[0]
+    bot = _bot_user_id()
+    if parent.get("bot_id") or (bot and parent.get("user") == bot) or _is_ifood_user(str(parent.get("user") or "")):
+        STATE.set(key, "ifood")  # aberta pelo iFood (cobrança/pergunta para a EPS): não é com a Lyra
+        return None
+    human = [m for m in messages if not (m.get("bot_id") or (bot and m.get("user") == bot))]
+    if any(_is_ifood_user(str(m.get("user") or "")) for m in human[1:]):
+        STATE.set(key, "ifood")  # o time iFood já está na conversa
+        return None
+    STATE.set(key, "lendo")
+    title = str(parent.get("text") or "")
+    conversa = "\n".join(f"EPS: {_strip_mentions(_strip_md(m.get('text'))).strip()[:800]}" for m in human
+                         if str(m.get("text") or "").strip())
+    n_imgs = sum(len(_image_files(m)) for m in human)
+    try:
+        answer = _clean_answer(ask_toqan(_topic_prompt(eps, title, conversa, n_imgs)))
+    except Exception:
+        logger.warning("[%s] Leitura de assunto falhou (%s)", eps, thread_ts, exc_info=True)
+        STATE.set(key, "")
+        return None
+    STATE.set(key, "lido")
+    text = answer.strip()
+    if not text or text.upper().startswith("SILENCIO") or _is_error_answer(text):
+        logger.info("[%s] Assunto %s: sem resposta (silêncio)", eps, thread_ts)
+        return None
+    m = re.match(r"`?ESCALAR\s*:\s*(experiencia|experiência|eficiencia|eficiência)\s*:\s*(.*)", text, re.I | re.S)
+    if m:
+        exp = _norm_text(m.group(1)).startswith("experiencia")
+        uid, nome = ((OWNER_EXPERIENCIA, OWNER_EXPERIENCIA_NOME) if exp else (OWNER_EFICIENCIA, OWNER_EFICIENCIA_NOME))
+        duvida = m.group(2).strip().strip("`").strip()[:300]
+        quem = (f"*{nome}* (em produção eu marco aqui)" if _status_shadow(eps) or not uid else f"<@{uid}>")
+        text = (f"Li a thread e isso não está na minha base. {quem}, consegue ajudar? "
+                f"Tema de {'experiência' if exp else 'eficiência'}: {duvida}")
+    return _post_status_reply(channel, thread_ts, eps, title, text, [], None, crisis_check=False)
+
+
 def _read_status_thread(channel: str, thread_ts: str, eps: str) -> str | None:
     """Lê a thread de status e, se houver o que cobrar, responde. Devolve o texto postado (ou None).
     Uma leitura por thread por vez: vários prints chegando juntos esperam a vez e reaproveitam a leitura."""
@@ -7651,7 +7796,12 @@ def _read_status_thread_locked(channel: str, thread_ts: str, eps: str) -> str | 
             _shadow_note(channel, thread_ts, eps, str(messages[0].get("text") or ""),
                          "🤔 Vi este controle, mas não reconheci a fila no título — não consigo cobrar ainda.",
                          once_key=f"shadow_nofila:{channel}:{thread_ts}")
-        return None
+            return None
+        if _print_control_kind(str(messages[0].get("text") or "")):
+            return None  # Volume/Produtividade/Acompanhamento: quem lê é o leitor de print
+        return _topic_thread(channel, thread_ts, eps, messages)  # assunto aberto pela EPS (ex.: palitagem)
+    if not STATE.get(f"topic:{channel}:{thread_ts}"):
+        STATE.set(f"topic:{channel}:{thread_ts}", "controle")  # thread de controle: não vira assunto
     bot = _bot_user_id()
     title = str(messages[0].get("text") or "")
     print_thread = bool(_print_control_kind(title))  # Volume/Produtividade/Acompanhamento: quem lê é o leitor de print
@@ -7989,6 +8139,17 @@ def _judge_produtividade(data: dict[str, Any]) -> list[tuple[str, str]]:
     return issues
 
 
+PRINT_RETRY_MAX = int(os.getenv("PRINT_RETRY_MAX", "3"))
+PRINT_RETRY_SECONDS = int(os.getenv("PRINT_RETRY_SECONDS", "180"))
+
+
+def _safe_print_retry(channel: str, thread_ts: str, msg_ts: str, eps: str) -> None:
+    try:
+        _read_print_message(channel, thread_ts, msg_ts, eps)
+    except Exception:
+        logger.exception("[%s] Print retry failed", eps)
+
+
 def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> str | None:
     done_key = f"printread:{channel}:{msg_ts}"
     if STATE.get(done_key):
@@ -8006,12 +8167,8 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
         if LLM_CONTROL_READ and _status_fila(title, eps):
             STATE.set(done_key, "")
             return _read_status_thread(channel, thread_ts, eps)  # controle com print (ou texto + print): leitura livre
-        if _looks_like_status(_strip_md(msg.get("text"))):  # conversa com imagem (caso, dúvida): ignora calada
-            _shadow_note(channel, thread_ts, eps, title,
-                         f"🤔 Vi um controle com print em _{re.sub(r'[`*_]', '', title).strip()[:60]}_, mas não reconheci "
-                         "a fila no título — não consigo cobrar ainda.",
-                         once_key=f"shadow_unknown:{channel}:{thread_ts}")
-        return None
+        STATE.set(done_key, "")
+        return _read_status_thread(channel, thread_ts, eps)  # sem fila no título: assunto (lê uma vez) ou status
     images = _image_files(msg)
     if not images:
         return None
@@ -8031,6 +8188,7 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
     problem = ""
     tech_problem = ""  # falha nossa (download, Toqan, JSON): só alerta, nunca cobra a EPS
     data: dict[str, Any] | None = None
+    _CONTROL_READ_SEM.acquire()  # uma leitura de imagem por vez no Toqan
     try:
         file_ids = []
         for f in images[:4]:
@@ -8059,8 +8217,18 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
                 else " — o upload da imagem para o Toqan falhou" if "upload" in detail.lower()
                 else " — parece o token do Databricks/Toqan" if _looks_like_token_error(detail) else "")
         tech_problem = f"falha ao ler a imagem ({type(exc).__name__}: {detail}){hint}"
+    finally:
+        _CONTROL_READ_SEM.release()
     if tech_problem:
-        STATE.set(done_key, "")  # falha nossa: libera para tentar de novo na próxima releitura
+        STATE.set(done_key, "")  # falha nossa: libera para tentar de novo
+        tries_key = f"printretry:{channel}:{msg_ts}"
+        tries = int(STATE.get(tries_key) or 0)
+        if tries < PRINT_RETRY_MAX:  # Toqan ocupado/recusou: tenta sozinha de novo daqui a pouco, sem alertar ainda
+            STATE.set(tries_key, str(tries + 1))
+            logger.warning("[%s] Print não lido (%s); nova tentativa %s/%s em %ss", eps, tech_problem[:120],
+                           tries + 1, PRINT_RETRY_MAX, PRINT_RETRY_SECONDS)
+            threading.Timer(PRINT_RETRY_SECONDS, lambda: _safe_print_retry(channel, thread_ts, msg_ts, eps)).start()
+            return None
         _alert(f"Print de controle ({eps} · {re.sub(r'[`*_]', '', title).strip()[:60]}): {tech_problem}. Nada foi postado para a EPS.")
         return None
     if problem or not data:
@@ -8172,6 +8340,9 @@ def _maybe_status_reply(event: dict[str, Any]) -> bool:
         return False
     if event.get("bot_id"):
         return False
+    _bot = _bot_user_id()
+    if _bot and f"<@{_bot}>" in str(event.get("text") or ""):
+        return True  # marcaram a Lyra: quem responde é a menção (no teste, espelhada no canal de testes)
     if _image_files(event):
         if not PRINT_READING:
             return False
@@ -8191,7 +8362,10 @@ def _maybe_status_reply(event: dict[str, Any]) -> bool:
         threading.Thread(target=run_print, daemon=True).start()
         return True
     if not (_looks_like_status(str(event.get("text") or "")) or (LLM_CONTROL_READ and _maybe_control(event))):
-        return False
+        bot = _bot_user_id()
+        if (bot and f"<@{bot}>" in str(event.get("text") or "")) \
+                or not (TOPIC_THREADS and not STATE.get(f"topic:{channel}:{thread_ts}")):
+            return False  # marcaram a Lyra (a menção responde) ou thread já avaliada: só responde se marcada
     with _LIVE_LOCK:
         if thread_ts in _STATUS_PENDING:
             return True
