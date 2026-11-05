@@ -540,7 +540,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.24.3"
+APP_VERSION = "5.25.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -2983,12 +2983,30 @@ def _operators_rows(eps: str | None, question: str) -> tuple[list[list[str]], in
     period, period_label = _operators_period(question)
     if eps is None:
         eps = _eps_of_question(question)  # visão completa pedindo uma EPS (ou fila): recorta nela
-    answer = _ask_base(_operators_prompt(eps, period))
-    if _is_error_answer(answer):
-        return "Não consegui puxar os dados dos operadores agora. Tenta de novo em alguns minutos?"
-    rows, total = _parse_operators_csv(answer)
-    if not rows:
-        return "Não consegui montar a base dos operadores agora. Tenta de novo em alguns minutos?"
+    if eps is None:
+        # visão iFood sem EPS: a base das duas juntas é grande demais para uma resposta só; busca uma por vez e junta
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(EPS_CELULAS)) as pool:
+            answers = list(pool.map(lambda e: (e, _ask_base(_operators_prompt(e, period))), list(EPS_CELULAS)))
+        rows, total = [], 0
+        for e, ans in answers:
+            if _is_error_answer(ans):
+                _alert(f"Base de operadores ({e}) falhou: {str(ans)[:200]}")
+                continue
+            r, t = _parse_operators_csv(ans)
+            rows += [x for x in r if _eps_pattern(e) in x[0].lower()]
+            total += t or len(r)
+        if not rows:
+            return "Não consegui puxar os dados dos operadores agora. Tenta de novo em alguns minutos?"
+    else:
+        answer = _ask_base(_operators_prompt(eps, period))
+        if _is_error_answer(answer):
+            _alert(f"Base de operadores ({eps}) falhou: {str(answer)[:200]}")
+            return "Não consegui puxar os dados dos operadores agora. Tenta de novo em alguns minutos?"
+        rows, total = _parse_operators_csv(answer)
+        if not rows:
+            _alert_unreadable("Base de operadores", eps, answer)
+            return "Não consegui montar a base dos operadores agora. Tenta de novo em alguns minutos?"
     if eps:
         rows = [r for r in rows if _eps_pattern(eps) in r[0].lower()]  # trava: só e-mails da EPS
     fila = _fila_in_question(question, eps)
@@ -4725,13 +4743,20 @@ def _is_small_talk(question: str) -> bool:
     """Mensagem curta sem pedido de dado, análise ou processo (ex.: 'tudo bem?', 'valeu', 'o que você acha?')."""
     t = _norm_text(question)
     return (0 < len(t.split()) <= 12 and not _DATA_WORDS_RE.search(t) and not _FILA_HINT_RE.search(t)
+            and not _DEFINITION_RE.search(t)
             and not _is_analytical(question) and not _is_plan_request(question) and not _is_knowledge_question(question)
             and not re.search(r"\d", t))
+
+
+_DEFINITION_RE = re.compile(r"\b(o que (e|eh|significa|quer dizer|faz)|quem e (o|a)|como funciona|significa|"
+                            r"qual a diferenca|o que sao)\b")
 
 
 def _is_knowledge_question(question: str) -> bool:
     """Dúvida de processo/política/agente de IA: a resposta vem da Lyra Conhecimento, não de dado nem de chute."""
     text = _norm_text(question)
+    if _DEFINITION_RE.search(text) and not _DATA_WORDS_RE.search(text):
+        return True  # "o que é o Almir?", "o que significa NCPO?": base de processos + Conhecimento
     if _DATA_WORDS_RE.search(text):  # "CSAT da Super Cliente", "TMA do VIP": é dado, não processo
         return False
     return bool(_KNOWLEDGE_RE.search(text)) and not _is_cause_request(question)
@@ -5767,7 +5792,12 @@ def _scheduler_loop() -> None:
         threading.Thread(target=_melhorias_poll_loop, name="lyra-melhorias-poll", daemon=True).start()
     threading.Thread(target=_kb_ready, name="lyra-kb", daemon=True).start()  # base de processos em memória
     if TABLE_ENABLED:  # deploy/restart zera o cache: já monta a tabela do dia para a 1ª pergunta não esperar
-        threading.Thread(target=lambda: _day_table(), name="lyra-warm-table", daemon=True).start()
+        def _warm_tables() -> None:
+            _day_table()
+            d1 = _as_date(_today_brazil()) - timedelta(days=1)
+            if d1.day <= 10:  # começo do mês: "mês passado" é pergunta frequente, deixa pronto
+                _day_table(_prev_month_bounds(d1))
+        threading.Thread(target=_warm_tables, name="lyra-warm-table", daemon=True).start()
     logger.info("Scheduler started for %s", TENANTS)
     while True:
         try:
@@ -7605,6 +7635,14 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             _say_sections(say, answer, event, in_thread)
         else:
             _say(say, answer or EMPTY_ANSWER_MESSAGE, event, in_thread)
+        if _NOMINAL_RE.search(_norm_text(question)) and re.search(r"ficaram de fora|planilha|excel|lista completa",
+                                                                  _norm_text(answer or "")):
+            # nominal grande: manda a lista completa em planilha sem a pessoa precisar pedir de novo
+            _say(say, "Segue a lista completa em planilha, já te mando aqui. ⏳", event, in_thread=True)
+            problem = _send_data_excel(event, client, eps, f"{question} — lista completa, todos os nomes, mesmo "
+                                                            "critério da resposta acima")
+            if problem:
+                _say(say, problem, event, in_thread)
     except MOPChannelNotAllowedError:
         _say(say, MOP_CHANNEL_NOT_ALLOWED_MESSAGE, event, in_thread=True)
     except MOPGoogleCredentialsError as exc:
@@ -9585,8 +9623,11 @@ def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "", tr
             if STATE.get(f"chamado_ask:{thread_ts}"):
                 STATE.set(f"chamado_ask:{thread_ts}", "")
                 STATE.set(key, "aguardando_info")  # a resposta do solicitante faz ela ler de novo
+                _flow_mark(channel, f"{_flow_topic(fields, parent_fields) or 'ajuda'}: perguntei detalhes a quem abriu")
             else:
                 STATE.set(key, "respondido")
+                _flow_mark(channel, f"{_flow_topic(fields, parent_fields) or 'ajuda'}: respondido"
+                           + (" (escalado)" if STATE.get(f"escalated:{channel}:{thread_ts}") else ""))
             return
         bot = _bot_user_id()
         replies = [str(m.get("text") or "") for m in messages
@@ -9645,6 +9686,30 @@ def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "", tr
         _alert(f"Falha ao abrir chamado de moedas ({thread_ts}): {type(exc).__name__}: {str(exc)[:150]}")
 
 
+def _describe_evidence(images: list[dict[str, Any]]) -> str:
+    """Lê o print anexado ao chamado (texto do erro, tela). Melhor esforço: se o Toqan não ler, devolve ""."""
+    try:
+        file_ids = []
+        for f in images[:3]:
+            content = _download_slack_bytes(f)
+            if content:
+                file_ids.append(toqan_upload_file(content, str(f.get("name") or "print.png"),
+                                                  str(f.get("mimetype") or "image/png")))
+        if not file_ids:
+            return ""
+        ans = ask_toqan_with_files(
+            "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Não chame subagentes. Descreva em até 3 linhas o que "
+            "o print mostra para entender o problema: a tela do app, a mensagem de erro EXATA entre aspas e o tipo de "
+            "pagamento/bandeira se aparecer. NUNCA transcreva número de cartão, CPF, nome, telefone ou endereço.",
+            file_ids, max_attempts=24)
+        ans = _clean_answer(ans)
+        ans = re.sub(r"\b(?:\d[ -]?){12,19}\b", "[número omitido]", ans)  # trava: nada de número de cartão
+        return "" if _is_error_answer(ans) else ans[:500]
+    except Exception:
+        logger.warning("Não consegui ler o print do chamado", exc_info=True)
+        return ""
+
+
 def _answer_flow_question(channel: str, thread_ts: str, eps: str | None, messages: list[dict[str, Any]],
                           fields: dict[str, str], parent_fields: dict[str, str], mention_text: str = "") -> None:
     """Tópico que não é Moedas (Ajuda, Escalar Ticket...): a Lyra tenta ajudar na thread pela base de conhecimento."""
@@ -9654,11 +9719,18 @@ def _answer_flow_question(channel: str, thread_ts: str, eps: str | None, message
     conversa = "\n".join(
         f"{'Lyra' if m.get('user') == bot else 'Operação'}: {_MENTION_RE.sub('', str(m.get('text') or '')).strip()[:600]}"
         for m in messages if m.get("ts") != thread_ts and not (m.get("bot_id") and m.get("user") != bot))
+    imgs = [f for m in messages for f in _image_files(m)][:3]
+    anexos = ""
+    if imgs:
+        leitura = _describe_evidence(imgs)
+        anexos = (f"A operação anexou {len(imgs)} imagem(ns) ao pedido. "
+                  + (f"O que dá para ver nelas: {leitura}\n" if leitura else
+                     "Você não consegue ver as imagens: NÃO peça print de novo; pergunte só o que um print não responde.\n"))
     prompt = (
         f"{_scope_instruction(eps)}\n\n"
         f"INFORMAÇÃO INTERNA PARA A LYRA — CANAL DE MELHORIAS DA {eps or 'EPS'}: a operação abriu um pedido pelo fluxo "
         f"Owners CX (tópico: {topic}). Ajude a operação na thread, como analista do time iFood.\n"
-        f"Pedido aberto:\n{pedido[:2500]}\n"
+        f"Pedido aberto:\n{pedido[:2500]}\n" + anexos
         + (f"Conversa na thread até aqui:\n{conversa[-2500:]}\n" if conversa else "")
         + (f"Nova mensagem para você: {mention_text}\n" if mention_text else "")
         + "Quem abriu o pedido É a operação de atendimento (a EPS), com o cliente já em atendimento: NUNCA diga para "
@@ -9869,6 +9941,7 @@ def slack_events():
 
 
 if __name__ == "__main__":
-    # Rode com `python app.py` (Procfile) e UMA réplica: o agendador vive neste processo.
+    # Em produção o Railway usa o gunicorn (Procfile + gunicorn.conf.py), que liga o agendador. `python app.py`
+    # continua funcionando (teste local ou volta rápida para o modelo antigo). Sempre UMA réplica.
     _start_scheduler()
     flask_app.run(host="0.0.0.0", port=PORT)
