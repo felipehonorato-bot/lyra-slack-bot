@@ -540,7 +540,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.25.0"
+APP_VERSION = "5.26.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -5658,8 +5658,9 @@ def _tenant_tick(tenant: Tenant, now: datetime) -> None:
             next_at = _report_next_attempt_at.get(tenant.key)
             if failures < REPORT_MAX_ATTEMPTS and (next_at is None or now >= next_at):
                 try:
-                    _run_daily_report(now, tenant)
+                    _rts = _run_daily_report(now, tenant)
                     _report_next_attempt_at.pop(tenant.key, None)
+                    _post_yesterday_digest(tenant, _rts)
                     if PREWARM_BASES:
                         threading.Thread(target=_prewarm_bases, args=(tenant.eps or "",), daemon=True).start()
                 except Exception as exc:
@@ -5791,6 +5792,8 @@ def _scheduler_loop() -> None:
     if MELHORIAS_POLL_SECONDS > 0 and MELHORIAS_CHANNELS:
         threading.Thread(target=_melhorias_poll_loop, name="lyra-melhorias-poll", daemon=True).start()
     threading.Thread(target=_kb_ready, name="lyra-kb", daemon=True).start()  # base de processos em memória
+    if CREAD:
+        threading.Thread(target=_cread_loop, name="lyra-cread", daemon=True).start()
     if TABLE_ENABLED:  # deploy/restart zera o cache: já monta a tabela do dia para a 1ª pergunta não esperar
         def _warm_tables() -> None:
             _day_table()
@@ -6733,6 +6736,10 @@ def _table_intent(question: str, eps: str | None) -> tuple[str, str | None, str 
     return None
 
 
+# "o que aconteceu hoje?", "o que rolou no canal?", "pendências": registro do dia da leitura contínua
+_DAYLOG_RE = re.compile(r"\b(o que (aconteceu|rolou|teve) (hoje|no canal|na operacao|ontem)|o que rolou|"
+                        r"pendencias (de hoje|do dia|abertas|do canal|em aberto)|o que (esta|ta|ficou) em aberto|"
+                        r"resumo do canal|como (foi|ta|esta) o canal)\b")
 # "novidades?", "como estamos?", "me atualiza": resposta rápida com a tabela do dia (sem chamar os subagentes)
 _NEWS_RE = re.compile(r"\b(novidade\w*|o que (tem|ha) de novo|como (estamos|que estamos|ta a operacao|esta a operacao|"
                       r"tao as coisas|estao as coisas)|me atualiza|me da um resumo|resumo (do dia|de hoje|rapido)|"
@@ -7440,6 +7447,15 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 event["_route"] = "treinamento"
                 question = (f"{question}\n(Fila: {fila_t})")
                 event["_training"] = fila_t
+        if CREAD and _DAYLOG_RE.search(_norm_text(question)):
+            _ontem = "ontem" in _norm_text(question)
+            day_txt = _daylog_text([eps] if eps else list(EPS_CELULAS),
+                                   day=(_as_date(_today_brazil()) - timedelta(days=1)) if _ontem else None,
+                                   title="No canal ontem" if _ontem else "No canal hoje")
+            event["_route"] = "registro do dia"
+            _say_sections(say, day_txt or "Hoje ainda não registrei nada relevante nas conversas do canal: só os "
+                                          "controles de rotina. 🌙", event)
+            return
         if _NEWS_RE.search(_norm_text(question)) and not _is_analytical(question):
             news = None
             try:
@@ -7448,7 +7464,8 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 logger.warning("News answer failed", exc_info=True)
             if news:  # "o que tem de novidade?": responde na hora com a tabela do dia, sem análise pesada
                 event["_route"] = "novidades"
-                _say_sections(say, news + "\n\n" + NEWS_FOLLOWUP, event)
+                canal = _daylog_text([eps] if eps else list(EPS_CELULAS), limit=5) if CREAD else ""
+                _say_sections(say, news + ("\n\n" + canal if canal else "") + "\n\n" + NEWS_FOLLOWUP, event)
                 return
         if not _report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or "")):
             focus: dict[str, Any] = {}
@@ -8232,6 +8249,298 @@ def _shadow_note(channel: str, thread_ts: str, eps: str, title: str, text: str, 
             return
         STATE.set(once_key, "1")
     _post_status_reply(channel, thread_ts, eps, title, text, [], None, crisis_check=False)
+
+
+# --- Leitura contínua dos canais das EPSs ---------------------------------------------------------------------------
+# Toda conversa dos canais de indicadores é lida (uma leitura por thread, CREAD_DELAY_SECONDS depois da última
+# mensagem). A Lyra extrai três coisas e age: (1) cobrança do iFood para a EPS — se a EPS não responder em 30 min,
+# reforça; quando responder, confere se tem causa, ação e prazo; (2) compromisso com prazo da EPS — no prazo, cobra
+# se foi feito; (3) problema operacional relatado — vai para o registro do dia. Tudo entra no registro do dia
+# ("o que aconteceu hoje?") e as pendências de ontem saem numa resposta na thread do report.
+CREAD = os.getenv("CONTINUOUS_READ", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+CREAD_DELAY_SECONDS = int(os.getenv("CREAD_DELAY_SECONDS", "180"))
+CREAD_FOLLOWUP_MINUTES = int(os.getenv("CREAD_FOLLOWUP_MINUTES", "30"))
+_CREAD_TIMERS: dict[str, threading.Timer] = {}
+_CREAD_LOCK = threading.Lock()
+_PENDING_LOCK = threading.Lock()
+_TRIVIAL_RE = re.compile(r"^\W*(ok|okay|blz|beleza|valeu|obrigad\w*|obg|bom dia|boa tarde|boa noite|ciente|top|show|"
+                         r"perfeito|certo|combinado|feito|sim|nao|isso|entendi|anotado|tmj|vlw)\W*$")
+
+
+def _cread_schedule(channel: str, root: str, eps: str) -> None:
+    """Cada mensagem nova reinicia o relógio da thread: a leitura acontece quando a conversa assenta."""
+    if not CREAD or not root:
+        return
+    key = f"{channel}:{root}"
+    with _CREAD_LOCK:
+        old = _CREAD_TIMERS.pop(key, None)
+        if old:
+            old.cancel()
+        t = threading.Timer(CREAD_DELAY_SECONDS, _cread_safe, args=(channel, root, eps))
+        t.daemon = True
+        _CREAD_TIMERS[key] = t
+        t.start()
+
+
+def _cread_safe(channel: str, root: str, eps: str) -> None:
+    with _CREAD_LOCK:
+        _CREAD_TIMERS.pop(f"{channel}:{root}", None)
+    try:
+        _cread(channel, root, eps)
+    except Exception:
+        logger.exception("[%s] Leitura contínua falhou (%s)", eps, root)
+
+
+def _who_label(user: str) -> str:
+    if not user:
+        return "?"
+    return "iFood" if _is_ifood_user(user) else "EPS"
+
+
+def _hhmm(ts: str) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts), BRAZIL_TIMEZONE).strftime("%H:%M")
+    except Exception:
+        return "--:--"
+
+
+def _cread(channel: str, root: str, eps: str) -> None:
+    msgs = _fetch_thread(channel, root)
+    if not msgs:
+        return
+    bot = _bot_user_id()
+    skey = f"cread:{channel}:{root}"
+    last = float(STATE.get(skey) or 0)
+    newest = max(float(m.get("ts") or 0) for m in msgs)
+    STATE.set(skey, str(newest))
+    human = [m for m in msgs if not (m.get("bot_id") or (bot and m.get("user") == bot))]
+    new = [m for m in human if float(m.get("ts") or 0) > last
+           and not _TRIVIAL_RE.match(_norm_text(_strip_mentions(_strip_md(m.get("text")))))
+           and _strip_mentions(_strip_md(m.get("text"))).strip()]
+    if not new:
+        return
+    new_ts = {str(m.get("ts")) for m in new}
+    title = _strip_md(str(msgs[0].get("text") or ""))[:150]
+    lines = []
+    for m in msgs[-40:]:
+        is_bot = m.get("bot_id") or (bot and m.get("user") == bot)
+        quem = "Lyra" if is_bot else f"{_who_label(str(m.get('user') or ''))} <@{m.get('user')}>"
+        txt = _strip_md(str(m.get("text") or "")).replace("\n", " ")[:600]
+        lines.append(f"{'[NOVA] ' if str(m.get('ts')) in new_ts else ''}ts={m.get('ts')} {_hhmm(str(m.get('ts')))} "
+                     f"{quem}: {txt}")
+    prompt = (
+        "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. NÃO chame subagentes. Responda APENAS com JSON.\n"
+        f"Conversa no canal de indicadores da {eps} (thread \"{title}\"). Cada linha diz se quem fala é do iFood ou da "
+        "EPS. Leia as mensagens marcadas [NOVA] (as outras são contexto) e extraia SÓ:\n"
+        "- cobranca_ifood: alguém do iFood cobrando/perguntando algo à EPS (ex.: 'estamos com fila em Review, o que "
+        "está acontecendo?'). Informe o ts da mensagem e se a EPS JÁ respondeu depois dela.\n"
+        "- compromisso: alguém da EPS prometendo algo com prazo de hora HOJE (ex.: 'normaliza até 14h', 'até 15h "
+        "mando o plano'). Prazo no formato HH:MM. Sem hora clara, ignore.\n"
+        "- problema: problema operacional relatado (sistema fora, instabilidade, pico, falta de gente, ferramenta).\n"
+        "Ignore atualização de indicador de hora em hora (status, CSAT/SLA, prints): isso já é lido em outro lugar.\n"
+        "Formato: {\"itens\": [{\"tipo\": \"cobranca_ifood\", \"ts\": \"...\", \"de\": \"<@U...>\", \"para\": "
+        "[\"<@U...>\"], \"texto\": \"...\", \"respondida\": false}, {\"tipo\": \"compromisso\", \"ts\": \"...\", "
+        "\"quem\": \"<@U...>\", \"o_que\": \"...\", \"prazo\": \"14:00\"}, {\"tipo\": \"problema\", \"resumo\": \"...\"}], "
+        "\"resumo\": \"1 linha do que aconteceu nas mensagens novas (ou vazio se for só conversa)\"}\n\n"
+        "Conversa:\n" + "\n".join(lines)
+    )
+    try:
+        data = _block_data_from_json(ask_toqan(prompt, max_attempts=40)) or {}
+    except Exception:
+        logger.warning("[%s] Leitura contínua: Toqan falhou (%s)", eps, root, exc_info=True)
+        STATE.set(skey, str(last))  # tenta de novo na próxima mensagem
+        return
+    now = _now_brazil()
+    problemas = []
+    for it in data.get("itens") or []:
+        tipo = str(it.get("tipo") or "")
+        if tipo == "cobranca_ifood" and not it.get("respondida") and str(it.get("ts")) in new_ts:
+            _pending_add({"k": "cobr", "ch": channel, "root": root, "eps": eps, "title": title,
+                          "ts": str(it.get("ts")), "de": _uid(it.get("de")), "para": [_uid(x) for x in it.get("para") or []],
+                          "texto": str(it.get("texto") or "")[:300],
+                          "due": (now + timedelta(minutes=CREAD_FOLLOWUP_MINUTES)).timestamp()})
+        elif tipo == "compromisso" and str(it.get("ts")) in new_ts:
+            mh = re.match(r"\s*(\d{1,2})(?:\s*[:h]\s*(\d{2}))?", str(it.get("prazo") or ""))
+            if not mh:
+                continue
+            due = now.replace(hour=min(int(mh.group(1)), 23), minute=int(mh.group(2) or 0), second=0, microsecond=0)
+            if due <= now:
+                continue
+            _pending_add({"k": "comp", "ch": channel, "root": root, "eps": eps, "title": title,
+                          "ts": str(it.get("ts")), "quem": _uid(it.get("quem")), "o_que": str(it.get("o_que") or "")[:200],
+                          "prazo": due.strftime("%H:%M"), "due": (due + timedelta(minutes=5)).timestamp()})
+        elif tipo == "problema" and it.get("resumo"):
+            problemas.append(str(it["resumo"])[:200])
+    resumo = str(data.get("resumo") or "").strip()
+    if resumo or problemas:
+        _daylog_add(eps, {"h": now.strftime("%H:%M"), "t": title[:80], "r": resumo[:240], "p": problemas,
+                          "link": _permalink(channel, root)})
+
+
+def _uid(x: Any) -> str:
+    m = re.search(r"U[A-Z0-9]{6,}", str(x or ""))
+    return m.group(0) if m else ""
+
+
+def _pending_add(item: dict[str, Any]) -> None:
+    with _PENDING_LOCK:
+        try:
+            items = json.loads(STATE.get("cread_pending") or "[]")
+        except ValueError:
+            items = []
+        if any(p.get("k") == item["k"] and p.get("ts") == item["ts"] for p in items):
+            return
+        items.append(item)
+        STATE.set("cread_pending", json.dumps(items[-200:]))
+
+
+def _pending_pop_due() -> list[dict[str, Any]]:
+    now = time.time()
+    with _PENDING_LOCK:
+        try:
+            items = json.loads(STATE.get("cread_pending") or "[]")
+        except ValueError:
+            items = []
+        due = [p for p in items if float(p.get("due") or 0) <= now]
+        STATE.set("cread_pending", json.dumps([p for p in items if float(p.get("due") or 0) > now]))
+    return due
+
+
+def _daylog_key(eps: str, day: date | None = None) -> str:
+    return f"daylog:{eps}:{_as_date(day or _today_brazil()).strftime('%Y%m%d')}"
+
+
+def _daylog_add(eps: str, entry: dict[str, Any], day: date | None = None) -> None:
+    with _PENDING_LOCK:
+        key = _daylog_key(eps, day)
+        try:
+            log = json.loads(STATE.get(key) or "[]")
+        except ValueError:
+            log = []
+        log.append(entry)
+        STATE.set(key, json.dumps(log[-120:]))
+
+
+def _daylog(eps: str, day: date | None = None) -> list[dict[str, Any]]:
+    try:
+        return json.loads(STATE.get(_daylog_key(eps, day)) or "[]")
+    except ValueError:
+        return []
+
+
+def _tag(uid: str, eps: str) -> str:
+    """No teste não marca ninguém (a mensagem vai para o canal de teste)."""
+    if not uid:
+        return ""
+    return f"<@{uid}>" if not _status_shadow(eps) else (_SPEAKER_CACHE.get(uid) or "a pessoa")
+
+
+def _cread_check_once() -> None:
+    for p in _pending_pop_due():
+        try:
+            _cread_followup(p)
+        except Exception:
+            logger.exception("Acompanhamento falhou: %s", p.get("k"))
+
+
+def _cread_followup(p: dict[str, Any]) -> None:
+    ch, root, eps, title = p["ch"], p["root"], p["eps"], p.get("title") or ""
+    msgs = _fetch_thread(ch, root)
+    bot = _bot_user_id()
+    after = [m for m in msgs if float(m.get("ts") or 0) > float(p["ts"])
+             and not (m.get("bot_id") or (bot and m.get("user") == bot))]
+    post = lambda t: _post_status_reply(ch, root, eps, title, t, [], None, crisis_check=False)
+    if p["k"] == "cobr":
+        resp = [m for m in after if not _is_ifood_user(str(m.get("user") or ""))]
+        de = _tag(p.get("de", ""), eps) or "o time iFood"
+        if not resp:
+            alvo = " ".join(_tag(u, eps) for u in p.get("para") or [] if u) or "Time"
+            post(f"{alvo}, {de} perguntou às {_hhmm(p['ts'])} e ainda está sem retorno: _{p.get('texto')}_. "
+                 "Qual a situação, o que está sendo feito e até que horas?")
+            _daylog_add(eps, {"h": _now_brazil().strftime("%H:%M"), "t": title[:80], "pend": "cobrança sem resposta",
+                              "r": f"{p.get('texto')}"[:200], "link": _permalink(ch, root)})
+            return
+        texto = "\n".join(_strip_md(str(m.get("text") or ""))[:500] for m in resp[:4])
+        try:
+            data = _block_data_from_json(ask_toqan(
+                "TAREFA INTERNA DO APP. Não chame subagentes. Responda APENAS JSON.\n"
+                f"Pergunta do iFood à operação: {p.get('texto')}\nResposta da operação: {texto}\n"
+                'A resposta tem causa, ação e prazo? {"ok": true|false, "falta": "o que falta, em 1 frase curta"}',
+                max_attempts=30)) or {}
+        except Exception:
+            return
+        if data.get("ok") is False and data.get("falta"):
+            quem = _tag(str(resp[0].get("user") or ""), eps)
+            post(f"{quem + ', ' if quem else ''}valeu pelo retorno. Pra fechar: {str(data['falta']).rstrip('.')}?")
+        return
+    if p["k"] == "comp":
+        texto = "\n".join(f"{_who_label(str(m.get('user') or ''))}: {_strip_md(str(m.get('text') or ''))[:400]}"
+                          for m in after[-10:]) or "(nada depois do compromisso)"
+        try:
+            data = _block_data_from_json(ask_toqan(
+                "TAREFA INTERNA DO APP. Não chame subagentes. Responda APENAS JSON.\n"
+                f"Compromisso da operação: {p.get('o_que')} (prazo {p.get('prazo')}).\nMensagens depois:\n{texto}\n"
+                'Foi confirmado que foi cumprido? {"cumprido": "sim"|"nao"|"sem_info"}', max_attempts=30)) or {}
+        except Exception:
+            data = {}
+        if str(data.get("cumprido")) == "sim":
+            return
+        quem = _tag(p.get("quem", ""), eps)
+        post(f"{quem + ', ' if quem else ''}deu {p.get('prazo')}: _{p.get('o_que')}_. Foi feito? Se não, o que "
+             "aconteceu e qual o novo prazo?")
+        _daylog_add(eps, {"h": _now_brazil().strftime("%H:%M"), "t": title[:80], "pend": "compromisso sem confirmação",
+                          "r": f"{p.get('o_que')} (até {p.get('prazo')})"[:200], "link": _permalink(ch, root)})
+
+
+def _cread_loop() -> None:
+    time.sleep(90)
+    while True:
+        try:
+            _cread_check_once()
+        except Exception:
+            logger.exception("Leitura contínua: verificação falhou")
+        time.sleep(120)
+
+
+def _daylog_text(eps_list: list[str], day: date | None = None, title: str = "No canal hoje", limit: int = 12) -> str:
+    out = []
+    for eps in eps_list:
+        log = _daylog(eps, day)
+        if not log:
+            continue
+        pend = [e for e in log if e.get("pend")]
+        fatos = [e for e in log if not e.get("pend") and e.get("r")]
+        probs = [p for e in log for p in (e.get("p") or [])]
+        bloco = [f"*{title} · {eps}*"]
+        bloco += [f"• {e['h']} · {e['r']}" for e in fatos[-limit:]]
+        if probs:
+            bloco.append("⚠️ *Problemas relatados:* " + "; ".join(dict.fromkeys(probs))[:500])
+        if pend:
+            bloco.append("📌 *Em aberto:* " + " · ".join(f"{e['pend']}: {e['r']}" for e in pend[-6:]))
+        out.append("\n".join(bloco))
+    return "\n\n".join(out)
+
+
+def _post_yesterday_digest(tenant: "Tenant", report_ts: str) -> None:
+    """Depois do report: pendências de ontem no canal (cobranças sem resposta, compromissos sem confirmação,
+    problemas) numa resposta na thread do report — o report em si não muda."""
+    if not CREAD or not tenant.eps or not report_ts:
+        return
+    y = _as_date(_today_brazil()) - timedelta(days=1)
+    log = _daylog(tenant.eps, y)
+    pend = [e for e in log if e.get("pend")]
+    probs = [p for e in log for p in (e.get("p") or [])]
+    if not pend and not probs:
+        return
+    linhas = ["📌 *Do canal ontem — o que ficou em aberto*"]
+    linhas += [f"• {e['pend'].capitalize()}: {e['r']}" + (f" (<{e['link']}|thread>)" if e.get("link") else "") for e in pend[-8:]]
+    if probs:
+        linhas.append("• Problemas relatados: " + "; ".join(dict.fromkeys(probs))[:400])
+    linhas.append("Algum desses ainda está aberto? Me conta aqui o status.")
+    try:
+        _post_sections(tenant.channel, "\n".join(linhas), thread_ts=report_ts)
+    except Exception:
+        logger.warning("[%s] Não consegui postar as pendências de ontem", tenant.key, exc_info=True)
 
 
 # --- Threads de assunto nos canais de indicadores (não são controle): ex. "Palitagem - Cálculo do SLA" ------------
@@ -9875,6 +10184,9 @@ def handle_message(event, say, client, ack):
         ack()
         if not is_im:
             try:
+                _cr_eps = _STATUS_CHANNEL_EPS.get(str(event.get("channel") or ""))
+                if _cr_eps and not event.get("bot_id") and event.get("subtype") in (None, "file_share"):
+                    _cread_schedule(str(event.get("channel")), str(event.get("thread_ts") or event.get("ts") or ""), _cr_eps)
                 _maybe_mirror_learning(event)
                 if _maybe_convo_followup(event, say, client):
                     return
