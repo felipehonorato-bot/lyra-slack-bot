@@ -540,7 +540,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.20.0"
+APP_VERSION = "5.24.3"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -4482,7 +4482,10 @@ def _speaker_line(event: dict[str, Any]) -> str:
 KNOWLEDGE_XLSX = os.getenv("KNOWLEDGE_XLSX", os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge",
                                                           "repositorio_processos_cx.xlsx"))
 KNOWLEDGE_SKIP_TABS = {"macros (case rules)", "atualizacoes repositorio", "figmas estudos & apresentacoes",
-                       "voucher na camada de l3", "macro"}
+                       "voucher na camada de l3", "macro",
+                       # informação interna do time: não entra na base de ninguém
+                       "organograma do time", "matriz raci", "responsaveis por bu", "repositorio de habilidades",
+                       "quem e o seu helio"}
 KB_MAX_CHARS = int(os.getenv("KB_MAX_CHARS", "7000"))
 TEAM_ANSWERS_TITLE = "Respostas do time"
 TEAM_ANSWERS_HEADERS = ["Data", "EPS", "Pergunta", "Resposta", "Quem respondeu", "Thread", "Status"]
@@ -4491,6 +4494,9 @@ _KB_LOCK = threading.Lock()
 _KB_STOP = set("a o e de da do das dos em no na nos nas um uma para por com que se ao aos as os ou mais como "
                "qual quais quando onde porque pq nao sim ja tem ser esta sao foi pelo pela isso esse essa "
                "ele ela eles elas voce voces me meu minha seu sua the of".split())
+
+
+_KB_PEOPLE_COL_RE = re.compile(r"respons|suporte nas valida|\bdono\b|criado por|modificado|focal")
 
 
 def _kb_tokens(text: str) -> list[str]:
@@ -4507,18 +4513,27 @@ def _kb_load_repo() -> list[dict[str, Any]]:
     for ws in wb.worksheets:
         if _norm_text(ws.title) in KNOWLEDGE_SKIP_TABS:
             continue
+        all_rows = [[str(c).strip() if c is not None else "" for c in row] for row in ws.iter_rows(values_only=True)]
+        # cabeçalho = entre as 15 primeiras linhas, a que tem mais células curtas (rótulos de coluna)
+        best, h_idx = 0, -1
+        for i, cells in enumerate(all_rows[:15]):
+            short = [c for c in cells if c and len(c) < 80 and not re.fullmatch(r"[\d.,]+", c)]
+            if len(short) >= 4 and len(short) > best:
+                best, h_idx = len(short), i
         header: list[str] | None = None
-        for row in ws.iter_rows(values_only=True):
-            cells = [str(c).strip() if c is not None else "" for c in row]
+        for i, cells in enumerate(all_rows):
             filled = [c for c in cells if c]
             if not filled:
                 continue
-            if header is None and len(filled) >= 4 and all(len(c) < 80 for c in filled):
+            if i == h_idx:
                 header = cells
                 continue
+            if _norm_text(filled[0]).startswith("responsavel"):
+                continue  # linha "Responsável: <pessoa>": informação interna do time
             if header:
                 parts = [f"{header[i] or '-'}: {c}" if i < len(header) and header[i] else c
-                         for i, c in enumerate(cells) if c]
+                         for i, c in enumerate(cells) if c
+                         and not (i < len(header) and _KB_PEOPLE_COL_RE.search(_norm_text(header[i])))]
             else:
                 parts = filled
             text = " | ".join(p.replace("\n", " / ") for p in parts)[:1800]
@@ -4628,6 +4643,24 @@ TRAINING_INSTRUCTION = (
     "Seja crítica: amostra pequena, operador com n baixo, ou causa fora do operador precisam ser ditos.\n\n")
 
 
+_TRAINING_THEME_RE = re.compile(r"\b(will\w*|rosie|agentforce|macro\w*|tabula\w*|processo\w*|politica\w*|ferramenta\w*|"
+                                r"sistema\w*|oraculo|bko|salesforce|matriz|cupo\w*|voucher\w*|cancelamento|reembolso|"
+                                r"estorno|clube|script|procedimento\w*|fluxo\w*)\b")
+TRAINING_THEME_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA — TREINAMENTO DE TEMA ({tema}), não de CSAT da fila. O nominal é a lista de quem "
+    "deve ser treinado NESSE tema. Quando a operação fala 'Will' sem dizer qual, é o Will de Negativas (pós-atendimento). "
+    "Critério padrão do Will de Negativas: operador que marcou o caso como resolvido ANTES de acionar o Will (a "
+    "pesquisa sobe ali e a nota fica com ele) — peça à Lyra Indicadores `Pedido: resolvido antes do Will` com "
+    "`Lista: completa`. Faça assim:\n"
+    "1. Entenda o uso certo: chame a Lyra Conhecimento sobre {tema} (como funciona, o que a operação deve fazer).\n"
+    "2. Critério: a lista precisa de um critério objetivo de quem usa errado/não usa (ex.: casos elegíveis ao Will "
+    "tratados manualmente, transbordo indevido, macro errada). Se a pessoa não disse o critério, NÃO monte lista pelo "
+    "CSAT: pergunte em 1 mensagem curta qual é o critério (e qual Will/fluxo), sugerindo 2 opções concretas.\n"
+    "3. Com o critério: peça à Lyra Indicadores os operadores que se encaixam, com n. Se ela não tiver esse dado, diga "
+    "com franqueza qual dado falta e de onde viria — nunca substitua por ranking de CSAT.\n"
+    "4. Feche com o conteúdo do treinamento (o uso certo, do passo 1) e como medir depois.\n\n")
+
+
 def _training_question(eps: str | None) -> str | None:
     """Pergunta de volta, com dado: qual fila? Mostra as filas que mais tiram CSAT no mês."""
     try:
@@ -4651,6 +4684,31 @@ def _training_question(eps: str | None) -> str | None:
                   "mesmo do operador (ou é política/parceiro), quem concentra esses casos e o que treinar.")
     return (base + "Qual fila você quer atacar? Com ela, eu levanto o motivo que mais gera detrator, se a causa é "
                    "do operador, quem concentra esses casos e o que treinar.")
+
+
+# "Nominal" no CX = a lista completa, nome por nome, de quem atende ao critério (não um top N).
+_NOMINAL_RE = re.compile(r"\b(nominal|nominalmente|lista completa|todos os nomes|nome a nome|nome por nome)\b")
+NOMINAL_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA: a pessoa pediu o NOMINAL — a lista nome a nome do recorte pedido, COMPLETA (não "
+    "um top 10). O recorte vem da conversa: num pedido de treinamento, é a lista de quem deve ser treinado (pelo "
+    "critério do treinamento); sem esse contexto (ex.: 'nominal da Review'), é a lista de TODOS os operadores daquela "
+    "fila/EPS no período, com o resultado de cada um, ordenada do pior para o melhor e com o quadrante — não suponha "
+    "que é treinamento. Cada linha: nome · e-mail · supervisor · fila · o número (com n). Se o recorte for ambíguo "
+    "(qual indicador? qual período?), use CSAT do mês e diga o recorte usado. Se passar de 25 nomes, mostre os 10 "
+    "primeiros e diga que a lista completa vai em planilha. Ao chamar a Lyra Indicadores, inclua a linha "
+    "`Lista: completa` no pedido (sem ela, ela corta em 15).\n\n")
+
+
+_ROSIE_EVAL_RE = re.compile(r"\b(avaliad\w*|avaliac\w*|nota\w*)\b[^?]{0,40}\brosie\b|\brosie\b[^?]{0,40}\b(avaliad\w*|avaliac\w*)\b")
+ROSIE_EVAL_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA: pergunta sobre avaliações dadas na Rosie. Chame a Lyra Indicadores com "
+    "`Pedido: avaliações na Rosie` (seção 7.1b dela: avaliação anterior à primeira atribuição a analista), com a fila e "
+    "o período que a conversa já trouxe (ex.: CX Suporte, outubro fechado) — se não houver, EPS do canal no mês. Responda a "
+    "representatividade (avaliações na Rosie ÷ total, com n), o CSAT delas e o CSAT da fila sem elas. Diga em meia "
+    "frase o critério usado (horário da avaliação x horário da atribuição ao analista) e o porquê: a pesquisa só sobe "
+    "quando o caso muda para resolvido, e às vezes (não é regra, mas acontece) a Rosie marca resolvido e transborda — a nota fica "
+    "com o analista, último proprietário do ticket. Se o peso for relevante, diga que isso é do fluxo da Rosie (iFood), "
+    "não da EPS, e que tirar essas notas da régua é decisão do time iFood.\n\n")
 
 
 CHAT_INSTRUCTION = (
@@ -5131,7 +5189,17 @@ def _post_esteiras(tenant: Tenant, posted: list[dict[str, Any]], day: date) -> N
 
 
 def _run_daily_report(now: datetime | None = None, tenant: Tenant | None = None) -> str:
-    """Gera e publica o report de um tenant; devolve o ts da mensagem principal."""
+    """Gera e publica o report de um tenant; devolve o ts da mensagem principal.
+    O report é prioridade no Toqan (não entra na fila das tarefas de fundo)."""
+    prev = getattr(_TOQAN_TL, "interactive", False)
+    _TOQAN_TL.interactive = True
+    try:
+        return _run_daily_report_inner(now, tenant)
+    finally:
+        _TOQAN_TL.interactive = prev
+
+
+def _run_daily_report_inner(now: datetime | None = None, tenant: Tenant | None = None) -> str:
     now = now or _now_brazil()
     tenant = tenant or TENANTS[0]
     google_client = _safe_google_client()
@@ -5852,7 +5920,7 @@ def _monitoring_channel_reply(question: str, say: Callable[..., Any], event: dic
         _say(say, MONITORING_HELP, event, in_thread)
 
 
-THREAD_CONTEXT_MAX_CHARS = 4000
+THREAD_CONTEXT_MAX_CHARS = int(os.getenv("THREAD_CONTEXT_MAX_CHARS", "12000"))
 
 
 def _thread_context(event: dict[str, Any]) -> str:
@@ -5881,7 +5949,8 @@ def _thread_context(event: dict[str, Any]) -> str:
         return ""
     body = "\n".join(parts)
     if len(body) > THREAD_CONTEXT_MAX_CHARS:
-        body = body[:1500] + "\n[…]\n" + body[-(THREAD_CONTEXT_MAX_CHARS - 1500):]
+        half = THREAD_CONTEXT_MAX_CHARS // 2  # começo (o post/report) e fim (a conversa recente)
+        body = body[:half] + "\n[…]\n" + body[-half:]
     block = _report_block_for(channel, thread_ts)
     head = "INFORMAÇÃO INTERNA PARA A LYRA — CONTEXTO DA THREAD (já está na tela de quem fala com você; use, não peça de novo)"
     if block:
@@ -6216,10 +6285,14 @@ def _learnings_instruction(eps: str | None) -> str:
             "desde que não contrariem números, metas, regras de cálculo ou política):\n" + lines + "\n\n")
 
 
-def _extract_learning(text: str, context: str) -> dict[str, Any]:
+def _extract_learning(text: str, context: str, critique: bool = False) -> dict[str, Any]:
     prompt = (
         "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Não chame subagentes. Responda APENAS com JSON válido.\n"
-        "Uma pessoa do time do iFood mandou a mensagem abaixo para a Lyra (agente de gestão das EPSs). Decida se ela "
+        + ("ATENÇÃO: a pessoa deu 👎 numa resposta da Lyra e esta mensagem explica o que ficou errado. Mesmo que ela "
+           "fale do caso concreto, extraia a LIÇÃO GERAL sobre como a Lyra deveria ter agido (ex.: 'Em pedido de "
+           "ajuda pouco claro, pergunte primeiro o que aconteceu e o que a operação já checou antes de orientar.'). "
+           "Só responda nenhum se não houver lição nenhuma.\n" if critique else "")
+        + "Uma pessoa do time do iFood mandou a mensagem abaixo para a Lyra (agente de gestão das EPSs). Decida se ela "
         "está ENSINANDO algo para as próximas vezes (correção de forma de responder, termo, preferência, contexto da "
         "operação) e escreva o aprendizado em UMA frase imperativa, curta e geral (ex.: 'Sempre traga o n junto do CSAT "
         "do mês.').\n"
@@ -6294,7 +6367,7 @@ def _handle_learning(event: dict[str, Any], question: str, eps: str | None, say:
     if not _is_ifood_user(user):
         return False
     context = _thread_context(event) or _dm_context(event)
-    got = _extract_learning(question, context)
+    got = _extract_learning(question, context, critique=forced)
     tipo = str(got.get("tipo") or "").lower()
     if tipo == "bloqueado":
         _say(say, "Isso mexe em meta, regra de cálculo, política ou no que é cobrado da EPS, então não guardo como "
@@ -6595,7 +6668,7 @@ def _scope_rows(rows: list[dict[str, Any]], eps: str | None) -> list[dict[str, A
     return [r for r in rows if eps is None or _eps_matches(r["eps"], eps)]
 
 
-_TABLE_BLOCK_RE = re.compile(r"\b(motivo|motivos|operador|operadores|analista|supervisor|supervisora|coordenador|"
+_TABLE_BLOCK_RE = re.compile(r"\b(motivo|motivos|operador\w*|analista\w*|atendente\w*|quem|nomes?|nominal|supervisor\w*|coordenador\w*|"
                              r"equipe|por que|porque|pq|semana|semanal|tma|sla|nps|reabertura|volume|grafico|excel|"
                              r"planilha|quadrante|q4|reincid\w*|ofensor\w*|dispersao|compar\w*|evolucao|tendencia|"
                              r"\d{1,2}/\d{1,2}|bu|food|multi)\b")
@@ -6612,7 +6685,7 @@ def _table_intent(question: str, eps: str | None) -> tuple[str, str | None, str 
     if _TABLE_BLOCK_RE.search(t) or _is_analytical(question) and not _TABLE_IMPACT_RE.search(t):
         return None
     eps_q = eps or _eps_in_text(question)
-    fila = _fila_in_question(question, eps_q)
+    fila = _fila_in_question(question, eps_q) or (_status_fila(question, eps_q) if eps_q else None)
     if fila and not eps_q:
         eps_q = next((e for e, cel in EPS_CELULAS.items() if fila in cel), None)
     if _TABLE_IMPACT_RE.search(t):
@@ -6652,11 +6725,20 @@ def _table_answer(question: str, eps: str | None, focus: dict[str, Any] | None =
         return None
     d1 = _as_date(_today_brazil()) - timedelta(days=1)
     use_d1 = bool(re.search(r"\b(ontem|d 1|d1)\b", _norm_text(question)))
+    prev_end = d1.replace(day=1) - timedelta(days=1)
+    use_prev = not use_d1 and bool(re.search(
+        rf"\b(mes passado|mes anterior|ultimo mes|mes fechado|fechamento do mes|{_norm_text(_MESES[prev_end.month - 1])})\b",
+        _norm_text(question)))
+    if use_prev:  # "mês passado": responde o mês anterior fechado
+        rows = _day_table(_prev_month_bounds(d1))
+        if not rows:
+            return None
+        d1 = prev_end
     kind = "d1" if use_d1 else "mes"
-    when = f"D-1 {d1.strftime('%d/%m')}" if use_d1 else (
-        f"mês 01 a {d1.strftime('%d/%m')}" if d1.day > 1 else f"mês ({d1.strftime('%d/%m')})")
+    when = (f"{_MESES[d1.month - 1]} fechado" if use_prev else f"D-1 {d1.strftime('%d/%m')}" if use_d1 else (
+        f"mês 01 a {d1.strftime('%d/%m')}" if d1.day > 1 else f"mês ({d1.strftime('%d/%m')})"))
     prev_rows = None
-    if not use_d1 and d1.day <= EARLY_MONTH_DAYS:
+    if not use_d1 and not use_prev and d1.day <= EARLY_MONTH_DAYS:
         prev_rows = _day_table(_prev_month_bounds(d1))
     prev_name = _MESES[(d1.replace(day=1) - timedelta(days=1)).month - 1]
 
@@ -6728,7 +6810,7 @@ def _table_answer(question: str, eps: str | None, focus: dict[str, Any] | None =
                  f"CSAT {_bfmt(c)}%" + (f" (meta {_bfmt(r['meta'])}%)" if r.get("meta") else ""), ""]
         lines.append(f"📍 *Resultado · {when}*")
         lines.append(f"• CSAT *{_bfmt(c)}%* → {_vs_meta(c, r.get('meta'))} (n={_fmt_int(n)})" + prev_of(r["fila"]))
-        if not use_d1 and r["d1_aval"]:
+        if not use_d1 and not use_prev and r["d1_aval"]:
             cd, nd, _ = _agg([r], "d1")
             lines.append(f"• D-1 {d1.strftime('%d/%m')}: {_bfmt(cd)}% (n={_fmt_int(nd)})")
         imp = _impact(base, [r], kind)
@@ -6737,7 +6819,7 @@ def _table_answer(question: str, eps: str | None, focus: dict[str, Any] | None =
         if r.get("motivo") and not use_d1:
             lines.append(f"• Motivo que mais tira: {r['motivo']}" + (f" (−{_bfmt(abs(r['motivo_pp']), 2)} p.p.)"
                                                                    if r.get("motivo_pp") is not None else ""))
-        rt = _ritmo_text(_ritmo(r, d1)) if not use_d1 and r.get("meta") else ""
+        rt = _ritmo_text(_ritmo(r, d1)) if not use_d1 and not use_prev and r.get("meta") else ""
         if rt:
             lines += ["", "💡 *Leitura*", f"↳ {rt[0].upper() + rt[1:]}."]
         return "\n".join(lines)
@@ -6776,7 +6858,7 @@ def _table_answer(question: str, eps: str | None, focus: dict[str, Any] | None =
             lines.append(f"📍 *Por fila* — do maior impacto negativo para o menor")
             for r in sorted(g, key=lambda r: (_impact(g, [r], kind) or 0)):
                 lines.append(fila_line(r, g))
-            segs = _segment_lines(g, e, kind, d1, with_ritmo=not use_d1)
+            segs = _segment_lines(g, e, kind, d1, with_ritmo=not use_d1 and not use_prev)
             if segs:
                 lines += ["", f"🎯 *Metas combinadas da {e}*"] + segs
         out.append("\n".join(lines))
@@ -7314,7 +7396,11 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             thread_txt = _thread_context(event) if event.get("thread_ts") else ""
             fila_t = (_fila_in_question(question, eps) or (_status_fila(question, eps) if eps else None)
                       or _fila_in_question(thread_txt[-2000:], eps))
-            if not fila_t:  # "quem eu treino?": treinamento começa pelo problema, não pela lista
+            theme = _TRAINING_THEME_RE.search(_norm_text(question))
+            if theme and not fila_t:  # treinamento de tema (Will, macro, processo…): não é pelo CSAT da fila
+                event["_route"] = "treinamento:tema"
+                event["_training_theme"] = theme.group(0)
+            elif not fila_t:  # "quem eu treino?": treinamento começa pelo problema, não pela lista
                 ask = _training_question(eps)
                 if ask:
                     event["_route"] = "treinamento:pergunta"
@@ -7460,8 +7546,12 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             extra = CLUBE_INSTRUCTION
         elif not extra and _is_knowledge_question(question):
             extra = KNOWLEDGE_INSTRUCTION
+        elif not extra and _ROSIE_EVAL_RE.search(_norm_text(question)):
+            extra = ROSIE_EVAL_INSTRUCTION
         elif not extra and event.get("_training"):
             extra = TRAINING_INSTRUCTION.format(fila=event["_training"])
+        elif not extra and event.get("_training_theme"):
+            extra = TRAINING_THEME_INSTRUCTION.format(tema=event["_training_theme"])
         elif not extra and _is_small_talk(question):
             extra = CHAT_INSTRUCTION  # conversa curta: responde rápido, sem subagentes
             event["_route"] = "conversa"
@@ -7470,7 +7560,8 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                   f"{DEFAULTS_INSTRUCTION if not extra else ''}{FULL_ACCESS_INSTRUCTION if _operator_names_allowed(eps) else ''}"
                   f"{ANSWER_LAYOUT_INSTRUCTION}{_learnings_instruction(eps)}{_table_context(eps)}"
                   f"{_inject_mop_context(question, eps)}"
-                  f"{_kb_context(question) if extra == KNOWLEDGE_INSTRUCTION else ''}")
+                  f"{_kb_context(question) if extra == KNOWLEDGE_INSTRUCTION else ''}"
+                  f"{NOMINAL_INSTRUCTION if _NOMINAL_RE.search(_norm_text(question)) else ''}")
         is_plan = extra == PLAN_INSTRUCTION
         if is_plan:
             prompt = _plan_context(question, eps) + prompt
@@ -7912,7 +8003,8 @@ def _control_prompt(title: str, fila: str, text: str, has_images: bool) -> str:
         '"volume_fila": null, "motivo": "resumo do motivo/cenário que a EPS deu", "acoes": ["ação 1"], '
         '"previsao": null, "outros": [{"indicador": "TMA", "valor": "9 min"}], "ruim": [], "bom": []}\n'
         "Regras:\n"
-        "- e_status=false se NÃO for atualização de indicadores (conversa, dúvida, agradecimento, aviso).\n"
+        "- e_status=false se NÃO for atualização de hora em hora (conversa, dúvida, agradecimento, aviso, diagnóstico, "
+        "análise do mês, fechamento, report de casos).\n"
         "- hora = hora de referência do status (ex.: 'Status atual – 11h' → '11:00'; '04/11 – 09:00' → '09:00').\n"
         "- sla = SLA de 1ª resposta; se só houver 'SLA', use esse.\n"
         "- motivo = o porquê que a EPS deu (cenário, motivo da não entrega, pontos de atenção), em até 200 caracteres. "
@@ -8000,7 +8092,7 @@ def _llm_status(channel: str, title: str, fila: str, message: dict[str, Any]) ->
         _CONTROL_READ_SEM.release()
     data = _block_data_from_json(answer) or {}
     status: dict[str, Any] | None = None
-    if data.get("e_status") and (_num(data.get("csat")) is not None or _num(data.get("sla")) is not None):
+    if data.get("e_status") and data.get("hora") and (_num(data.get("csat")) is not None or _num(data.get("sla")) is not None):
         hm = re.match(r"\s*(\d{1,2})(?:\s*[:h]\s*(\d{2}))?", str(data.get("hora") or ""))
         acoes = [str(a).strip() for a in (data.get("acoes") or []) if str(a).strip()]
         status = {
@@ -8120,8 +8212,8 @@ def _topic_prompt(eps: str, title: str, conversa: str, n_imgs: int) -> str:
         f"{_scope_instruction(eps)}\n\n"
         f"INFORMAÇÃO INTERNA PARA A LYRA — a {eps} abriu esta thread no canal de indicadores. NÃO é um controle de "
         "hora em hora. Título: \"" + _strip_md(title)[:150] + "\"\n"
-        f"Conversa na thread:\n{conversa[-3000:]}\n"
-        + (f"(Há {n_imgs} imagem(ns) anexada(s) que você não vê.)\n" if n_imgs else "")
+        f"Conversa na thread:\n{conversa if len(conversa) <= 12000 else conversa[:7000] + chr(10) + '[…]' + chr(10) + conversa[-5000:]}\n"
+        + (f"(Há {n_imgs} imagem(ns) anexada(s) que você NÃO vê.)\n" if n_imgs else "")
         + _kb_context(f"{_strip_md(title)} {conversa[-1500:]}")
         + "Decida e responda em UM destes formatos, sem nada antes:\n"
         "1. `SILENCIO` — se for só informativo, ritual, aviso ou conversa entre a operação, sem dúvida, divergência "
@@ -8129,10 +8221,24 @@ def _topic_prompt(eps: str, title: str, conversa: str, n_imgs: int) -> str:
         "2. A resposta, em até 6 linhas, se for dúvida/divergência (ex.: como o iFood calcula um indicador, por que o "
         "número deles difere do nosso, regra de processo) E a base responder: consulte a *Lyra Conhecimento* (regras, "
         "definições, processos) e, se for número ou cálculo, a *Lyra Indicadores*. Use só o que elas devolverem.\n"
-        "3. `ESCALAR: experiencia: <a dúvida em 1 linha>` ou `ESCALAR: eficiencia: <a dúvida em 1 linha>` — se a base "
-        "não tiver a resposta (NÃO SEI) ou depender de decisão do time. experiencia = CSAT, avaliações, detratoras, "
-        "aderência a processo/política. eficiencia = TMA, SLA, volume, fila, produtividade, HC, palitagem e o resto.\n"
-        "Nunca chute número nem regra."
+        "3. *Report ou análise da EPS* (ex.: Close the Looping, diagnóstico, devolutiva de monitoria, análise de casos, "
+        "plano): dê o feedback de gestora em até 10 linhas, citando o report: o que está bom; se a CONTA e o MÉTODO se "
+        "sustentam (refaça as contas com os números dados; ex.: expurgar só as detratoras de um grupo e manter as "
+        "promotoras dele infla o resultado — o certo é tirar o grupo inteiro); se a META e os termos batem com os "
+        "oficiais (metas do contexto; 'dispersão' no time é CSAT Q4 ÷ CSAT Q1, não distância da meta; o CSAT de caso "
+        "resolvido pelo Will fica com o Will (Agentforce CX), nunca com o operador; a pesquisa só sobe quando o caso muda "
+        "para resolvido: às vezes (não é o fluxo padrão) a Rosie marca resolvido e transborda (a nota cai no analista), e no Will de Negativas, "
+        "que é pós-atendimento, nota no operador = o operador marcou resolvido ANTES de acionar o Will — erro de "
+        "procedimento, caso de treinamento, não de expurgo); o que falta "
+        "(amostra, evidência, ação com dono e prazo). Se a análise PROPÕE mudar regra do iFood (expurgo, atribuição de "
+        "nota, meta, cálculo), isso não é decisão sua nem da EPS: termine o feedback com uma linha final "
+        "`ESCALAR: experiencia|eficiencia: <a decisão que o time precisa tomar>`.\n"
+        "4. `ESCALAR: experiencia: <a dúvida em 1 linha>` ou `ESCALAR: eficiencia: <a dúvida em 1 linha>` — só para "
+        "DÚVIDA de regra/cálculo/processo que a base não responde (NÃO SEI) ou que depende de decisão do time. "
+        "experiencia = CSAT, avaliações, detratoras, aderência a processo/política. eficiencia = TMA, SLA, volume, fila, "
+        "produtividade, HC, palitagem e o resto.\n"
+        "Se o conteúdo principal estiver em imagem que você não vê, diga em 1 frase que não consegue ver a imagem e "
+        "peça o texto ou o Excel — não escale e não chute o conteúdo. Nunca chute número nem regra."
     )
 
 
@@ -8153,7 +8259,9 @@ def _topic_thread(channel: str, thread_ts: str, eps: str, messages: list[dict[st
         return None
     STATE.set(key, "lendo")
     title = str(parent.get("text") or "")
-    conversa = "\n".join(f"EPS: {_strip_mentions(_strip_md(m.get('text'))).strip()[:800]}" for m in human
+    conversa = "\n".join(f"EPS: {_strip_mentions(_strip_md(m.get('text'))).strip()[:6000]}"
+                         + (f"\n[planilha anexada]\n{_alt_control_text(m, False)[:4000]}" if _sheet_files(m) else "")
+                         for m in human
                          if str(m.get("text") or "").strip())
     n_imgs = sum(len(_image_files(m)) for m in human)
     try:
@@ -8170,8 +8278,21 @@ def _topic_thread(channel: str, thread_ts: str, eps: str, messages: list[dict[st
     esc = _parse_escalation(text)
     post = lambda t: _post_status_reply(channel, thread_ts, eps, title, t, [], None, crisis_check=False)
     if esc:
-        return _escalate(channel, thread_ts, eps, esc[0], esc[1], post, shadow=_status_shadow(eps))
+        body = re.split(r"`?ESCALAR\s*:", text, maxsplit=1)[0].strip()
+        if body:  # feedback do report + decisão de regra para o dono do tema
+            post(body)
+        return _escalate(channel, thread_ts, eps, esc[0], esc[1], post, shadow=_status_shadow(eps), decisao=bool(body))
     return post(text)
+
+
+_CONTROL_TITLE_RE = re.compile(r"\b(controle|status|acompanhamento|report cx|hora ?a ?hora|hora/hora|intra ?hora|"
+                               r"intrahora|volume|produtividade|monitoramento de (fila|sla|csat))\b")
+
+
+def _is_control_title(title: str) -> bool:
+    """Título de controle de hora em hora (Controle de SLA, Acompanhamento de Fila, Report CX Review…).
+    Diagnóstico, análise, Close the Looping, palitagem etc. são assunto, mesmo citando a fila."""
+    return bool(_CONTROL_TITLE_RE.search(_norm_text(_strip_md(title))))
 
 
 def _parse_escalation(text: str) -> tuple[str, str] | None:
@@ -8183,15 +8304,15 @@ def _parse_escalation(text: str) -> tuple[str, str] | None:
 
 
 def _escalate(channel: str, thread_ts: str, eps: str | None, theme: str, duvida: str,
-              post: Callable[[str], Any], shadow: bool) -> Any:
+              post: Callable[[str], Any], shadow: bool, decisao: bool = False) -> Any:
     """Marca o dono do tema (Gustavo: experiência; Michael: eficiência) e passa a ouvir a resposta dele para aprender."""
     exp = theme == "experiencia"
     uid, nome = ((OWNER_EXPERIENCIA, OWNER_EXPERIENCIA_NOME) if exp else (OWNER_EFICIENCIA, OWNER_EFICIENCIA_NOME))
-    quem = f"*{nome}* (em produção eu marco aqui)" if shadow or not uid else f"<@{uid}>"
+    quem = f"*{nome}* (em produção eu marco)" if shadow or not uid else f"<@{uid}>"
     STATE.set(f"escalated:{channel}:{thread_ts}", json.dumps({"duvida": duvida, "eps": eps or "", "tema": theme}))
-    return post(f"Isso não está na minha base. {quem}, consegue ajudar? "
-                f"Tema de {'experiência' if exp else 'eficiência'}: {duvida}\n"
-                "_Quando o time responder aqui, eu aprendo e da próxima vez já respondo._")
+    if decisao:  # o feedback já foi postado: só chama o dono, curto, como uma pessoa faria
+        return post(f"{quem}, consegue avaliar aqui?")
+    return post(f"{quem}, consegue ajudar aqui?")
 
 
 def _learn_from_owner_reply(event: dict[str, Any], post: Callable[[str], Any]) -> None:
@@ -8269,6 +8390,8 @@ def _read_status_thread_locked(channel: str, thread_ts: str, eps: str) -> str | 
         if _print_control_kind(str(messages[0].get("text") or "")):
             return None  # Volume/Produtividade/Acompanhamento: quem lê é o leitor de print
         return _topic_thread(channel, thread_ts, eps, messages)  # assunto aberto pela EPS (ex.: palitagem)
+    if not _is_control_title(str(messages[0].get("text") or "")):
+        return _topic_thread(channel, thread_ts, eps, messages)  # análise/diagnóstico citando a fila: não é status
     if not STATE.get(f"topic:{channel}:{thread_ts}"):
         STATE.set(f"topic:{channel}:{thread_ts}", "controle")  # thread de controle: não vira assunto
     bot = _bot_user_id()
@@ -8300,10 +8423,8 @@ def _read_status_thread_locked(channel: str, thread_ts: str, eps: str) -> str | 
             parsed["user"] = m.get("user")
             statuses.append(parsed)
     if not statuses:
-        if unread:
-            _shadow_note(channel, thread_ts, eps, title,
-                         "🤔 Vi a atualização, mas não achei CSAT nem SLA nela — não consigo cobrar ainda.",
-                         once_key=f"shadow_noread:{channel}:{thread_ts}:{len(messages)}")
+        if unread:  # mensagem sem CSAT/SLA numa thread de controle (conversa, base anexada): não é status, fica calada
+            logger.info("[%s] Controle %s: mensagem sem CSAT/SLA, ignorada", eps, thread_ts)
         return None
     issues, last = _status_issues(statuses, fila)
     skey = f"status:{channel}:{thread_ts}"
@@ -8349,7 +8470,36 @@ def _read_status_thread_locked(channel: str, thread_ts: str, eps: str) -> str | 
     if last.get("sla") is not None:
         head += f" · SLA {_bfmt(last['sla'])}%"
     return _post_status_reply(channel, thread_ts, eps, str(messages[0].get("text") or ""), head,
-                              [txt for _, txt in new], last.get("user"))
+                              _compact_status_bullets(new, last, fila), last.get("user"))
+
+
+def _compact_status_bullets(new: list[tuple[str, str]], last: dict[str, Any], fila: str) -> list[str]:
+    """Cobrança enxuta: (1) resultado e causa — CSAT/SLA fora da meta numa pergunta só; (2) plano e prazo — ação
+    genérica e prazo vago numa pergunta só. O resto (dados que não batem, leitura, repetição) segue como está."""
+    kinds = {k for k, _ in new}
+    out: list[str] = []
+    res = []
+    if "csat" in kinds and last.get("csat") is not None:
+        res.append(f"CSAT {_bfmt(last['csat'])}% (meta {_fmt_meta(FILA_METAS.get(fila))}%)")
+    if "sla" in kinds and last.get("sla") is not None:
+        res.append(f"SLA {_bfmt(last['sla'])}% (meta {_fmt_meta(SLA_METAS.get(fila))}%)")
+    if res:
+        piorou = " e caindo com o mesmo plano" if "piorou" in kinds else ""
+        out.append(f"{' e '.join(res)} abaixo da meta{piorou}: o que causou e o que está sendo feito pra recuperar?")
+    plano = []
+    if "passos" in kinds:
+        acao = (last.get("acoes") or [last.get("passos") or ""])
+        txt = re.sub(r"\s+", " ", str(acao[0] if acao else "")).strip()[:60]
+        if txt:
+            plano.append(f"\"{txt}\" não é ação")
+    if "prazo" in kinds:
+        plano.append(f"\"{last['previsao']}\" não é prazo" if last.get("previsao") else "falta o prazo")
+    if plano:
+        out.append(f"{' e '.join(plano)}: o que exatamente vai ser feito, com quem e até que horas?")
+    for k, txt in new:
+        if k not in {"csat", "sla", "piorou", "passos", "prazo"} or (k in {"csat", "sla"} and not res):
+            out.append(txt)
+    return out
 
 
 def _post_status_reply(channel: str, thread_ts: str, eps: str, thread_title: str, head: str,
@@ -9247,7 +9397,25 @@ def _flow_post(channel: str, thread_ts: str, text: str) -> None:
         parent = str(_resp_get(resp, "ts") or "")
         if parent:
             STATE.set(key, parent)
+    if parent:
+        STATE.set(f"mirror:{test_ch}:{parent}", f"{channel}|{thread_ts}")
     slack_app.client.chat_postMessage(channel=test_ch, thread_ts=parent or None, text=text)
+
+
+def _maybe_mirror_learning(event: dict[str, Any]) -> None:
+    """Resposta do time iFood na cópia da thread (canal de teste) de um caso que a Lyra escalou: aprende igual."""
+    ch, root = str(event.get("channel") or ""), str(event.get("thread_ts") or "")
+    orig = STATE.get(f"mirror:{ch}:{root}") if root else ""
+    if not orig or event.get("bot_id"):
+        return
+    o_ch, o_ts = orig.split("|", 1)
+    if not STATE.get(f"escalated:{o_ch}:{o_ts}"):
+        return
+    ev = dict(event)
+    ev.update(channel=o_ch, thread_ts=o_ts)
+    threading.Thread(target=_learn_from_owner_reply,
+                     args=(ev, lambda t, c=ch, r=root: slack_app.client.chat_postMessage(channel=c, thread_ts=r, text=t)),
+                     daemon=True).start()
 
 
 # Rede de segurança: o Slack nem sempre entrega o evento da mensagem do fluxo de trabalho. A Lyra também relê os
@@ -9375,13 +9543,15 @@ def _flow_mark(channel: str, what: str) -> None:
         pass
 
 
-def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "") -> None:
+def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "", trigger_user: str = "") -> None:
     """Lê o chamado do Fluxo Owners CX (mensagem + thread). Moedas: triagem e chamado no Rewards. Outros tópicos:
     responde na thread pela base de conhecimento (e de novo quando marcarem a Lyra na thread)."""
     key = f"chamado:{thread_ts}"
     eps = _flow_eps(channel)
     with _CHAMADOS_LOCK:
         state = STATE.get(key)
+        if state == "aguardando_info" and trigger_user and _is_ifood_user(trigger_user) and not mention_text:
+            return  # o time iFood entrou na conversa: não é a resposta do solicitante
         if state == "respondido" and mention_text:
             STATE.set(key, "processando")
         elif state in {"aberto", "processando", "fora", "respondido"}:
@@ -9412,7 +9582,11 @@ def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "") ->
                 _flow_mark(channel, "melhoria registrada na planilha")
                 return
             _answer_flow_question(channel, thread_ts, eps, messages, fields, parent_fields, mention_text)
-            STATE.set(key, "respondido")
+            if STATE.get(f"chamado_ask:{thread_ts}"):
+                STATE.set(f"chamado_ask:{thread_ts}", "")
+                STATE.set(key, "aguardando_info")  # a resposta do solicitante faz ela ler de novo
+            else:
+                STATE.set(key, "respondido")
             return
         bot = _bot_user_id()
         replies = [str(m.get("text") or "") for m in messages
@@ -9487,7 +9661,14 @@ def _answer_flow_question(channel: str, thread_ts: str, eps: str | None, message
         f"Pedido aberto:\n{pedido[:2500]}\n"
         + (f"Conversa na thread até aqui:\n{conversa[-2500:]}\n" if conversa else "")
         + (f"Nova mensagem para você: {mention_text}\n" if mention_text else "")
-        + "Regras: responda pelo que a base devolver (trechos da base de processos abaixo; ClubIA para Clube; Lyra "
+        + "Quem abriu o pedido É a operação de atendimento (a EPS), com o cliente já em atendimento: NUNCA diga para "
+        "'orientar o cliente a contatar o atendimento'. Aja como o analista do iFood que atende esse canal: primeiro "
+        "entenda o caso. Se o pedido não deixar claro o problema (o que exatamente aconteceu, o que o cliente tentou, "
+        "o que já foi checado, dados do caso como código/valor do cupom, mensagem de erro, print), responda SOMENTE, "
+        "sem nada antes: `PERGUNTAR: <até 3 perguntas objetivas, numa mensagem curta e cordial>` — inclua a pergunta "
+        "do que a própria operação já checou (ex.: 'o cupom está dentro das regras do pedido: validade, valor mínimo, "
+        "forma de pagamento, loja?').\n"
+        "Com o caso claro: responda pelo que a base devolver (trechos da base de processos abaixo; ClubIA para Clube; Lyra "
         "Conhecimento para os demais processos, política, matriz de decisão e agentes). "
         "Se for pedido para escalar um ticket, diga o que a operação precisa fazer e o que já pode adiantar pelo "
         "processo. Resposta curta (até 6 linhas), sem título, sem dado pessoal de cliente.\n"
@@ -9505,6 +9686,13 @@ def _answer_flow_question(channel: str, thread_ts: str, eps: str | None, message
     if esc:
         _escalate(channel, thread_ts, eps, esc[0], esc[1], lambda t: _flow_post(channel, thread_ts, t),
                   shadow=bool(MELHORIAS_SHADOW and eps))
+        return
+    m_ask = re.match(r"\s*`?PERGUNTAR\s*:\s*(.*)", answer, re.S | re.I)
+    if m_ask:  # caso pouco claro: pergunta ao solicitante antes de responder ou escalar
+        parent = messages[0] if messages else {}
+        quem = _flow_requester(parent, str(parent.get("text") or ""))
+        _flow_post(channel, thread_ts, (f"<@{quem}> " if quem else "") + m_ask.group(1).strip().strip("`"))
+        STATE.set(f"chamado_ask:{thread_ts}", "1")
         return
     _flow_post(channel, thread_ts, _strip_file_promises(answer))
 
@@ -9566,7 +9754,7 @@ def _route_chamados_event(event: dict[str, Any]) -> bool:
                     time.sleep(2)
                 else:
                     time.sleep(LIVE_REPLY_DELAY_SECONDS if event.get("thread_ts") and not event.get("bot_id") else 5)
-                _handle_owners_flow(channel, root, mention)
+                _handle_owners_flow(channel, root, mention, str(event.get("user") or "") if not event.get("bot_id") else "")
             threading.Thread(target=run, daemon=True).start()
         return True
     thread_ts = str(event.get("thread_ts") or "")
@@ -9615,6 +9803,7 @@ def handle_message(event, say, client, ack):
         ack()
         if not is_im:
             try:
+                _maybe_mirror_learning(event)
                 if _maybe_convo_followup(event, say, client):
                     return
                 if _maybe_status_reply(event):
