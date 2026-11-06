@@ -540,7 +540,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.26.0"
+APP_VERSION = "5.26.5"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -969,7 +969,7 @@ def _ask_toqan_with_files(prompt: str, file_ids: list[str], max_attempts: int = 
     try:
         data = _toqan_request("create_conversation", {"user_message": prompt, "private_user_files": files})
     except ToqanAPIError as exc:
-        if re.search(r"HTTP (409|429|5\d\d)", str(exc)):
+        if re.search(r"HTTP (429|5\d\d)", str(exc)):
             raise  # Toqan ocupado/limite: abrir outra conversa só piora
         logger.info("create_conversation with files not accepted; trying continue_conversation")
     conversation_id, request_id = data.get("conversation_id"), data.get("request_id")
@@ -4729,6 +4729,18 @@ ROSIE_EVAL_INSTRUCTION = (
     "não da EPS, e que tirar essas notas da régua é decisão do time iFood.\n\n")
 
 
+# "equipe pior em TMA e CSAT": cruza os dois indicadores por equipe
+_COMBO_RE = re.compile(r"(?=.*\btma\b)(?=.*\bcsat\b)(?=.*\b(equipe\w*|supervisor\w*|time|times|operador\w*|analista\w*)\b)")
+COMBO_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA: a pessoa quer cruzar CSAT e TMA por equipe. Peça à Lyra Indicadores, para a fila e o "
+    "período (mês, se não disser), por equipe (supervisor do MOP): CSAT com n e TMA. Compare o CSAT com a META da fila e "
+    "o TMA com o PLAN da fila (os dois estão nos números oficiais deste contexto — não diga que não tem o plan). Responda: "
+    "(1) as equipes ruins NOS DOIS (CSAT abaixo da meta E TMA acima do plan), da pior para a melhor; (2) se nenhuma for "
+    "ruim nos dois, a pior em cada um, dizendo que são equipes diferentes; (3) o tamanho do desvio de cada uma "
+    "(p.p. e segundos). Operadores sem supervisor no MOP não são uma equipe: chame de 'sem supervisor cadastrado no MOP' "
+    "e aponte como lacuna de cadastro, fora do ranking.\n\n")
+
+
 CHAT_INSTRUCTION = (
     "INFORMAÇÃO INTERNA PARA A LYRA: esta é uma mensagem de conversa, não um pedido de análise. Responda como você "
     "(seção Personalidade): gente do time, bem-humorada quando couber (uma tirada, no máximo), sem frase de robô. "
@@ -6932,10 +6944,15 @@ def _table_context(eps: str | None) -> str:
     sel = _scope_rows(rows, eps)
     if not sel:
         return ""
-    body = "; ".join(f"{r['eps']} · {r['fila']}: {_bfmt(_agg([r])[0])}% (n={_fmt_int(r['mes_aval'])})"
+    def _plan(fila: str) -> str:
+        k = next((k for k in TMA_PLAN if _norm_text(k) == _norm_text(fila)), None)
+        return f" · plan de TMA {_fmt_tempo(TMA_PLAN[k][0])}" if k and fila not in NO_TMA_FILAS else ""
+    body = "; ".join(f"{r['eps']} · {r['fila']}: CSAT {_bfmt(_agg([r])[0])}% (meta {_fmt_meta(r.get('meta'))}%, "
+                     f"n={_fmt_int(r['mes_aval'])}){_plan(r['fila'])}"
                      for r in sel if r["mes_aval"])
-    return ("INFORMAÇÃO INTERNA PARA A LYRA — NÚMEROS OFICIAIS DO MÊS ATÉ ONTEM (use estes; se o subagente trouxer outro "
-            f"número para a mesma fila e período, fique com este): {body}\n\n")
+    return ("INFORMAÇÃO INTERNA PARA A LYRA — NÚMEROS OFICIAIS DO MÊS ATÉ ONTEM, com a meta de CSAT e o plan de TMA de "
+            "cada fila (use estes; se o subagente trouxer outro número ou outra meta para a mesma fila e período, fique "
+            f"com este; o plan de TMA vale para a fila e para as equipes dela): {body}\n\n")
 
 
 def _ritmo_for_report(fila: str, rows: list[dict[str, Any]] | None, d1: date) -> str:
@@ -7595,6 +7612,10 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             extra = KNOWLEDGE_INSTRUCTION
         elif not extra and _ROSIE_EVAL_RE.search(_norm_text(question)):
             extra = ROSIE_EVAL_INSTRUCTION
+        elif not extra and (_COMBO_RE.search(_norm_text(question)) or (
+                event.get("thread_ts") and re.search(r"\btma\b|\bcsat\b", _norm_text(question))
+                and _COMBO_RE.search(_norm_text(_thread_context(event)[-1500:])))):
+            extra = COMBO_INSTRUCTION
         elif not extra and event.get("_training"):
             extra = TRAINING_INSTRUCTION.format(fila=event["_training"])
         elif not extra and event.get("_training_theme"):
@@ -7940,7 +7961,8 @@ STATUS_DROP_PP = 2.0  # CSAT caiu ≥ 2 p.p. de um status pro outro com o mesmo 
 _GENERIC_STEP_RE = re.compile(r"\b(captacao\w*|captar|acompanhamento|monitoramento|em andamento|na meta|"
                               r"tentativas? de reversao|reversao|tratativa|alinhamento|reforco|seguimos|atencao)\b")
 _DEADLINE_RE = re.compile(r"\d{1,2}\s*(h\b|:\d{2})|\d{1,2}/\d{1,2}|\bate (as|o fim|amanha)\b")
-_STATUS_FILA_ALIASES = (("super cliente", "CX Super Cliente"), ("vip", "CX Super Cliente"), ("review", "CX Review"),
+_STATUS_FILA_ALIASES = (("super cliente", "CX Super Cliente"), ("vip", "CX Super Cliente"), ("cx super", "CX Super Cliente"),
+                        ("super cx", "CX Super Cliente"), ("review", "CX Review"),
                         ("denuncia", "CX Denúncia"), ("madrugada", "Madrugada"), ("suporte", "CX Suporte"))
 _STATUS_PENDING: set[str] = set()
 
@@ -8074,7 +8096,29 @@ def _control_prompt(title: str, fila: str, text: str, has_images: bool) -> str:
     )
 
 
-_CONTROL_READ_SEM = threading.BoundedSemaphore(int(os.getenv("CONTROL_READ_PARALLEL", "1")))
+_CONTROL_READ_SEM = threading.BoundedSemaphore(int(os.getenv("CONTROL_READ_PARALLEL", "1")))  # imagens
+_TEXT_READ_SEM = threading.BoundedSemaphore(2)  # texto não fica na fila atrás das imagens
+# Disjuntor das imagens: quando o Toqan recusa imagem várias vezes seguidas, pausa a leitura de imagem por um tempo
+# (não entope a fila nem gera alerta em série) e avisa uma vez.
+IMAGE_BREAKER_FAILS = 3
+IMAGE_BREAKER_MINUTES = int(os.getenv("IMAGE_BREAKER_MINUTES", "30"))
+_IMG_FAILS = {"n": 0, "until": 0.0}
+
+
+def _images_paused() -> bool:
+    return time.time() < _IMG_FAILS["until"]
+
+
+def _image_result(ok: bool, detail: str = "") -> None:
+    if ok:
+        _IMG_FAILS["n"] = 0
+        return
+    _IMG_FAILS["n"] += 1
+    if _IMG_FAILS["n"] >= IMAGE_BREAKER_FAILS and not _images_paused():
+        _IMG_FAILS["until"] = time.time() + IMAGE_BREAKER_MINUTES * 60
+        _IMG_FAILS["n"] = 0
+        _alert(f"O Toqan recusou {IMAGE_BREAKER_FAILS} leituras de imagem seguidas ({detail[:100]}). Pausei a leitura "
+               f"de prints por {IMAGE_BREAKER_MINUTES} min; o que vier em texto continua sendo lido normalmente.")
 LLM_READ_LAST = 2  # só as últimas mensagens da thread vão para a leitura livre (as antigas ficam com a regra)
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
 _THREAD_LOCKS_GUARD = threading.Lock()
@@ -8112,8 +8156,12 @@ def _llm_status(channel: str, title: str, fila: str, message: dict[str, Any]) ->
         except ValueError:
             pass
     images = _image_files(message)[:3]
+    text_len = len(_strip_mentions(_strip_md(message.get("text"))).strip())
+    if text_len >= 40 or _images_paused():
+        images = []  # tem texto: lê o texto (o Toqan recusa imagem com frequência; o texto é o que vale)
+    sem = _CONTROL_READ_SEM if images else _TEXT_READ_SEM
     try:
-        _CONTROL_READ_SEM.acquire()
+        sem.acquire()
         if images:
             file_ids = []
             for f in images:
@@ -8122,8 +8170,13 @@ def _llm_status(channel: str, title: str, fila: str, message: dict[str, Any]) ->
                     file_ids.append(toqan_upload_file(content, str(f.get("name") or "print.png"),
                                                       str(f.get("mimetype") or "image/png")))
             prompt = _control_prompt(title, fila, str(message.get("text") or ""), bool(file_ids))
-            answer = (ask_toqan_with_files(prompt, file_ids, max_attempts=PRINT_MAX_POLLS) if file_ids
-                      else ask_toqan(prompt, max_attempts=PRINT_MAX_POLLS))
+            try:
+                answer = (ask_toqan_with_files(prompt, file_ids, max_attempts=PRINT_MAX_POLLS) if file_ids
+                          else ask_toqan(prompt, max_attempts=PRINT_MAX_POLLS))
+                _image_result(True)
+            except Exception as img_exc:
+                _image_result(False, str(img_exc))
+                raise
         else:
             answer = ask_toqan(_control_prompt(title, fila, str(message.get("text") or ""), False),
                                max_attempts=PRINT_MAX_POLLS)
@@ -8144,7 +8197,7 @@ def _llm_status(channel: str, title: str, fila: str, message: dict[str, Any]) ->
                    f"{str(exc)[:120]}). Tento de novo na próxima mensagem da thread.")
         return None  # não guarda: tenta de novo depois
     finally:
-        _CONTROL_READ_SEM.release()
+        sem.release()
     data = _block_data_from_json(answer) or {}
     status: dict[str, Any] | None = None
     if data.get("e_status") and data.get("hora") and (_num(data.get("csat")) is not None or _num(data.get("sla")) is not None):
@@ -9226,6 +9279,10 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
     misread = ""  # a imagem estava legível, mas a transcrição não fechou com os totais: só alerta interno
     tech_problem = ""  # falha nossa (download, Toqan, JSON): só alerta, nunca cobra a EPS
     data: dict[str, Any] | None = None
+    if images and not alt and _images_paused():
+        STATE.set(done_key, "")
+        logger.info("[%s] Leitura de print pausada (disjuntor do Toqan); fica para a próxima", eps)
+        return None
     _CONTROL_READ_SEM.acquire()  # uma leitura de imagem por vez no Toqan
     try:
         file_ids = []
@@ -9277,6 +9334,11 @@ def _read_print_message(channel: str, thread_ts: str, msg_ts: str, eps: str) -> 
         tech_problem = f"falha ao ler a imagem ({type(exc).__name__}: {detail}){hint}"
     finally:
         _CONTROL_READ_SEM.release()
+    if images and not alt:
+        _image_result(not tech_problem, tech_problem)
+    if tech_problem and _images_paused():
+        STATE.set(done_key, "")
+        return None  # Toqan recusando imagem: sem fila de novas tentativas nem alerta em série
     if tech_problem:
         STATE.set(done_key, "")  # falha nossa: libera para tentar de novo
         tries_key = f"printretry:{channel}:{msg_ts}"
@@ -9602,7 +9664,7 @@ def _chamado_from_flow(fields: dict[str, str], parent_fields: dict[str, str], pa
     }
 
 
-def _triage_chamado(chamado: dict[str, str], extra_replies: list[str]) -> dict[str, Any]:
+def _triage_chamado(chamado: dict[str, str], extra_replies: list[str], evidencia: str = "") -> dict[str, Any]:
     """Classifica o tipo de problema, acha a missão e lista o que falta (via Toqan, JSON)."""
     prompt = (
         "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Responda APENAS com JSON válido.\n\n"
@@ -9610,15 +9672,20 @@ def _triage_chamado(chamado: dict[str, str], extra_replies: list[str]) -> dict[s
         "antes de ele ir para o time de Rewards.\n"
         f"Chamado: {json.dumps(chamado, ensure_ascii=False)}\n"
         + (f"Complementos que a operação mandou na thread:\n" + "\n---\n".join(extra_replies) + "\n" if extra_replies else "")
+        + (f"O que aparece no print anexado: {evidencia}\n" if evidencia else "")
         + f"Tipos de problema aceitos pelo Rewards: {json.dumps(REWARDS_PROBLEM_TYPES, ensure_ascii=False)}\n\n"
         'Formato: {"tipo_problema":"...","missao":"...","faltando":["..."],"descricao_rewards":"...","pergunta":"..."}\n'
+        "Todo caso de moedas vai para o Rewards (se o cliente abriu contato, ele precisa da solução): entenda o problema "
+        "e descreva bem; não oriente nem segure o chamado.\n"
         "Regras:\n"
         "- tipo_problema: o tipo da lista que melhor descreve; se nenhum servir, 'Outro: <resumo curto>'.\n"
         "- missao: ID ou nome da missão citado no chamado ou nos complementos; vazio se não houver.\n"
         "- faltando: dados mínimos que o Rewards exige e que NÃO estão no chamado nem nos complementos: "
-        "número do ticket, ID do cliente (UUID), o que aconteceu, quando ocorreu, onde ocorreu (tela/fluxo do app), "
-        "e a missão quando o problema é de missão. Não peça o que já está lá. Evidência (print) é opcional.\n"
-        "- descricao_rewards: descrição limpa para o Rewards (o que, quando, como, onde), juntando chamado e complementos, "
+        "número do ticket, ID do cliente (UUID), o que aconteceu e a missão quando o problema é de missão. 'Quando' e "
+        "'onde' NÃO bloqueiam: se não disserem quando, use a data do chamado; o onde (tela/fluxo) tire da descrição ou do "
+        "print (ex.: Lojinha > resgate em saldo). Não peça o que já está lá nem o que o print mostra. Print é opcional.\n"
+        "- descricao_rewards: descrição limpa para o Rewards (o que, quando, como, onde), juntando chamado, complementos e o "
+        "que o print mostra (ex.: a mensagem de erro/aviso exata do app), "
         "sem saudação e sem dados pessoais além dos IDs.\n"
         "- pergunta: se faltar algo, UMA mensagem curta e educada pedindo exatamente o que falta; senão vazio."
     )
@@ -9658,7 +9725,7 @@ def _download_slack_bytes(file_info: dict[str, Any]) -> bytes | None:
 
 
 def _post_rewards_chamado(chamado: dict[str, str], triage: dict[str, Any], origin_link: str,
-                          eps: str | None = None, n_evid: int = 0) -> str | None:
+                          eps: str | None = None, files: list[dict[str, Any]] | None = None) -> str | None:
     """Abre o chamado no Rewards (ou no canal de teste da EPS). Devolve o ts da mensagem do chamado no canal."""
     dest, teste = _chamado_destino(eps)
     payload = {
@@ -9683,25 +9750,56 @@ def _post_rewards_chamado(chamado: dict[str, str], triage: dict[str, Any], origi
                 logger.warning("Could not read Rewards channel history", exc_info=True)
                 break
         return None
-    solicitante = f"<@{chamado['solicitante']}>" if chamado.get("solicitante") else "operação"
-    text = "\n".join(line for line in [
-        (f"🧪 *TESTE · chamado de moedas {eps or ''}* — em produção vai para o <#{REWARDS_CHANNEL}>" if teste
-         else "🪙 *Rewards Engine CX Support* · chamado aberto pela Lyra"),
-        "",
-        f"*Número do Ticket:* {chamado['ticket']}",
-        f"*ID do Cliente:* {chamado['cliente']}",
-        f"*ID do Pedido:* {chamado.get('pedido') or '—'}",
-        f"*Id ou Nome da Missão:* {triage.get('missao') or '—'}",
-        f"*Descreva o problema:* {triage['descricao']}",
-        f"*Tipo de problema:* {triage['tipo_problema']}",
-        f"*Evidências:* {f'{n_evid} anexo(s) aqui na thread' if n_evid else 'sem anexo'}",
-        "",
-        f"*Solicitante:* {solicitante}" + (f" · *Prioridade:* {chamado['prioridade']}" if chamado.get("prioridade") else ""),
-        f"<{origin_link}|Thread de origem>" if origin_link else "",
-    ] if line is not None)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    uploads = []
+    for f in (files or [])[:10]:
+        content = _download_slack_bytes(f)
+        if content:
+            uploads.append({"content": content, "filename": f.get("name") or "evidencia.png",
+                            "title": f.get("title") or f.get("name") or "Evidência"})
+    text = _rewards_chamado_text(chamado, triage, origin_link, eps, teste, len(uploads))
+    if uploads:
+        # igual ao formulário do Reward Engine: o chamado e as evidências na MESMA mensagem
+        try:
+            slack_app.client.files_upload_v2(channel=dest, file_uploads=uploads, initial_comment=text)
+            for _ in range(6):
+                time.sleep(3)
+                hist = slack_app.client.conversations_history(channel=dest, limit=10)
+                for m in _resp_get(hist, "messages", []) or []:
+                    if chamado["ticket"] and chamado["ticket"] in str(m.get("text") or "") and m.get("files"):
+                        return str(m.get("ts"))
+            return None
+        except Exception:
+            logger.warning("Could not post chamado with evidence; posting text only", exc_info=True)
     resp = slack_app.client.chat_postMessage(channel=dest, text=text)
     return str(_resp_get(resp, "ts") or "") or None
+
+
+def _rewards_chamado_text(chamado: dict[str, str], triage: dict[str, Any], origin_link: str,
+                          eps: str | None, teste: bool, n_evid: int = 0) -> str:
+    """Mesmo layout do formulário Reward Engine CX Support: rótulo em negrito numa linha, resposta na de baixo."""
+    campos = [
+        ("Número do Ticket", chamado.get("ticket") or "."),
+        ("ID do Cliente", chamado.get("cliente") or "."),
+        ("ID do Pedido", chamado.get("pedido") or "."),
+        ("Id ou Nome da Missão", triage.get("missao") or "."),
+        ("Descreva o problema", triage.get("descricao") or "."),
+        ("Tipo de problema", triage.get("tipo_problema") or "."),
+        ("Evidências", f"{n_evid} anexo(s) nesta mensagem" if n_evid else "."),
+    ]
+    linhas = []
+    if teste:
+        linhas.append(f"🧪 _Teste {eps or ''} — em produção este chamado vai para o <#{REWARDS_CHANNEL}>_")
+    linhas.append("*Reward Engine CX Support*")
+    for rotulo, valor in campos:
+        linhas += [f"*{rotulo}*", str(valor).strip()]
+    rodape = []
+    if chamado.get("solicitante"):
+        rodape.append(f"a pedido de <@{chamado['solicitante']}>")
+    if origin_link:
+        rodape.append(f"<{origin_link}|thread de origem>")
+    if rodape:
+        linhas.append("_Aberto pela Lyra " + " · ".join(rodape) + "_")
+    return "\n".join(linhas)
 
 
 def _permalink(channel: str, ts: str) -> str:
@@ -9943,7 +10041,9 @@ def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "", tr
                    if m.get("ts") != thread_ts and not (m.get("bot_id") or m.get("subtype") == "bot_message")
                    and m.get("user") != bot]
         chamado = _chamado_from_flow(fields, parent_fields, parent_text, parent)
-        triage = _triage_chamado(chamado, replies)
+        imgs = [f for m in messages for f in _image_files(m)][:3]
+        evidencia = _describe_evidence(imgs) if imgs else ""
+        triage = _triage_chamado(chamado, replies, evidencia)
         if triage["faltando"]:
             if state != "aguardando":
                 quem = f"<@{chamado['solicitante']}> " if chamado.get("solicitante") else ""
@@ -9956,16 +10056,7 @@ def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "", tr
         origin = _permalink(channel, thread_ts)
         files = [f for m in messages for f in (m.get("files") or []) if isinstance(f, dict)]
         dest, teste = _chamado_destino(eps)
-        rewards_ts = _post_rewards_chamado(chamado, triage, origin, eps, len(files[:10]))
-        if rewards_ts and files:
-            for f in files[:10]:
-                content = _download_slack_bytes(f)
-                if content:
-                    try:
-                        slack_app.client.files_upload_v2(channel=dest, thread_ts=rewards_ts, content=content,
-                                                         filename=f.get("name") or "evidencia.png", title="Evidência")
-                    except Exception:
-                        logger.warning("Could not upload evidence", exc_info=True)
+        rewards_ts = _post_rewards_chamado(chamado, triage, origin, eps, files)
         link = _permalink(dest, rewards_ts) if rewards_ts else ""
         _flow_post(
             channel, thread_ts,
