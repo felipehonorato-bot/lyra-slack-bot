@@ -211,8 +211,9 @@ MAX_POLL_ATTEMPTS = 180  # 180 x 10s = 30 minutos
 PROCESSING_REACTION = "eyes"
 DONE_REACTION = "white_check_mark"
 ERROR_MESSAGE = "Não consegui processar agora, tente novamente"
-TIMEOUT_ERROR_MESSAGE = ("Essa demorou mais do que devia e eu parei para não te deixar esperando. Me pede em partes "
-                         "(ex.: primeiro o resultado da fila, depois o plano) que sai mais rápido.")
+TIMEOUT_ERROR_MESSAGE = ("Essa travou do meu lado: a consulta passou do tempo e eu parei pra não te deixar esperando. "
+                         "Já avisei o time. Tenta de novo daqui a pouco?")
+INTERACTIVE_MAX_POLLS = int(os.getenv("INTERACTIVE_MAX_POLLS", str(MAX_POLL_ATTEMPTS)))  # conversa: 30 min
 EMPTY_ANSWER_MESSAGE = "Não consegui obter uma resposta agora."
 
 DAILY_REPORT_CHANNEL = os.getenv("DAILY_REPORT_CHANNEL", "C0BF6JVFG7N")
@@ -540,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.26.7"
+APP_VERSION = "5.26.8"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -4453,7 +4454,9 @@ FILA_METAS: dict[str, float] = _MetasNow()
 ESTEIRA_MAX_POLLS = 72  # 12 min: a esteira não pode segurar a conversa
 ESTEIRA_MIN_GAP_PP = 0.3  # abaixo disso o gap é pequeno demais para dividir em p.p.: mostra só %
 _CAUSE_RE = re.compile(
-    r"\b(por que|porque|pq|motivo|motivos|causa|causas|explica|o que (esta|ta) puxando|de onde vem)\b.*"
+    r"\b(efeito mix|variacao de mix|mix de motivo\w*|teve mix|tivemos (variacao de )?mix|mudou o mix)\b"
+    r"|\bo que (voce )?(identific\w*|viu|explica|impact\w*|puxou|derrubou)\b.*\b(csat|gap|abaixo|meta|queda|caiu|pp|p p)\b"
+    r"|\b(por que|porque|pq|motivo|motivos|causa|causas|explica|o que (esta|ta) puxando|de onde vem)\b.*"
     r"\b(csat|caiu|cai|caindo|piorou|queda|gap|detrator|detratores|ruim|abaixo)\b"
     r"|\b(csat|gap|detratores)\b.*\b(por que|porque|pq|causa|causas|motivo)\b"
 )
@@ -4888,8 +4891,11 @@ KNOWLEDGE_INSTRUCTION = (
     "respostas do time). Senão, chame o subagente "
     "*Lyra Conhecimento* com `Pedido: <a pergunta, completa>` (uma chamada por pergunta, se houver mais de uma) e "
     "responda com o que ela devolver. NÃO use outra busca nem conhecimento geral (CDC, \"geralmente\", outras empresas). "
-    "Se ela devolver NÃO SEI, diga que isso não está na sua base, que a referência é o One Hub (Matriz CX) e que vai "
-    "confirmar com o time.\n\n"
+    "Responda SÓ a pergunta atual (não repita ressalvas de perguntas anteriores da conversa). Se a base não tiver a "
+    "resposta ou faltar a condição pedida: diga em 1 frase o que a base traz e o que não traz, a referência (One Hub / "
+    "Matriz CX), SEM prometer 'vou confirmar', e termine com uma linha final `ESCALAR: experiencia: <a dúvida em 1 "
+    "linha>` (política, processo de atendimento, CSAT) ou `ESCALAR: eficiencia: <a dúvida>` (TMA, SLA, fila, "
+    "ferramentas). O app chama a pessoa certa do time.\n\n"
 )
 
 
@@ -4972,6 +4978,45 @@ def _is_cause_request(question: str) -> bool:
     return bool(_CAUSE_RE.search(_norm_text(question)))
 
 
+_MIX_ONLY_RE = re.compile(r"\bmix\b")
+_SEGMENT_SUPER_RE = re.compile(r"\b(super|super cx|cx super|vip|platin\w*)\b")
+
+
+def _fila_ref(question: str, eps: str | None, event: dict[str, Any]) -> str | None:
+    """Fila da pergunta: citada no texto; 'Super' = a fila Super Cliente da EPS; senão a última fila citada na thread
+    ('nesse segmento', 'essa fila')."""
+    fila = _fila_in_question(question, eps)
+    if fila:
+        return fila
+    candidates = _celulas_of(eps) if eps else [f for cel in EPS_CELULAS.values() for f in cel]
+    qn = _norm_text(question)
+    for palavra, chave in (("review", "review"), ("suporte", "suporte"), ("madrugada", "madrugada"),
+                           ("denuncia", "denuncia"), ("cancelamento", "cancelamento"), ("revisao", "revisao manual"),
+                           ("fraude", "fraudes")):
+        hits = [f for f in candidates if chave in _norm_text(f)]
+        if re.search(rf"\b{palavra}\w*", qn) and len(hits) == 1:
+            return hits[0]
+    supers = [f for f in candidates if "super cliente" in _norm_text(f)]
+    if _SEGMENT_SUPER_RE.search(qn) and len(supers) == 1:
+        return supers[0]
+    if not event.get("thread_ts"):
+        return None
+    try:
+        ctx = _norm_text(_thread_context(event)[-3000:])
+    except Exception:
+        return None
+    best, pos = None, -1
+    for f in candidates:
+        i = ctx.rfind(_norm_text(f))
+        if i > pos:
+            best, pos = f, i
+    if len(supers) == 1:
+        m = list(re.finditer(r"\b(super|platin\w*|vip)\b", ctx))
+        if m and m[-1].start() > pos:
+            best = supers[0]
+    return best
+
+
 def _fila_in_question(question: str, eps: str | None) -> str | None:
     candidates = _celulas_of(eps) if eps else [f for cel in EPS_CELULAS.values() for f in cel]
     text = _norm_text(question)
@@ -4997,7 +5042,7 @@ def _esteira_on_demand_prompt(eps: str | None, fila: str, day: date, d1_only: bo
 def _post_esteira_on_demand(event: dict[str, Any], eps: str | None, question: str) -> bool:
     """Pergunta de causa ('por que o CSAT caiu?'): posta a esteira de impacto da fila na thread. True = postou."""
     block = _report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or ""))
-    fila = block[1].get("fila") if block else _fila_in_question(question, eps)
+    fila = block[1].get("fila") if block else _fila_ref(question, eps, event)
     if not fila:
         return False
     text_q = _norm_text(question)
@@ -7608,26 +7653,30 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
 
         extra = ""
         if _is_cause_request(question):
-            fila_q = _fila_in_question(question, eps)
+            fila_q = _fila_ref(question, eps, event)
+            mix_only = bool(_MIX_ONLY_RE.search(_norm_text(question)))
             block_q = _report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or ""))
             if fila_q or block_q:
                 # esteira (Qualidade) em paralelo com a análise de variação (Indicadores): a pessoa não fica esperando
-                _say(say, "Vou levantar as causas: primeiro a análise da variação (mix de motivos e response rate); "
-                          "se a queda não for só mix, em seguida a esteira de impacto por pilar. Leva alguns minutos ⏳",
-                          event, in_thread=True)
                 fila_v = block_q[1].get("fila") if block_q else fila_q
+                _say(say, (f"Vou olhar o mix de motivos de `{fila_v}` (este mês x referência). Já te trago ⏳" if mix_only else
+                           f"Vou levantar as causas em `{fila_v}`: primeiro a variação (mix de motivos e response rate); "
+                           "se não for só mix, em seguida a esteira de impacto por pilar. Leva alguns minutos ⏳"),
+                     event, in_thread=True)
                 cur, ref, l_cur, l_ref = _variation_periods(question)
-                var_answer = ask_toqan(_variation_prompt(eps, fila_v, cur, ref), progress_callback=send_progress)
+                var_answer = ask_toqan(_variation_prompt(eps, fila_v, cur, ref), progress_callback=send_progress,
+                                       max_attempts=INTERACTIVE_MAX_POLLS)
                 progress.done()
                 var_data = {} if _is_error_answer(var_answer) else (_block_data_from_json(var_answer) or {})
                 rendered = _render_variation(fila_v, var_data, l_cur, l_ref) if var_data else None
                 if rendered:
                     _say_sections(say, rendered, event)
                     rose = (_num(var_data.get("csat_atual")) or 0) >= (_num(var_data.get("csat_ref")) or 0)
-                    if not _mix_dominant(var_data) and not rose:
+                    if not mix_only and not _mix_dominant(var_data) and not rose:
                         threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
                     return
-                threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
+                if not mix_only:
+                    threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
                 extra = ("INFORMAÇÃO INTERNA PARA A LYRA: a esteira de impacto (pilares Operador, Tempo, Política, Parceiro, "
                          "Produto) é postada separadamente pelo app nesta thread. NÃO chame a Lyra Qualidade e NÃO liste pilares: "
                          "chame só a Lyra Indicadores (Pedido: variação do CSAT) e responda a variação (efeito mix x performance "
@@ -7683,12 +7732,16 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                         send_progress("A análise completa está pesada agora; vou te mandar o plano com o que já tenho. ⏳")
                         answer = ask_toqan(_plan_fallback_prompt(question, eps), max_attempts=60)
                 else:
-                    answer = ask_toqan(prompt, progress_callback=send_progress)
+                    answer = ask_toqan(prompt, progress_callback=send_progress, max_attempts=INTERACTIVE_MAX_POLLS)
             finally:
                 progress.done()
             _remember_answer(prompt, answer)
         _passive_access_check(answer)
         answer = _strip_file_promises(answer)
+        esc_q = _parse_escalation(answer or "")
+        if esc_q:  # dúvida que a base não responde: chama o dono do tema de verdade (e aprende com a resposta)
+            answer = re.split(r"`?ESCALAR\s*:", answer, maxsplit=1)[0].strip()
+            answer = re.sub(r"[^.\n]*\b(vou|vamos) (confirmar|validar|checar)[^.\n]*\.?", "", answer).strip()
         if _operator_names_allowed(eps):
             try:
                 answer = _with_operator_names(answer)
@@ -7711,6 +7764,17 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             _say_sections(say, answer, event, in_thread)
         else:
             _say(say, answer or EMPTY_ANSWER_MESSAGE, event, in_thread)
+        if esc_q:
+            ch_q = str(event.get("channel") or "")
+            dono = "o Gustavo" if esc_q[0] == "experiencia" else "o Michael"
+            if ch_q.startswith("D"):
+                _say(say, f"Isso quem fecha é {dono} — vou deixar a dúvida com ele. 🙂", event, in_thread=True)
+                _alert(f"❓ Dúvida sem resposta na base (DM, {dono[2:]}): _{esc_q[1]}_ "
+                       f"({_permalink(ch_q, str(event.get('thread_ts') or event.get('ts') or ''))})")
+            else:
+                _escalate(ch_q, str(event.get("thread_ts") or event.get("ts") or ""), eps, esc_q[0], esc_q[1],
+                          lambda t: _say(say, t, event, in_thread=True), shadow=bool(eps and _status_shadow(eps)),
+                          decisao=bool(answer))
         if (_NOMINAL_RE.search(_norm_text(question)) or (event.get("thread_ts") and _SAME_SET_RE.search(_norm_text(question)))) \
                 and re.search(r"ficaram de fora|limite de exibi|nao aparecem|não aparecem|planilha|excel|lista completa",
                                                                   _norm_text(answer or "")):
@@ -7738,7 +7802,11 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
     except ToqanAPIError as exc:
         failed["v"] = True
         logger.exception("Lyra could not process Slack event")
-        _say(say, TIMEOUT_ERROR_MESSAGE if "polling timed out" in str(exc) else ERROR_MESSAGE, event, in_thread)
+        timed_out = "timed out" in str(exc)
+        _say(say, TIMEOUT_ERROR_MESSAGE if timed_out else ERROR_MESSAGE, event, in_thread)
+        if timed_out:
+            _alert(f"⏱️ Pergunta sem resposta por tempo esgotado: _{str(event.get('text') or '')[:200]}_ "
+                   f"({_permalink(str(event.get('channel') or ''), str(event.get('thread_ts') or event.get('ts') or ''))})")
     except Exception:
         failed["v"] = True
         logger.exception("Lyra could not process Slack event")
