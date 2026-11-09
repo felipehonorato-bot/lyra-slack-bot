@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.26.8"
+APP_VERSION = "5.27.3"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -2858,6 +2858,442 @@ def _send_chart(event: dict[str, Any], client: Any, eps: str | None, question: s
     )
     return None
 
+# --- Base caso a caso por indicador (CSAT, SLA de 1ª resposta, TMA) + abertura por operador --------------------------
+# Ex.: "casos fora do SLA de 1ª resposta da Super", "base de CSAT da minha equipe com número do caso", "casos de TMA
+# alto do time da Supervisora 3". Excel com a aba dos casos e a aba por operador; filtra por fila e/ou equipe (MOP).
+_CASE_FIELDS_RE = re.compile(r"\b(numero do caso|numeros dos casos|n do caso|caso a caso|ticket a ticket|numero do ticket|"
+                             r"comentario\w*|hora da avaliacao|data da avaliacao|nota atribuida|formulario do caso|"
+                             r"avaliacao por avaliacao|lista de avaliacoes|abertura das avaliacoes|casos?|tickets?|"
+                             r"base de (csat|sla|tma|avaliac\w*)|fora do sla|estour\w*)\b")
+_CASE_IND_RE = re.compile(r"\b(csat|avaliac\w*|nota\w*|entrega\w*|detrator\w*|sla|primeira resposta|1a resposta|"
+                          r"tma|tempo de atendimento|tempo de atribuicao)\b")
+CASE_LIST_MAX = int(os.getenv("CASE_LIST_MAX", "400"))
+SLA_LIMITE_S = {"super": 120, "vip": 120}  # 1ª resposta: 2 min nas filas Super/VIP; 10 min nas demais
+SLA_LIMITE_PADRAO_S = 600
+
+
+def _is_case_list_request(question: str) -> bool:
+    t = _norm_text(question)
+    if not (_CASE_FIELDS_RE.search(t) and _CASE_IND_RE.search(t)):
+        return False
+    # "casos" sozinho só vale com pedido de lista/base/número (evita "quantos casos..." e perguntas de causa)
+    return bool(re.search(r"\b(numero|numeros|lista|base|abertura|planilha|excel|traz|traga|manda|mande|envia|envie|"
+                          r"me passa|quais (os )?casos|caso a caso|comentario\w*|hora da avaliacao|nota atribuida)\b", t))
+
+
+def _case_indicator(question: str) -> str:
+    t = _norm_text(question)
+    if re.search(r"\b(sla|primeira resposta|1a resposta|fora do sla)\b", t):
+        return "sla"
+    if re.search(r"\b(tma|tempo de atendimento|tempo de atribuicao)\b", t):
+        return "tma"
+    return "csat"
+
+
+def _sla_limite_txt(fila: str | None) -> str:
+    if fila:
+        lim = next((v for k, v in SLA_LIMITE_S.items() if k in _norm_text(fila)), SLA_LIMITE_PADRAO_S)
+        return f"{lim} s ({lim // 60} min)"
+    return "120 s (2 min) nas filas Super Cliente/VIP e 600 s (10 min) nas demais"
+
+
+def _case_team(question: str, event: dict[str, Any], eps: str | None) -> tuple[str | None, list[str] | None, str]:
+    """(nome do líder, e-mails da equipe, problema). Só quando a pergunta fala de equipe/time/supervisor."""
+    if not _TEAM_RE.search(_norm_text(question)):
+        return None, None, ""
+    people = _mop_people(eps)
+    if not people:
+        return None, None, "Não consegui ler o MOP pra achar a equipe agora. Tenta de novo em alguns minutos?"
+    kind, leader = _resolve_team(question, event, people)
+    if kind not in {"sup", "coord"} or not leader:
+        return None, None, ("De qual equipe? Não achei você como supervisor(a) ou coordenador(a) no MOP. Me diz o nome "
+                            "(ex.: \"casos de CSAT da equipe da Supervisora 3\").")
+    field = "supervisor" if kind == "sup" else "coordenador"
+    emails = sorted(e for e, p in people.items() if _norm_text(p[field]) == _norm_text(leader))
+    return leader, emails or None, "" if emails else f"Não achei operadores da equipe de {leader} no MOP."
+
+
+def _xlsx_sheet(wb: Any, title: str, header: list[str], rows: list[list[Any]], wide_cols: tuple[str, ...] = ()) -> None:
+    from openpyxl.styles import Alignment, Font, PatternFill
+    ws = wb.create_sheet(title[:31])
+    ws.append(header)
+    for r in rows:
+        ws.append([(_to_float(v) if isinstance(v, str) and re.fullmatch(r"-?\d+(\.\d+)?", v.strip()) and len(v.strip()) < 9
+                    else v) for v in r])
+    for c in ws[1]:
+        c.font, c.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="EA1D2C")
+    for i, name in enumerate(header, start=1):
+        col = ws.cell(row=1, column=i).column_letter
+        wide = any(w in _norm_text(name) for w in wide_cols)
+        ws.column_dimensions[col].width = 60 if wide else min(max(len(str(name)) + 4, 12), 40)
+        if wide:
+            for cell in ws[col][1:]:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.freeze_panes = "A2"
+    if ws.max_row > 1:
+        ws.auto_filter.ref = ws.dimensions
+
+
+def _send_case_list(event: dict[str, Any], client: Any, eps: str | None, question: str) -> str | None:
+    ind = _case_indicator(question)
+    fila = _fila_in_question(question, eps) or (
+        _fila_ref(question, eps, event) if not _TEAM_RE.search(_norm_text(question)) else None)
+    leader, team, problem = _case_team(question, event, eps)
+    if problem:
+        return problem
+    if not fila and not team:
+        return ("Monto sim! De qual fila ou equipe? (ex.: \"Super Cliente\" ou \"equipe da Supervisora 3\"). Trago caso a "
+                "caso e a abertura por operador.")
+    d1 = _d1_context(question, event)
+    spec = _period_spec("ontem" if d1 else ("semana" if re.search(r"\bsemana\b", _norm_text(question)) else "mês"))
+    todas = d1 or bool(re.search(r"\b(todas|promotor\w*|todos os casos)\b", _norm_text(question)))
+    filtro = (f"Fila: {fila}\n" if fila else "Fila: todas as filas da EPS\n") + (
+        f"Só estes operadores (e-mails): {', '.join(team[:400])}\n" if team else "")
+    base = f"{_scope_instruction(eps)}\n\nTAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Chame a *Lyra Indicadores* com exatamente:\nEPS: {eps or 'iFood'}\n"
+    fim = "Devolva SOMENTE o CSV que ela responder (ou a linha ERRO:), sem comentar."
+    if ind == "csat":
+        p_casos = (base + f"Pedido: avaliações detalhadas (CSV)\n{filtro}Período: {spec['cur']}\nNotas: "
+                   f"{'todas' if todas else 'detratoras (1, 2 e 3)'}\nLimite: {CASE_LIST_MAX}\n{fim}")
+        p_ops = None
+        aba, wide = "Avaliações", ("coment",)
+        escopo = "todas as notas" if todas else "só detratoras (notas 1 a 3)"
+        extra = "" if todas else " No mês, as promotoras ficam fora pelo volume; pra todas as notas, peça por D-1."
+    elif ind == "sla":
+        lim = _sla_limite_txt(fila)
+        p_casos = (base + f"Pedido: casos fora do SLA (CSV)\n{filtro}Período: {spec['cur']}\nLimite de 1ª resposta: "
+                   f"{lim}\nLimite: {CASE_LIST_MAX}\n{fim}")
+        p_ops = base + f"Pedido: SLA por operador (CSV)\n{filtro}Período: {spec['cur']}\nLimite de 1ª resposta: {lim}\n{fim}"
+        aba, wide = "Fora do SLA", ()
+        escopo = f"interações com 1ª resposta acima de {lim}"
+        extra = ""
+    else:
+        p_casos = (base + f"Pedido: casos de TMA (CSV)\n{filtro}Período: {spec['cur']}\nLimite: {CASE_LIST_MAX}\n{fim}")
+        p_ops = base + f"Pedido: TMA por analista (CSV)\n{filtro}Período: {spec['cur']}\n{fim}"
+        aba, wide = "Casos de TMA", ()
+        escopo = "casos do maior para o menor tempo de atribuição"
+        extra = ""
+    out: dict[str, Any] = {}
+
+    def ask(key: str, prompt: str) -> None:
+        try:
+            out[key] = ask_toqan(prompt, max_attempts=INTERACTIVE_MAX_POLLS)
+        except Exception as exc:
+            out[key] = f"ERRO: {exc}"
+
+    threads = [threading.Thread(target=ask, args=("casos", p_casos), daemon=True)]
+    if p_ops:
+        threads.append(threading.Thread(target=ask, args=("ops", p_ops), daemon=True))
+    for t in threads:
+        t.start()
+    rows_op_csat = None
+    if ind == "csat":
+        try:
+            rows_op_csat = _fetch_operator_rows(eps, spec["cur"], team)
+        except Exception:
+            rows_op_csat = None
+    for t in threads:
+        t.join()
+
+    def parse(key: str) -> tuple[list[str], list[list[str]], int] | None:
+        parsed = None if _is_error_answer(out.get(key, "")) else _parse_data_csv(out.get(key, ""))
+        if not parsed:
+            return None
+        _, header, rows = parsed
+        total_line = next((r for r in rows if r and r[0].upper() == "TOTAL"), None)
+        rows = [[_mask_pii(c) for c in r] for r in rows if r and r[0].upper() != "TOTAL"]
+        raw_n = len(rows)
+        op_col = next((i for i, h in enumerate(header) if "operador" in _norm_text(h) or "email" in _norm_text(h)), None)
+        if op_col is not None:
+            if eps:  # trava: operador só da EPS do canal
+                rows = [r for r in rows if len(r) > op_col and (not r[op_col] or _eps_pattern(eps) in r[op_col].lower())]
+            if team:
+                ts = set(team)
+                rows = [r for r in rows if len(r) > op_col and r[op_col].lower() in ts]
+        total = int(_to_float(total_line[1]) or raw_n) if total_line and len(total_line) > 1 else raw_n
+        return header, rows, (total if total > raw_n else 0)  # 0 = não houve corte pelo limite
+
+    casos = parse("casos")
+    if ind == "csat":
+        op_header = ["E-mail", "Fila", "Avaliações", "Promotores", "Detratores", "CSAT (%)", "Meta (%)",
+                     "Atingimento (%)", "Quadrante"]
+        ops = [r for r in (rows_op_csat or []) if len(r) >= 8 and (not fila or _norm_text(r[1]) == _norm_text(fila))
+               and (not team or r[0].lower() in set(team))]
+        ops.sort(key=lambda r: _to_float(r[6]) if _to_float(r[6]) is not None else 999)
+        op_rows = [[r[0], r[1], _to_float(r[2]) or 0, _to_float(r[3]) or 0, (_to_float(r[2]) or 0) - (_to_float(r[3]) or 0),
+                    _to_float(r[4]), _to_float(r[5]), _to_float(r[6]), r[7]] for r in ops]
+    else:
+        po = parse("ops")
+        op_header, op_rows = (po[0], po[1]) if po else (["Operador"], [])
+    if not casos and not op_rows:
+        return "Não consegui puxar essa base agora. Tenta de novo em alguns minutos?"
+    from openpyxl import Workbook
+    wb = Workbook()
+    wb.remove(wb.active)
+    if casos:
+        _xlsx_sheet(wb, aba, casos[0], casos[1], wide)
+    else:
+        _xlsx_sheet(wb, aba, ["Aviso"], [["Os casos não vieram agora — peça de novo em alguns minutos."]])
+    _xlsx_sheet(wb, "Por operador", op_header, op_rows)
+    buf = io.BytesIO()
+    wb.save(buf)
+    n_casos = len(casos[1]) if casos else 0
+    total_casos = casos[2] if casos else 0
+    corte = (f" Pelo limite, vieram os {n_casos} primeiros de {_fmt_int(total_casos)}; pra ver todos, peça por D-1 ou "
+             "por semana." if casos and total_casos else "")
+    alvo = " · ".join(x for x in [f"`{fila}`" if fila else "", f"equipe de {leader}" if leader else ""] if x)
+    nome_ind = {"csat": "CSAT", "sla": "SLA 1ª resposta", "tma": "TMA"}[ind]
+    (client or slack_app.client).files_upload_v2(
+        channel=event.get("channel"), thread_ts=_reply_ts(event), content=buf.getvalue(),
+        filename=re.sub(r"[^\w\-]+", "_", f"{nome_ind}_casos_{fila or leader or ''}_{_now_brazil().strftime('%d-%m')}")[:60] + ".xlsx",
+        title=f"{nome_ind} · casos · {fila or leader} · {spec['short']}",
+        initial_comment=(f"📋 *{nome_ind}* · {alvo} · {spec['short']} · {escopo}: {n_casos} caso(s) na aba *{aba}* e "
+                         f"{len(op_rows)} operador(es) na aba *Por operador*.{corte}{extra}"))
+    return None
+
+
+_PII_RES = [
+    (re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"), "[e-mail]"),
+    (re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"), "[cpf]"),
+    (re.compile(r"\b(?:\d[ -]?){13,19}\b"), "[cartão]"),
+    (re.compile(r"(?:\+?55\s?)?\(?\d{2}\)?\s?9?\d{4}[-\s]?\d{4}\b"), "[telefone]"),
+]
+
+
+def _mask_pii(value: str) -> str:
+    """Comentário de cliente vai para a planilha sem dado pessoal (e-mail, CPF, cartão, telefone). E-mail de operador
+    da EPS (if-aec/if-csu) fica."""
+    v = str(value or "")
+    if re.fullmatch(r"\s*[\w.+-]+@if-(aec|csu)\.com\.br\s*", v, re.I) or re.fullmatch(r"\s*\d{6,10}\s*", v):
+        return v.strip()  # e-mail do operador / número do caso
+    for rx, rep_ in _PII_RES:
+        v = rx.sub(rep_, v)
+    return v
+
+
+# --- Material em PPTX (apresentação da fila) ------------------------------------------------------------------------
+_DECK_RE = re.compile(r"\b(pptx|ppt|powerpoint|power point|apresentacao|apresentacoes|slide|slides|deck|material)\b")
+DECK_RED, DECK_INK, DECK_MUTED, DECK_LINE = "EA1D2C", "1F1F1F", "6B6B6B", "D9D9D9"
+
+
+def _is_deck_request(question: str) -> bool:
+    text = _norm_text(question)
+    return bool(_DECK_RE.search(text)) and bool(re.search(
+        r"\b(constroi|construa|construir|monta|monte|montar|cria|crie|criar|gera|gere|gerar|faz|faca|fazer|prepara|"
+        r"prepare|preparar|manda|mande|quero|preciso|consegue|pode|me)\b", text))
+
+
+def _deck_data(event: dict[str, Any], eps: str | None, fila: str, send_progress: Callable[[str], Any] | None):
+    """Busca em paralelo: variação do mês (mix x performance) e a série diária do CSAT da fila."""
+    cur, ref, l_cur, l_ref = _variation_periods("")
+    out: dict[str, Any] = {"labels": (l_cur, l_ref)}
+
+    def var() -> None:
+        try:
+            ans = ask_toqan(_variation_prompt(eps, fila, cur, ref), max_attempts=INTERACTIVE_MAX_POLLS)
+            out["var"] = {} if _is_error_answer(ans) else (_block_data_from_json(ans) or {})
+        except Exception:
+            logger.warning("Deck: variação falhou", exc_info=True)
+            out["var"] = {}
+
+    def serie() -> None:
+        try:
+            meta = FILA_METAS.get(fila)
+            pedido = (f"CSAT diário da fila {fila} no mês atual (dia 1 até D-1), gráfico de linha com as datas dd/mm, "
+                      f"série 'CSAT', unidade %" + (f", referencia meta {meta}" if meta is not None else ""))
+            ans = ask_toqan(_chart_prompt(eps, pedido, ""), max_attempts=INTERACTIVE_MAX_POLLS)
+            spec = {} if _is_error_answer(ans) else (_block_data_from_json(ans) or {})
+            out["png"] = _build_chart_png(spec) if spec else None
+        except Exception:
+            logger.warning("Deck: série diária falhou", exc_info=True)
+            out["png"] = None
+
+    threads = [threading.Thread(target=var, daemon=True), threading.Thread(target=serie, daemon=True)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return out
+
+
+def _build_deck(fila: str, eps: str | None, row: dict[str, Any] | None, conj: list[dict[str, Any]],
+                var: dict[str, Any], png: bytes | None, labels: tuple[str, str]) -> bytes:
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.util import Inches, Pt
+
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    blank = prs.slide_layouts[6]
+    rgb = RGBColor.from_string
+
+    def text(slide, x, y, w, h, runs, size=14, color=DECK_INK, bold=False):
+        tf = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h)).text_frame
+        tf.word_wrap = True
+        for i, line in enumerate(runs if isinstance(runs, list) else [runs]):
+            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+            parts = line if isinstance(line, list) else [(line, bold)]
+            for chunk, b in parts:
+                r = p.add_run()
+                r.text, r.font.size, r.font.bold = chunk, Pt(size), b
+                r.font.color.rgb = rgb(color)
+            p.space_after = Pt(6)
+        return tf
+
+    def header(slide, titulo, sub=""):
+        bar = slide.shapes.add_shape(1, 0, 0, prs.slide_width, Inches(0.12))
+        bar.fill.solid(); bar.fill.fore_color.rgb = rgb(DECK_RED); bar.line.fill.background()
+        text(slide, 0.5, 0.3, 12.3, 0.7, titulo, size=24, bold=True)
+        if sub:
+            text(slide, 0.5, 0.95, 12.3, 0.4, sub, size=12, color=DECK_MUTED)
+
+    def table(slide, x, y, w, rows_, widths):
+        shp = slide.shapes.add_table(len(rows_), len(rows_[0]), Inches(x), Inches(y), Inches(w),
+                                     Inches(0.36 * len(rows_)))
+        tb = shp.table
+        for j, wd in enumerate(widths):
+            tb.columns[j].width = Inches(wd)
+        for i, r in enumerate(rows_):
+            for j, v in enumerate(r):
+                c = tb.cell(i, j)
+                c.text = str(v)
+                para = c.text_frame.paragraphs[0]
+                para.runs[0].font.size = Pt(11)
+                para.runs[0].font.bold = i == 0
+                para.runs[0].font.color.rgb = rgb("FFFFFF" if i == 0 else DECK_INK)
+                c.fill.solid()
+                c.fill.fore_color.rgb = rgb(DECK_INK if i == 0 else ("F5F5F5" if i % 2 else "FFFFFF"))
+        return tb
+
+    l_cur, l_ref = labels
+    pp = lambda v: ("+" if v > 0 else "−" if v < 0 else "") + _bfmt(abs(v), 1)
+    now = _now_brazil()
+
+    # 1. capa
+    sl = prs.slides.add_slide(blank)
+    header(sl, f"{fila} · resultado e principais movimentos", f"{eps or 'iFood'} · {l_cur} · gerado pela Lyra em "
+                                                               f"{now.strftime('%d/%m às %H:%M')}")
+    c_m = n_m = c_d = n_d = imp = None
+    meta = row.get("meta") if row else None
+    if row:
+        c_m, n_m, _ = _agg([row], "mes")
+        c_d, n_d, _ = _agg([row], "d1")
+        imp = _impact(conj, [row], "mes") if len(conj) > 1 else None
+    linhas = []
+    if c_m is not None:
+        gap = (c_m - meta) if meta is not None else None
+        linhas.append([("CSAT do mês: ", False), (f"{_bfmt(c_m)}%", True), (f" (n={_fmt_int(n_m)})", False)]
+                      + ([(f" contra meta de {_fmt_meta(meta)}% — {pp(gap)} p.p.", False)] if gap is not None else []))
+        if c_d is not None and n_d:
+            linhas.append(f"D-1: {_bfmt(c_d)}% (n={_fmt_int(n_d)}).")
+        if imp is not None:
+            linhas.append(f"Impacto no consolidado da {eps}: {pp(imp)} p.p.")
+        if row.get("motivo_mes"):
+            linhas.append(f"Motivo de maior impacto no mês: {row['motivo_mes']}"
+                          + (f" ({row.get('motivo_mes_pp')} p.p.)" if row.get("motivo_mes_pp") not in (None, "") else "") + ".")
+    c_ref, c_cur = _num(var.get("csat_ref")), _num(var.get("csat_atual"))
+    if c_ref is not None and c_cur is not None:
+        linhas.append(f"Contra {l_ref}: {_bfmt(c_ref)}% → {_bfmt(c_cur)}% ({pp(c_cur - c_ref)} p.p.).")
+    text(sl, 0.5, 1.6, 5.6 if png else 12.3, 4.5, linhas or ["Sem dados da fila no período."], size=15)
+    destaque = ""
+    if c_m is not None and meta is not None:
+        destaque = ("Fila na meta no mês." if c_m >= meta else
+                    f"Fila {_bfmt(meta - c_m)} p.p. abaixo da meta no mês.")
+    if destaque:
+        text(sl, 0.5, 6.3, 5.6 if png else 12.3, 0.6, destaque, size=16, bold=True, color=DECK_RED)
+    if png:
+        sl.shapes.add_picture(io.BytesIO(png), Inches(6.4), Inches(1.5), width=Inches(6.5))
+
+    # 2. principais movimentos
+    if var:
+        sl = prs.slides.add_slide(blank)
+        mix, perf = _num(var.get("mix_pp")), _num(var.get("performance_pp"))
+        header(sl, "Principais movimentos", f"{l_ref} → {l_cur} · efeito mix (tipo de contato) x efeito performance "
+                                            "(atendimento do mesmo motivo)")
+        resumo = []
+        if mix is not None and perf is not None:
+            resumo.append([("Efeito mix: ", False), (f"{pp(mix)} p.p.", True), ("   ·   Efeito performance: ", False),
+                           (f"{pp(perf)} p.p.", True)])
+        rr_ref, rr_cur = _num(var.get("rr_ref")), _num(var.get("rr_atual"))
+        if rr_ref is not None and rr_cur is not None:
+            resumo.append(f"Response rate: {_bfmt(rr_ref)}% → {_bfmt(rr_cur)}% ({pp(rr_cur - rr_ref)} p.p.).")
+        n_r, n_c = _num(var.get("n_ref")), _num(var.get("n_atual"))
+        if n_r and n_c and (n_c / n_r > 2 or n_c / n_r < 0.5):
+            resumo.append(f"Atenção: a amostra mudou muito ({_fmt_int(n_r)} → {_fmt_int(n_c)} avaliações).")
+        text(sl, 0.5, 1.5, 12.3, 1.0, resumo, size=14)
+        perf_rows = [["Motivo", "CSAT antes", "CSAT agora", "Efeito (p.p.)"]]
+        for m in sorted([m for m in (var.get("top_performance") or []) if isinstance(m, dict)],
+                        key=lambda m: _num(m.get("efeito_pp")) or 0)[:6]:
+            perf_rows.append([_motivo_label(m.get("motivo")), f"{_bfmt(_num(m.get('csat_ref')) or 0)}%",
+                              f"{_bfmt(_num(m.get('csat_atual')) or 0)}%", pp(_num(m.get("efeito_pp")) or 0)])
+        mix_rows = [["Motivo", "Particip. antes", "Particip. agora", "Efeito (p.p.)"]]
+        for m in (var.get("top_mix") or [])[:6]:
+            if not isinstance(m, dict):
+                continue
+            sr, sa, cm = _num(m.get("share_ref")), _num(m.get("share_atual")), _num(m.get("csat_ref"))
+            ef = (sa - sr) / 100 * (cm - c_ref) if None not in (sr, sa, cm, c_ref) else (_num(m.get("efeito_pp")) or 0)
+            mix_rows.append([_motivo_label(m.get("motivo")), f"{_bfmt(sr or 0)}%", f"{_bfmt(sa or 0)}%", pp(ef)])
+        text(sl, 0.5, 2.6, 6.0, 0.4, "Performance por motivo", size=13, bold=True)
+        if len(perf_rows) > 1:
+            table(sl, 0.5, 3.0, 6.0, perf_rows, [2.7, 1.1, 1.1, 1.1])
+        text(sl, 6.8, 2.6, 6.0, 0.4, "Mix de motivos", size=13, bold=True)
+        if len(mix_rows) > 1:
+            table(sl, 6.8, 3.0, 6.0, mix_rows, [2.4, 1.2, 1.2, 1.2])
+        if c_ref is not None and c_cur is not None and perf is not None and mix is not None:
+            if c_cur >= c_ref:
+                lei = "O CSAT não caiu contra a referência."
+            elif abs(mix) >= abs(c_cur - c_ref) * MIX_DOMINANT_SHARE:
+                lei = "A queda vem do mix: chegou mais contato de motivo com CSAT naturalmente menor."
+            else:
+                lei = f"A queda vem do atendimento (performance {pp(perf)} p.p.): é o que a EPS precisa atacar."
+            text(sl, 0.5, 6.5, 12.3, 0.6, lei, size=15, bold=True, color=DECK_RED)
+
+    # 3. o que cobrar
+    sl = prs.slides.add_slide(blank)
+    header(sl, "Próximos passos", "o que cobrar da operação e o que acompanhar")
+    passos = []
+    if c_m is not None and meta is not None and c_m < meta:
+        passos.append(f"Plano para fechar {_bfmt(meta - c_m)} p.p. de gap no mês: ação · responsável · prazo.")
+    top_p = sorted([m for m in (var.get("top_performance") or []) if isinstance(m, dict)],
+                   key=lambda m: _num(m.get("efeito_pp")) or 0)[:2] if var else []
+    for m in top_p:
+        if (_num(m.get("efeito_pp")) or 0) < 0:
+            passos.append(f"Atacar o atendimento de {_motivo_label(m.get('motivo'))}: CSAT "
+                          f"{_bfmt(_num(m.get('csat_ref')) or 0)}% → {_bfmt(_num(m.get('csat_atual')) or 0)}%.")
+    passos.append("Esteira de impacto por pilar (operador, tempo, política, parceiro, produto): peça à Lyra na thread.")
+    text(sl, 0.5, 1.6, 12.3, 5.0, ["• " + p for p in passos], size=16)
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def _send_deck(event: dict[str, Any], client: Any, eps: str | None, question: str,
+               send_progress: Callable[[str], Any] | None = None) -> str | None:
+    fila = _fila_ref(question, eps, event)
+    if not fila:
+        return ("Monto sim! Me diz de qual fila (ex.: Review, Suporte, Super Cliente) que eu trago resultado do mês, "
+                "movimentos de mix e performance e o que cobrar, em pptx.")
+    try:
+        rows = _day_table() or []
+    except Exception:
+        rows = []
+    row = next((r for r in rows if r.get("fila") == fila), None)
+    conj = [r for r in rows if row and r.get("eps") == row.get("eps")]
+    data = _deck_data(event, eps, fila, send_progress)
+    if not row and not data.get("var"):
+        return "Não consegui puxar os dados da fila agora. Tenta de novo em alguns minutos?"
+    try:
+        pptx_bytes = _build_deck(fila, eps or (row or {}).get("eps"), row, conj, data.get("var") or {},
+                                 data.get("png"), data["labels"])
+    except Exception:
+        logger.exception("Deck build failed")
+        return "Montei os dados, mas o arquivo falhou na geração. Já avisei o time."
+    nome = re.sub(r"[^\w\-]+", "_", f"Lyra_{fila}_{_now_brazil().strftime('%d-%m')}")[:60] + ".pptx"
+    (client or slack_app.client).files_upload_v2(
+        channel=event.get("channel"), thread_ts=_reply_ts(event), content=pptx_bytes, filename=nome,
+        title=f"{fila} · resultado e movimentos",
+        initial_comment=f"📎 Material de `{fila}`: resultado do mês, mix x performance por motivo e próximos passos.")
+    return None
+
 
 _DATA_EXCEL_RE = re.compile(r"\b(excel|xls|xlsx|planilha|csv|tabela em arquivo|arquivo)\b")
 
@@ -4655,7 +5091,9 @@ def _kb_context(query: str) -> str:
 _TRAINING_RE = re.compile(
     r"\bquem\b[^?]{0,40}\b(trein\w*|reciclag\w*|capacit\w*|feedback|acompanhar|desenvolver)\b"
     r"|\b(lista|prioridade|plano|sugest\w*|indica\w*)\b[^?]{0,20}\b(treinamento|reciclagem|capacitacao)\b"
-    r"|\b(preciso|quero|vou|devo|bora)\b[^?]{0,20}\b(treinar|reciclar|capacitar)\b")
+    r"|\b(preciso|quero|vou|devo|bora)\b[^?]{0,20}\b(treinar|reciclar|capacitar)\b"
+    r"|\b(tema|temas|assunto|assuntos|ponto|pontos|o que|foco)\b[^?]{0,30}\b(trein\w*|reciclag\w*|capacit\w*)\b"
+    r"|\b(trein\w*|reciclag\w*|capacit\w*)\b[^?]{0,30}\b(focar|foco|priorizar|prioridade)\b")
 TRAINING_INSTRUCTION = (
     "INFORMAÇÃO INTERNA PARA A LYRA — PEDIDO DE TREINAMENTO da fila {fila}. Treinamento bom ataca um problema da "
     "operação; não entregue só a lista dos piores. Faça nesta ordem:\n"
@@ -4669,6 +5107,10 @@ TRAINING_INSTRUCTION = (
     "diga que manda a planilha completa e mostre os 10 primeiros.\n"
     "4. *Monte:* problema (com número) → o que treinar (conteúdo concreto, a partir dos comentários) → quem (nominal) → "
     "como medir (indicador e prazo, ex.: CSAT do motivo em 2 semanas).\n"
+    "A resposta SEMPRE abre com a seção *Motivos ofensores*: os 3 motivos de contato que mais tiram CSAT da fila no "
+    "período, cada um com participação nas avaliações, CSAT do motivo (n) e impacto em p.p. no CSAT da fila. Depois, "
+    "cada tema de treinamento diz a qual motivo ofensor ele responde (tema sem motivo ligado só entra se o comentário "
+    "mostrar o problema em vários motivos, e aí diga isso).\n"
     "Seja crítica: amostra pequena, operador com n baixo, ou causa fora do operador precisam ser ditos.\n\n")
 
 
@@ -4979,6 +5421,64 @@ def _is_cause_request(question: str) -> bool:
 
 
 _MIX_ONLY_RE = re.compile(r"\bmix\b")
+_D1_RE = re.compile(r"\b(ontem|d ?- ?1|d1|dia anterior)\b")
+
+
+def _d1_context(question: str, event: dict[str, Any]) -> bool:
+    """A conversa é sobre ontem (D-1)? Pela pergunta ou, se ela não disser o período, pelo que veio antes na thread."""
+    q = _norm_text(question)
+    if _D1_RE.search(q):
+        return True
+    if re.search(r"\b(mes|semana|novembro|outubro|dezembro|janeiro|mtd)\b", q) or not event.get("thread_ts"):
+        return False
+    try:
+        ctx = _norm_text(_thread_context(event)[-2500:])
+    except Exception:
+        return False
+    d1 = [m.start() for m in _D1_RE.finditer(ctx)]
+    mes = [m.start() for m in re.finditer(r"\b(mes|mtd)\b", ctx)]
+    return bool(d1) and (not mes or d1[-1] > mes[-1])
+
+
+def _above_meta_note(fila: str | None, eps: str | None, kind: str) -> str | None:
+    """Fila que bateu a própria meta no período: explica que o impacto negativo no consolidado é de peso (fila de meta
+    baixa), não de desempenho, e aponta quem ficou abaixo da própria meta. None = fila abaixo da meta (segue a análise)."""
+    if not fila:
+        return None
+    try:
+        rows = _day_table() or []
+    except Exception:
+        return None
+    row = next((r for r in rows if r.get("fila") == fila), None)
+    if not row or row.get("meta") is None or not row.get(f"{kind}_aval"):
+        return None
+    c, n, _ = _agg([row], kind)
+    if c is None or c < row["meta"]:
+        return None
+    conj = [r for r in rows if r.get("eps") == row.get("eps")]
+    total, n_tot, meta_cons = _agg(conj, kind)
+    imp = _impact(conj, [row], kind) if len(conj) > 1 else None
+    per = "ontem" if kind == "d1" else "no mês"
+    linhas = [f"`{fila}` não foi mal pra régua dela: {per} fez {_bfmt(c)}% (n={_fmt_int(n)}), acima da meta de "
+              f"{_fmt_meta(row['meta'])}%."]
+    if imp is not None and imp < 0 and meta_cons is not None:
+        linhas.append(f"O impacto de {f'{imp:+.2f}'.replace('.', ',').replace('-', '−')} p.p. "
+                      f"no consolidado da {row.get('eps')} é de peso, não de desempenho: a meta dela é bem mais baixa que a "
+                      f"consolidada ({_bfmt(meta_cons)}%), então na régua de impacto ela sempre aparece puxando pra baixo "
+                      f"quando tem volume.")
+    abaixo = []
+    for r in conj:
+        rc, rn, _ = _agg([r], kind)
+        if rc is not None and r.get("meta") is not None and rc < r["meta"] and n_tot:
+            abaixo.append((rn / n_tot * (rc - r["meta"]), r["fila"], rc, rn, r["meta"]))
+    abaixo.sort()
+    if abaixo:
+        linhas.append(f"Quem ficou abaixo da própria meta {per}: " + "; ".join(
+            f"`{f}` {_bfmt(rc)}% x {_fmt_meta(m)}% (n={_fmt_int(rn)})" for _, f, rc, rn, m in abaixo[:3])
+            + ". Quer que eu abra a causa de alguma delas?")
+    else:
+        linhas.append(f"Todas as filas da {row.get('eps')} bateram a própria meta {per}.")
+    return "\n".join(linhas)
 _SEGMENT_SUPER_RE = re.compile(r"\b(super|super cx|cx super|vip|platin\w*)\b")
 
 
@@ -5039,6 +5539,40 @@ def _esteira_on_demand_prompt(eps: str | None, fila: str, day: date, d1_only: bo
     )
 
 
+_N3_LINE_RE = re.compile(r"^.*(ESCALAR\s*N3\s*:|\b(sinaliz\w*|levar|encaminh\w*)\b[^\n]{0,60}\b(revis[aã]o\s+)?N3\b).*$",
+                         re.I | re.M)
+
+
+def _route_n3_flags(answer: str, origem: str, event: dict[str, Any] | None = None) -> str:
+    """Sinal sensível (discriminação, fraude, assédio...) NÃO vai na thread: sai da resposta e vai por alerta privado
+    para o time (com o que a Lyra viu e os tickets), para o N3 avaliar."""
+    text = str(answer or "")
+    # bloco "⚠️ Sinalização N3" com o conteúdo em bullets nas linhas seguintes: sai o bloco inteiro
+    lines, keep, flags, i = text.splitlines(), [], [], 0
+    while i < len(lines):
+        line = lines[i]
+        if _N3_LINE_RE.match(line):
+            flags.append(line.strip())
+            i += 1
+            while i < len(lines) and re.match(r"\s*([•\-–*]|\d+[.)])\s+", lines[i]):
+                flags.append(lines[i].strip())
+                i += 1
+            continue
+        keep.append(line)
+        i += 1
+    if not flags:
+        return text
+    text = "\n".join(keep)
+    link = ""
+    if event:
+        link = _permalink(str(event.get("channel") or ""), str(event.get("thread_ts") or event.get("ts") or ""))
+    itens = [re.sub(r"^[•\-–*\s]+", "", re.sub(r"(?i)ESCALAR\s*N3\s*:\s*", "", f)) for f in flags[:8]]
+    itens = [i for i in itens if i and not re.fullmatch(r"\W*\*?\s*sinaliza\w*\s+N3\s*\*?\W*", i, re.I)]
+    _alert("🚨 *Para o N3 avaliar* — " + origem + (f" (<{link}|conversa>)" if link else "") + "\n"
+           + "\n".join("• " + i for i in itens))
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 def _post_esteira_on_demand(event: dict[str, Any], eps: str | None, question: str) -> bool:
     """Pergunta de causa ('por que o CSAT caiu?'): posta a esteira de impacto da fila na thread. True = postou."""
     block = _report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or ""))
@@ -5050,6 +5584,7 @@ def _post_esteira_on_demand(event: dict[str, Any], eps: str | None, question: st
     day = _today_brazil().date() - timedelta(days=1)
     try:
         answer = ask_toqan(_esteira_on_demand_prompt(eps, fila, day, d1_only), max_attempts=ESTEIRA_MAX_POLLS)
+        answer = _route_n3_flags(answer, f"esteira de `{fila}` ({eps or 'iFood'})", event)
         if _is_error_answer(answer):
             return False
         data = _block_data_from_json(answer) or {}
@@ -5147,7 +5682,8 @@ def _motivo_label(raw: Any) -> str:
     return text
 
 
-def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref: str) -> str | None:
+def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref: str,
+                      with_esteira: bool = True) -> str | None:
     c_ref, c_cur = _num(data.get("csat_ref")), _num(data.get("csat_atual"))
     if c_ref is None or c_cur is None:
         return None
@@ -5170,20 +5706,33 @@ def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref
     if data.get("n_ref") is not None and data.get("n_atual") is not None:
         n_txt = f" · n {_fmt_int(_num(data['n_ref']) or 0)} → {_fmt_int(_num(data['n_atual']) or 0)}"
     lines.append(f"CSAT *{_bfmt(c_ref)}% → {_bfmt(c_cur)}%* ({sign(total)} p.p.){n_txt}")
+    n_ref_v, n_cur_v = _num(data.get("n_ref")), _num(data.get("n_atual"))
+    if n_ref_v and n_cur_v and (n_cur_v / n_ref_v > 2 or n_cur_v / n_ref_v < 0.5):
+        lines.append(f"⚠️ A amostra mudou muito ({_fmt_int(n_ref_v)} → {_fmt_int(n_cur_v)} avaliações): pode ser mudança "
+                     "de roteamento ou de fila entre os períodos. Leia a comparação com cuidado.")
     if mix is not None:
         lines.append("")
-        lines.append(f"🔀 *Efeito mix: {sign(mix)} p.p.* — mudou o tipo de contato que chegou")
-        lines.append(f"_participação de cada motivo nas avaliações: {t_ref} → {t_cur}_")
-        top_mix = sorted([m for m in (data.get("top_mix") or []) if isinstance(m, dict)],
-                         key=lambda m: (_num(m.get("efeito_pp")) or 0) * (1 if mix > 0 else -1), reverse=True)
-        for m in top_mix[:3]:
-            part = (f"• {_motivo_label(m.get('motivo'))}: {_bfmt(_num(m.get('share_ref')) or 0)}% → "
-                    f"{_bfmt(_num(m.get('share_atual')) or 0)}% das avaliações")
-            if m.get("csat_ref") is not None:
-                part += f" (CSAT {_bfmt(_num(m['csat_ref']) or 0)}%)"
-            if m.get("efeito_pp") is not None:
-                part += f" · {sign(_num(m['efeito_pp']) or 0)} p.p."
-            lines.append(part)
+        rows_mix = []
+        for m in (data.get("top_mix") or []):
+            if not isinstance(m, dict):
+                continue
+            sr, sa, cm = _num(m.get("share_ref")), _num(m.get("share_atual")), _num(m.get("csat_ref"))
+            # efeito do motivo no CSAT da fila = Δ participação × (CSAT do motivo − CSAT da fila), recalculado aqui
+            ef = (sa - sr) / 100 * (cm - c_ref) if None not in (sr, sa, cm) else _num(m.get("efeito_pp"))
+            rows_mix.append((ef, m, sr, sa, cm))
+        if abs(mix) < 0.1:
+            lines.append(f"🔀 *Efeito mix: {sign(mix)} p.p.* — o tipo de contato que chegou praticamente não mudou")
+        else:
+            lines.append(f"🔀 *Efeito mix: {sign(mix)} p.p.* — mudou o tipo de contato que chegou")
+            lines.append(f"_participação de cada motivo nas avaliações: {t_ref} → {t_cur} · p.p. = efeito no CSAT da fila_")
+            rows_mix.sort(key=lambda x: (x[0] or 0) * (1 if mix > 0 else -1), reverse=True)
+            for ef, m, sr, sa, cm in rows_mix[:3]:
+                part = (f"• {_motivo_label(m.get('motivo'))}: {_bfmt(sr or 0)}% → {_bfmt(sa or 0)}% das avaliações")
+                if cm is not None:
+                    part += f" (CSAT {_bfmt(cm)}%)"
+                if ef is not None:
+                    part += f" · {sign(ef)} p.p."
+                lines.append(part)
     if perf is not None:
         lines.append("")
         lines.append(f"🎯 *Efeito performance: {sign(perf)} p.p.* — mudou o atendimento do mesmo motivo")
@@ -5216,9 +5765,13 @@ def _render_variation(fila: str, data: dict[str, Any], label_cur: str, label_ref
                      "naturalmente menor, e o atendimento de cada motivo se manteve. Não é caso de plano de ação da EPS; "
                      "é contexto para acompanhar o volume desses motivos.")
     elif perf is not None:
-        quem = (f"o efeito performance ({sign(perf)} p.p.) e os pilares Operador e Tempo da esteira"
-                if perf < 0 else "os pilares Operador e Tempo da esteira (a performance não piorou)")
-        lines.append(f"👉 *Da EPS cobrar:* {quem}. Mix e amostra são contexto, não culpa da operação.")
+        if with_esteira:
+            quem = (f"o efeito performance ({sign(perf)} p.p.) e os pilares Operador e Tempo da esteira"
+                    if perf < 0 else "os pilares Operador e Tempo da esteira (a performance não piorou)")
+            lines.append(f"👉 *Da EPS cobrar:* {quem}. Mix e amostra são contexto, não culpa da operação.")
+        else:
+            lines.append(f"👉 *Leitura:* a queda veio do atendimento (efeito performance {sign(perf)} p.p.), não do mix. "
+                         "Quer que eu traga a esteira de impacto pra ver em quais pilares (operador, tempo, política...)?")
     return "\n".join(lines)
 
 
@@ -7579,6 +8132,15 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
         asks = _is_question_like(question)
         analytical = _is_analytical(question)  # "por que", "quem piorou", "quanto contribuiu": análise livre
         progress = _Progress(event)
+        if _is_case_list_request(question):
+            event["_route"] = "avaliacoes"
+            _say(say, f"Vou montar a base caso a caso de {({'csat': 'CSAT', 'sla': 'SLA de 1ª resposta', 'tma': 'TMA'})[_case_indicator(question)]} "
+                      "e a abertura por operador. Leva alguns minutos ⏳", event, in_thread=True)
+            problem = _send_case_list(event, client, eps, question)
+            progress.done()
+            if problem:
+                _say(say, problem, event, in_thread=True)
+            return
         if _is_team_request(question) and not analytical and (asks or not in_report_thread):
             event["_route"] = "equipe"
             progress("Vou montar o resultado da equipe, já te mando. ⏳")
@@ -7633,6 +8195,18 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 _say(say, problem, event, in_thread)
             return
 
+        if _is_deck_request(question):
+            event["_route"] = "material"
+            fila_d = _fila_ref(question, eps, event)
+            if fila_d:
+                _say(say, f"Bora! Vou montar o material de `{fila_d}` em pptx: resultado do mês, movimentos de mix e "
+                          "performance e próximos passos. Leva alguns minutos ⏳", event, in_thread=True)
+            problem = _send_deck(event, client, eps, question)
+            progress.done()
+            if problem:
+                _say(say, problem, event, in_thread=True)
+            return
+
         if _is_chart_request(question):
             event["_route"] = "grafico"
             _say(say, "Vou montar o gráfico, já te mando aqui. ⏳", event, in_thread=True)
@@ -7652,23 +8226,41 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
         send_progress = progress  # uma mensagem de andamento só, editada e apagada quando a resposta chega
 
         extra = ""
+        if re.search(r"\besteira\b", _norm_text(question)):
+            fila_e = _fila_ref(question, eps, event)
+            if fila_e:
+                d1_e = _d1_context(question, event)
+                _say(say, f"Vou montar a esteira de impacto de `{fila_e}` ({'D-1' if d1_e else 'mês'}). Leva alguns minutos ⏳",
+                     event, in_thread=True)
+                ok = _post_esteira_on_demand(event, eps, f"{question} ontem" if d1_e else question)
+                progress.done()
+                if not ok:
+                    _say(say, f"Não consegui montar a esteira de `{fila_e}` agora. Tenta de novo daqui a pouco?", event,
+                         in_thread=True)
+                return
         if _is_cause_request(question):
             fila_q = _fila_ref(question, eps, event)
             mix_only = bool(_MIX_ONLY_RE.search(_norm_text(question)))
+            d1_ctx = _d1_context(question, event)
             block_q = _report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or ""))
             if fila_q or block_q:
                 # esteira (Qualidade) em paralelo com a análise de variação (Indicadores): a pessoa não fica esperando
                 fila_v = block_q[1].get("fila") if block_q else fila_q
+                note = None if mix_only else _above_meta_note(fila_v, eps, "d1" if d1_ctx else "mes")
+                if note:  # a fila bateu a própria meta: o "ruim" é peso no consolidado, não desempenho
+                    progress.done()
+                    _say(say, note, event, in_thread=True)
+                    return
                 _say(say, (f"Vou olhar o mix de motivos de `{fila_v}` (este mês x referência). Já te trago ⏳" if mix_only else
                            f"Vou levantar as causas em `{fila_v}`: primeiro a variação (mix de motivos e response rate); "
                            "se não for só mix, em seguida a esteira de impacto por pilar. Leva alguns minutos ⏳"),
                      event, in_thread=True)
-                cur, ref, l_cur, l_ref = _variation_periods(question)
+                cur, ref, l_cur, l_ref = _variation_periods(f"{question} ontem" if d1_ctx else question)
                 var_answer = ask_toqan(_variation_prompt(eps, fila_v, cur, ref), progress_callback=send_progress,
                                        max_attempts=INTERACTIVE_MAX_POLLS)
                 progress.done()
                 var_data = {} if _is_error_answer(var_answer) else (_block_data_from_json(var_answer) or {})
-                rendered = _render_variation(fila_v, var_data, l_cur, l_ref) if var_data else None
+                rendered = _render_variation(fila_v, var_data, l_cur, l_ref, with_esteira=not mix_only) if var_data else None
                 if rendered:
                     _say_sections(say, rendered, event)
                     rose = (_num(var_data.get("csat_atual")) or 0) >= (_num(var_data.get("csat_ref")) or 0)
@@ -7738,6 +8330,8 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             _remember_answer(prompt, answer)
         _passive_access_check(answer)
         answer = _strip_file_promises(answer)
+        answer = _route_n3_flags(answer, f"pergunta de {_first_name(str(event.get('user') or '')) or 'alguém'}: "
+                                          f"_{question[:120]}_", event)
         esc_q = _parse_escalation(answer or "")
         if esc_q:  # dúvida que a base não responde: chama o dono do tema de verdade (e aprende com a resposta)
             answer = re.split(r"`?ESCALAR\s*:", answer, maxsplit=1)[0].strip()
