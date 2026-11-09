@@ -540,7 +540,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.26.5"
+APP_VERSION = "5.26.7"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -4474,6 +4474,14 @@ _DATA_WORDS_RE = re.compile(r"\b(csat|tma|tmi|nps|meta|plan|report|volume|quadra
 _SPEAKER_CACHE: dict[str, str] = {}
 
 
+def _first_name(user: str) -> str:
+    """Primeiro nome da pessoa no Slack (cache em memória); vazio se não achar."""
+    if not user:
+        return ""
+    _speaker_line({"user": user})
+    return _SPEAKER_CACHE.get(user) or ""
+
+
 def _speaker_line(event: dict[str, Any]) -> str:
     """Primeiro nome de quem está falando, para a Lyra conversar como gente (cache em memória)."""
     user = str(event.get("user") or "")
@@ -4738,7 +4746,30 @@ COMBO_INSTRUCTION = (
     "(1) as equipes ruins NOS DOIS (CSAT abaixo da meta E TMA acima do plan), da pior para a melhor; (2) se nenhuma for "
     "ruim nos dois, a pior em cada um, dizendo que são equipes diferentes; (3) o tamanho do desvio de cada uma "
     "(p.p. e segundos). Operadores sem supervisor no MOP não são uma equipe: chame de 'sem supervisor cadastrado no MOP' "
-    "e aponte como lacuna de cadastro, fora do ranking.\n\n")
+    "e aponte como lacuna de cadastro, fora do ranking.\n"
+    "Se a pergunta for por ANALISTA/OPERADOR (não por equipe), siga a regra de TMA POR ANALISTA abaixo.\n\n")
+
+
+# TMA por analista: o dado existe (entradas_filas tem o e-mail de quem atendeu) — nunca dizer que só há por fila
+_ANALYST_TMA_RE = re.compile(r"(?=.*\btma\b)(?=.*\b(analista\w*|operador\w*|atendente\w*|agente\w*)\b)")
+ANALYST_TMA_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA — TMA POR ANALISTA: o TMA EXISTE por analista. Peça à Lyra Indicadores "
+    "`Pedido: TMA por analista` (seção 7.1d dela), com o período da conversa (mês até D-1, se não disser) e, se a conversa "
+    "já trouxe uma lista de operadores, a linha `Só estes operadores (e-mails): ...`. Nunca responda que o TMA só existe "
+    "por fila. Para 'quem mais impacta': impacto no TMA da EPS em segundos (tirar o analista e ver para onde iria o "
+    "TMA), do maior para o menor; compare cada um com o TMA da fila pela mesma régua e com o plan da fila. Traga também "
+    "o TMA consolidado da EPS (sai do SQL oficial — nunca diga que não está disponível). Se a pergunta cruza CSAT e TMA, "
+    "faça os dois rankings por analista (top 3 de cada, como pedido) e diga quem aparece nos dois.\n\n")
+
+
+# "desses mesmos operadores": a lista é a da resposta anterior, inteira
+_SAME_SET_RE = re.compile(r"\b(mesm[oa]s|desses|destes|dessas|destas|esses|estes|essas|estas)\s+(\w+\s+)?"
+                          r"(operador\w*|analista\w*|atendente\w*|pessoas|nomes|agentes)\b")
+SAME_SET_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA: a pessoa se refere aos MESMOS operadores de uma resposta anterior desta conversa. "
+    "Pegue os e-mails dessa resposta e peça à Lyra Indicadores só eles (`Só estes operadores (e-mails): ...`) com "
+    "`Lista: completa` — mostre TODOS, um por um, sem corte de 15. Quem não atingir o mínimo de avaliações aparece no "
+    "fim com '(amostra pequena, n=X)'; quem não tiver avaliação no período aparece como 'sem avaliações no período'.\n\n")
 
 
 CHAT_INSTRUCTION = (
@@ -7616,6 +7647,12 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 event.get("thread_ts") and re.search(r"\btma\b|\bcsat\b", _norm_text(question))
                 and _COMBO_RE.search(_norm_text(_thread_context(event)[-1500:])))):
             extra = COMBO_INSTRUCTION
+            if re.search(r"\b(analista\w*|operador\w*)\b", _norm_text(question)):
+                extra += ANALYST_TMA_INSTRUCTION
+        elif not extra and (_ANALYST_TMA_RE.search(_norm_text(question)) or (
+                event.get("thread_ts") and re.search(r"\btma\b", _norm_text(question))
+                and _SAME_SET_RE.search(_norm_text(question)))):
+            extra = ANALYST_TMA_INSTRUCTION
         elif not extra and event.get("_training"):
             extra = TRAINING_INSTRUCTION.format(fila=event["_training"])
         elif not extra and event.get("_training_theme"):
@@ -7629,7 +7666,8 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                   f"{ANSWER_LAYOUT_INSTRUCTION}{_learnings_instruction(eps)}{_table_context(eps)}"
                   f"{_inject_mop_context(question, eps)}"
                   f"{_kb_context(question) if extra == KNOWLEDGE_INSTRUCTION else ''}"
-                  f"{NOMINAL_INSTRUCTION if _NOMINAL_RE.search(_norm_text(question)) else ''}")
+                  f"{NOMINAL_INSTRUCTION if _NOMINAL_RE.search(_norm_text(question)) else ''}"
+                  f"{SAME_SET_INSTRUCTION if event.get('thread_ts') and _SAME_SET_RE.search(_norm_text(question)) else ''}")
         is_plan = extra == PLAN_INSTRUCTION
         if is_plan:
             prompt = _plan_context(question, eps) + prompt
@@ -7673,7 +7711,8 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             _say_sections(say, answer, event, in_thread)
         else:
             _say(say, answer or EMPTY_ANSWER_MESSAGE, event, in_thread)
-        if _NOMINAL_RE.search(_norm_text(question)) and re.search(r"ficaram de fora|planilha|excel|lista completa",
+        if (_NOMINAL_RE.search(_norm_text(question)) or (event.get("thread_ts") and _SAME_SET_RE.search(_norm_text(question)))) \
+                and re.search(r"ficaram de fora|limite de exibi|nao aparecem|não aparecem|planilha|excel|lista completa",
                                                                   _norm_text(answer or "")):
             # nominal grande: manda a lista completa em planilha sem a pessoa precisar pedir de novo
             _say(say, "Segue a lista completa em planilha, já te mando aqui. ⏳", event, in_thread=True)
@@ -8374,6 +8413,10 @@ def _cread(channel: str, root: str, eps: str) -> None:
         return
     new_ts = {str(m.get("ts")) for m in new}
     title = _strip_md(str(msgs[0].get("text") or ""))[:150]
+    parent_user = str(msgs[0].get("user") or "")
+    # thread aberta pela EPS que não é controle de hora em hora = report/informativo da EPS para o iFood: não se cobra
+    eps_report = bool(parent_user) and not _is_ifood_user(parent_user) and not msgs[0].get("bot_id") \
+        and not _is_control_title(title) and bool(_EPS_REPORT_RE.search(_norm_text(title)))
     lines = []
     for m in msgs[-40:]:
         is_bot = m.get("bot_id") or (bot and m.get("user") == bot)
@@ -8386,13 +8429,17 @@ def _cread(channel: str, root: str, eps: str) -> None:
         f"Conversa no canal de indicadores da {eps} (thread \"{title}\"). Cada linha diz se quem fala é do iFood ou da "
         "EPS. Leia as mensagens marcadas [NOVA] (as outras são contexto) e extraia SÓ:\n"
         "- cobranca_ifood: alguém do iFood cobrando/perguntando algo à EPS (ex.: 'estamos com fila em Review, o que "
-        "está acontecendo?'). Informe o ts da mensagem e se a EPS JÁ respondeu depois dela.\n"
+        "está acontecendo?'). Informe o ts da mensagem, se a EPS JÁ respondeu depois dela, se é cobrança de PROBLEMA "
+        "(indicador ruim, fila, falha: precisa de plano) ou só pedido/pergunta, e em 'reforco' UMA frase curta para "
+        "reforçar se ficar sem resposta, adequada ao que foi pedido (pedido de ação: 'Conseguem confirmar quando isso "
+        "foi feito?'; problema: 'Qual a situação, o que está sendo feito e até que horas?'). Comentário, elogio ou "
+        "agradecimento do iFood NÃO é cobrança.\n"
         "- compromisso: alguém da EPS prometendo algo com prazo de hora HOJE (ex.: 'normaliza até 14h', 'até 15h "
         "mando o plano'). Prazo no formato HH:MM. Sem hora clara, ignore.\n"
         "- problema: problema operacional relatado (sistema fora, instabilidade, pico, falta de gente, ferramenta).\n"
         "Ignore atualização de indicador de hora em hora (status, CSAT/SLA, prints): isso já é lido em outro lugar.\n"
         "Formato: {\"itens\": [{\"tipo\": \"cobranca_ifood\", \"ts\": \"...\", \"de\": \"<@U...>\", \"para\": "
-        "[\"<@U...>\"], \"texto\": \"...\", \"respondida\": false}, {\"tipo\": \"compromisso\", \"ts\": \"...\", "
+        "[\"<@U...>\"], \"texto\": \"...\", \"respondida\": false, \"problema\": true, \"reforco\": \"...\"}, {\"tipo\": \"compromisso\", \"ts\": \"...\", "
         "\"quem\": \"<@U...>\", \"o_que\": \"...\", \"prazo\": \"14:00\"}, {\"tipo\": \"problema\", \"resumo\": \"...\"}], "
         "\"resumo\": \"1 linha do que aconteceu nas mensagens novas (ou vazio se for só conversa)\"}\n\n"
         "Conversa:\n" + "\n".join(lines)
@@ -8407,10 +8454,11 @@ def _cread(channel: str, root: str, eps: str) -> None:
     problemas = []
     for it in data.get("itens") or []:
         tipo = str(it.get("tipo") or "")
-        if tipo == "cobranca_ifood" and not it.get("respondida") and str(it.get("ts")) in new_ts:
+        if tipo == "cobranca_ifood" and not it.get("respondida") and str(it.get("ts")) in new_ts and not eps_report:
             _pending_add({"k": "cobr", "ch": channel, "root": root, "eps": eps, "title": title,
                           "ts": str(it.get("ts")), "de": _uid(it.get("de")), "para": [_uid(x) for x in it.get("para") or []],
-                          "texto": str(it.get("texto") or "")[:300],
+                          "texto": str(it.get("texto") or "")[:300], "problema": bool(it.get("problema", True)),
+                          "reforco": str(it.get("reforco") or "")[:200],
                           "due": (now + timedelta(minutes=CREAD_FOLLOWUP_MINUTES)).timestamp()})
         elif tipo == "compromisso" and str(it.get("ts")) in new_ts:
             mh = re.match(r"\s*(\d{1,2})(?:\s*[:h]\s*(\d{2}))?", str(it.get("prazo") or ""))
@@ -8428,6 +8476,10 @@ def _cread(channel: str, root: str, eps: str) -> None:
     if resumo or problemas:
         _daylog_add(eps, {"h": now.strftime("%H:%M"), "t": title[:80], "r": resumo[:240], "p": problemas,
                           "link": _permalink(channel, root)})
+
+
+_EPS_REPORT_RE = re.compile(r"\b(report|relatorio|close the loop\w*|devolutiva|monitoria|diagnostico|analise|"
+                            r"resultado\w*|resumo|book|fechamento)\b")
 
 
 def _uid(x: Any) -> str:
@@ -8485,7 +8537,7 @@ def _tag(uid: str, eps: str) -> str:
     """No teste não marca ninguém (a mensagem vai para o canal de teste)."""
     if not uid:
         return ""
-    return f"<@{uid}>" if not _status_shadow(eps) else (_SPEAKER_CACHE.get(uid) or "a pessoa")
+    return f"<@{uid}>" if not _status_shadow(eps) else (f"*{_first_name(uid)}*" if _first_name(uid) else "")
 
 
 def _cread_check_once() -> None:
@@ -8507,24 +8559,31 @@ def _cread_followup(p: dict[str, Any]) -> None:
         resp = [m for m in after if not _is_ifood_user(str(m.get("user") or ""))]
         de = _tag(p.get("de", ""), eps) or "o time iFood"
         if not resp:
-            alvo = " ".join(_tag(u, eps) for u in p.get("para") or [] if u) or "Time"
-            post(f"{alvo}, {de} perguntou às {_hhmm(p['ts'])} e ainda está sem retorno: _{p.get('texto')}_. "
-                 "Qual a situação, o que está sendo feito e até que horas?")
+            alvos = [t for t in dict.fromkeys(_tag(u, eps) for u in p.get("para") or [] if u) if t]
+            alvo = ", ".join(alvos[:3]) or "Time"
+            reforco = str(p.get("reforco") or "").strip() or "Qual a situação, o que está sendo feito e até que horas?"
+            post(f"{alvo}, {de} pediu às {_hhmm(p['ts'])} e ainda está sem retorno: _{str(p.get('texto')).rstrip('.')}_. "
+                 f"{reforco}")
             _daylog_add(eps, {"h": _now_brazil().strftime("%H:%M"), "t": title[:80], "pend": "cobrança sem resposta",
                               "r": f"{p.get('texto')}"[:200], "link": _permalink(ch, root)})
             return
+        if not p.get("problema", True):
+            return  # pedido/pergunta simples respondido: não pede causa/plano/prazo
         texto = "\n".join(_strip_md(str(m.get("text") or ""))[:500] for m in resp[:4])
         try:
             data = _block_data_from_json(ask_toqan(
                 "TAREFA INTERNA DO APP. Não chame subagentes. Responda APENAS JSON.\n"
                 f"Pergunta do iFood à operação: {p.get('texto')}\nResposta da operação: {texto}\n"
-                'A resposta tem causa, ação e prazo? {"ok": true|false, "falta": "o que falta, em 1 frase curta"}',
+                "A cobrança era de um PROBLEMA operacional. A resposta traz a causa, a ação e o prazo? Se a resposta "
+                "resolve ou explica a questão, ok=true. "
+                '{"ok": true|false, "falta": "o que falta, como pergunta curta e natural (ex.: \'Qual a causa?\')"}',
                 max_attempts=30)) or {}
         except Exception:
             return
         if data.get("ok") is False and data.get("falta"):
             quem = _tag(str(resp[0].get("user") or ""), eps)
-            post(f"{quem + ', ' if quem else ''}valeu pelo retorno. Pra fechar: {str(data['falta']).rstrip('.')}?")
+            falta = str(data['falta']).strip().rstrip('.?')
+            post(f"{quem + ', ' if quem else ''}valeu pelo retorno! Pra fechar: {falta[:1].lower() + falta[1:]}?")
         return
     if p["k"] == "comp":
         texto = "\n".join(f"{_who_label(str(m.get('user') or ''))}: {_strip_md(str(m.get('text') or ''))[:400]}"
@@ -8622,15 +8681,16 @@ def _topic_prompt(eps: str, title: str, conversa: str, n_imgs: int) -> str:
         "número deles difere do nosso, regra de processo) E a base responder: consulte a *Lyra Conhecimento* (regras, "
         "definições, processos) e, se for número ou cálculo, a *Lyra Indicadores*. Use só o que elas devolverem.\n"
         "3. *Report ou análise da EPS* (ex.: Close the Looping, diagnóstico, devolutiva de monitoria, análise de casos, "
-        "plano): dê o feedback de gestora em até 10 linhas, citando o report: o que está bom; se a CONTA e o MÉTODO se "
+        "plano): é a EPS reportando ao iFood — NÃO é cobrança. Se o report não tem erro de conta, método, meta ou regra, "
+        "responda `SILENCIO` (não peça amostra, plano, dono, prazo nem 'como medir'). Só fale se houver ERRO, em até 5 "
+        "linhas, só sobre o erro: se a CONTA e o MÉTODO se "
         "sustentam (refaça as contas com os números dados; ex.: expurgar só as detratoras de um grupo e manter as "
         "promotoras dele infla o resultado — o certo é tirar o grupo inteiro); se a META e os termos batem com os "
         "oficiais (metas do contexto; 'dispersão' no time é CSAT Q4 ÷ CSAT Q1, não distância da meta; o CSAT de caso "
         "resolvido pelo Will fica com o Will (Agentforce CX), nunca com o operador; a pesquisa só sobe quando o caso muda "
         "para resolvido: às vezes (não é o fluxo padrão) a Rosie marca resolvido e transborda (a nota cai no analista), e no Will de Negativas, "
         "que é pós-atendimento, nota no operador = o operador marcou resolvido ANTES de acionar o Will — erro de "
-        "procedimento, caso de treinamento, não de expurgo); o que falta "
-        "(amostra, evidência, ação com dono e prazo). Se a análise PROPÕE mudar regra do iFood (expurgo, atribuição de "
+        "procedimento, caso de treinamento, não de expurgo). Se a análise PROPÕE mudar regra do iFood (expurgo, atribuição de "
         "nota, meta, cálculo), isso não é decisão sua nem da EPS: termine o feedback com uma linha final "
         "`ESCALAR: experiencia|eficiencia: <a decisão que o time precisa tomar>`.\n"
         "4. `ESCALAR: experiencia: <a dúvida em 1 linha>` ou `ESCALAR: eficiencia: <a dúvida em 1 linha>` — só para "
@@ -9685,8 +9745,10 @@ def _triage_chamado(chamado: dict[str, str], extra_replies: list[str], evidencia
         "'onde' NÃO bloqueiam: se não disserem quando, use a data do chamado; o onde (tela/fluxo) tire da descrição ou do "
         "print (ex.: Lojinha > resgate em saldo). Não peça o que já está lá nem o que o print mostra. Print é opcional.\n"
         "- descricao_rewards: descrição limpa para o Rewards (o que, quando, como, onde), juntando chamado, complementos e o "
-        "que o print mostra (ex.: a mensagem de erro/aviso exata do app), "
-        "sem saudação e sem dados pessoais além dos IDs.\n"
+        "que o print mostra (ex.: a mensagem de erro/aviso exata do app), sem saudação. NÃO repita ticket, cliente, "
+        "pedido nem missão (já vão em campos próprios). Do print, só o que é do problema de moedas: ignore campos vazios "
+        "ou alheios (forma de pagamento, bandeira, endereço). Ignore conversa interna da operação (avisos ao time, "
+        "'já comunicamos', pedidos de reforço). 2 a 4 frases.\n"
         "- pergunta: se faltar algo, UMA mensagem curta e educada pedindo exatamente o que falta; senão vazio."
     )
     parsed: Any = None
@@ -9988,6 +10050,48 @@ def _flow_mark(channel: str, what: str) -> None:
         pass
 
 
+FLOW_IFOOD_NUDGE_HOURS = int(os.getenv("FLOW_IFOOD_NUDGE_HOURS", "48"))
+_TICKET_NUM_RE = re.compile(r"\b\d{8}\b")
+
+
+def _flow_ifood_replies(messages: list[dict[str, Any]], thread_ts: str) -> list[dict[str, Any]]:
+    """Respostas de gente do iFood (não bot, não o fluxo) na thread do chamado."""
+    bot = _bot_user_id()
+    return [m for m in messages if m.get("ts") != thread_ts and not (m.get("bot_id") or m.get("subtype") == "bot_message")
+            and m.get("user") != bot and _is_ifood_user(str(m.get("user") or ""))]
+
+
+def _flow_ifood_followup(channel: str, thread_ts: str, eps: str | None, messages: list[dict[str, Any]],
+                         fields: dict[str, str], parent_fields: dict[str, str]) -> None:
+    """Caso já com o iFood: se o último retorno do iFood tem mais de FLOW_IFOOD_NUDGE_HOURS e a operação continuou
+    mandando casos, cobra quem assumiu (uma vez por janela), com os casos novos. Senão, silêncio."""
+    ifood = _flow_ifood_replies(messages, thread_ts)
+    if not ifood:
+        return
+    last = ifood[-1]
+    last_ts = float(last.get("ts") or 0)
+    bot = _bot_user_id()
+    after = [m for m in messages if float(m.get("ts") or 0) > last_ts
+             and not (m.get("bot_id") or m.get("subtype") == "bot_message") and m.get("user") != bot]
+    if not after or time.time() - last_ts < FLOW_IFOOD_NUDGE_HOURS * 3600:
+        _flow_mark(channel, "caso já com o iFood: acompanhando em silêncio")
+        return
+    nkey = f"flow_nudge:{thread_ts}"
+    if time.time() - float(STATE.get(nkey) or 0) < FLOW_IFOOD_NUDGE_HOURS * 3600:
+        return
+    STATE.set(nkey, str(time.time()))
+    tickets = list(dict.fromkeys(t for m in after for t in _TICKET_NUM_RE.findall(str(m.get("text") or ""))))
+    titulo = (_flow_value(fields, "titulo") or _flow_value(parent_fields, "titulo") or "este caso").strip()
+    quem = str(last.get("user") or "")
+    dia = datetime.fromtimestamp(last_ts, BRAZIL_TIMEZONE).strftime("%d/%m")
+    n = len(tickets) or len(after)
+    casos = (f": {', '.join(tickets[:8])}" + (f" e mais {len(tickets) - 8}" if len(tickets) > 8 else "")) if tickets else ""
+    _flow_post(channel, thread_ts,
+               f"<@{quem}>, desde o seu último retorno aqui ({dia}) a operação trouxe mais {n} caso(s) de "
+               f"*{titulo}*{casos}. Tem atualização?")
+    _flow_mark(channel, "caso com o iFood: cobrei atualização de quem assumiu")
+
+
 def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "", trigger_user: str = "") -> None:
     """Lê o chamado do Fluxo Owners CX (mensagem + thread). Moedas: triagem e chamado no Rewards. Outros tópicos:
     responde na thread pela base de conhecimento (e de novo quando marcarem a Lyra na thread)."""
@@ -9997,7 +10101,7 @@ def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "", tr
         state = STATE.get(key)
         if state == "aguardando_info" and trigger_user and _is_ifood_user(trigger_user) and not mention_text:
             return  # o time iFood entrou na conversa: não é a resposta do solicitante
-        if state == "respondido" and mention_text:
+        if state in {"respondido", "com_ifood"} and mention_text:
             STATE.set(key, "processando")
         elif state in {"aberto", "processando", "fora", "respondido"}:
             return
@@ -10017,6 +10121,12 @@ def _handle_owners_flow(channel: str, thread_ts: str, mention_text: str = "", tr
             return  # o fluxo ainda não postou os detalhes na thread
         fields = _parse_flow_fields(_flow_text(details))
         parent_fields = _parse_flow_fields(parent_text)
+        if not mention_text and not _is_moedas_flow(fields, parent_fields) and _flow_ifood_replies(messages, thread_ts):
+            # o time iFood já assumiu o caso: a Lyra não refaz a triagem nem pergunta de novo à operação;
+            # só acompanha (se o retorno prometido atrasar e a operação seguir mandando casos, cobra quem assumiu)
+            _flow_ifood_followup(channel, thread_ts, eps, messages, fields, parent_fields)
+            STATE.set(key, "com_ifood")
+            return
         if not _is_moedas_flow(fields, parent_fields):
             if eps is None:  # canal antigo do fluxo (OWNERS_FLOW_CHANNEL): só moedas
                 STATE.set(key, "fora")
