@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.29.0"
+APP_VERSION = "5.31.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -3092,6 +3092,17 @@ TOQAN_INDICADORES_KEY = os.getenv("TOQAN_INDICADORES_KEY", "").strip() or None
 CAPA_SLA_META = {"cx super cliente - aec": 90.0, "cx super cliente - csu": 90.0, "pf super clientes": 90.0}
 CAPA_SLA_META_PADRAO = 80.0
 _CAPA_CACHE: dict[str, tuple[float, list[dict[str, str]]]] = {}
+CAPA_DIARIA_SQL_PATH = os.path.join(os.path.dirname(CAPA_SQL_PATH), "capa_diaria.sql")
+CAPA_PLANOS_PATH = os.path.join(os.path.dirname(CAPA_SQL_PATH), "capa_planos.json")
+# células da CAPA (ordem, EPS, corte de SLA em min) — o plano (média de interações, tempo de atendimento por interação e
+# ticket único por dia) vem por mês do capa_planos.json (aba PLAN de cada Excel mensal)
+CAPA_CELULAS = [(1, "AEC", "CX Suporte", 5), (2, "AEC", "Madrugada", 5), (3, "AEC", "CX Review - AeC", 5),
+                (4, "CSU", "CX Review - CSU", 5), (5, "AEC", "CX Super Cliente - AeC", 2),
+                (6, "CSU", "CX Super Cliente - CSU", 2), (7, "CSU", "PF Cancelamento", 5),
+                (8, "CSU", "PF Super Clientes", 5), (9, "CSU", "PF Revisão Manual", 5), (10, "CSU", "CX Denúncia", 5),
+                (11, "CSU", "Fraudes DX", 5), (12, "CSU", "DX - PF Contestação", 5),
+                (13, "CSU", "DX - PF Contestação Bloqueio temporário", 5), (14, "AEC", "Fila desativada 37 - Canarinhos", 5)]
+_DIARIO_RE = re.compile(r"\b(diari\w*|dia a dia|por dia|cada dia|dia por dia)\b")
 _CAPA_RE = re.compile(r"\b(tma|sla|primeira resposta|capa|eficiencia|ticket unico|tickets unicos|interacoes|"
                       r"planejado x realizado|plan x real|aderencia ao plan\w*)\b")
 
@@ -3115,14 +3126,40 @@ def _compact_sql(sql: str) -> str:
     return "\n".join(out)
 
 
-def _capa_template() -> tuple[str | None, str]:
+def _capa_template(diaria: bool = False) -> tuple[str | None, str]:
     try:
-        with open(CAPA_SQL_PATH, encoding="utf-8") as fh:
+        with open(CAPA_DIARIA_SQL_PATH if diaria else CAPA_SQL_PATH, encoding="utf-8") as fh:
             sql = fh.read()
     except OSError:
         return None, ""
-    m = re.search(r"MES_PLANO:\s*(\d{4}-\d{2})", sql)
-    return sql, (m.group(1) if m else "")
+    return sql, ""
+
+
+def _capa_planos() -> dict[str, Any]:
+    try:
+        with open(CAPA_PLANOS_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _capa_plano_values(mes: str) -> tuple[str, str, bool]:
+    """(VALUES das células, VALUES do plano diário, tem plano do mês)."""
+    plano = _capa_planos().get(mes) or {}
+    cel = []
+    for ordem, eps_c, nome, corte in CAPA_CELULAS:
+        p = plano.get(nome)
+        mi = f"{float(p['media_interacoes_plan']):.4f}" if p else "1.00"
+        ti = f"{float(p['tempo_atendimento_plan']):.7f}" if p else "NULL"
+        cel.append(f"({ordem}, '{eps_c}', '{nome}', {corte}, {mi}, {ti})")
+    pt = []
+    for nome, p in plano.items():
+        dias = [v for _, v in sorted((p.get("tickets") or {}).items()) if _ and _.startswith(mes)]
+        if dias:
+            pt.append(f"('{nome}', ARRAY({', '.join(str(int(v)) for v in dias)}))")
+    if not pt:
+        pt = ["('__sem_plano__', ARRAY(0))"]
+    return ",\n    ".join(cel), ",\n    ".join(pt), bool(plano)
 
 
 def _is_capa_request(question: str) -> bool:
@@ -3132,9 +3169,33 @@ def _is_capa_request(question: str) -> bool:
         r"como funciona|o que e|o que significa|motivo\w*|ofensor\w*|trein\w*)\b", t) and bool(_capa_template()[0])
 
 
+_MES_NOMES = {"janeiro": 1, "fevereiro": 2, "marco": 3, "abril": 4, "maio": 5, "junho": 6, "julho": 7, "agosto": 8,
+              "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12}
+
+
 def _capa_period(question: str, event: dict[str, Any]) -> tuple[date, date, str]:
     d1 = _as_date(_today_brazil()) - timedelta(days=1)
     t = _norm_text(question)
+    m_rng = re.search(r"\b(\d{1,2})/(\d{1,2})\s*(?:a|ate|-)\s*(\d{1,2})/(\d{1,2})\b", t)
+    if m_rng:  # "01/11 a 05/11"
+        d_a, m_a, d_b, m_b = (int(x) for x in m_rng.groups())
+        try:
+            ano = d1.year if m_a <= d1.month else d1.year - 1
+            ini, fim = date(ano, m_a, d_a), min(date(ano if m_b >= m_a else ano + 1, m_b, d_b), d1)
+            return ini, fim, f"{ini.strftime('%d/%m')} a {fim.strftime('%d/%m')}"
+        except ValueError:
+            pass
+    mes_q = next((n for nome, n in _MES_NOMES.items() if re.search(rf"\b{nome}\b", t)), None)
+    if mes_q is None and re.search(r"\b(mes passado|mes anterior|ultimo mes|mes fechado)\b", t):
+        mes_q = (d1.replace(day=1) - timedelta(days=1)).month
+    if mes_q:  # mês pedido pelo nome: o mês inteiro (ou até ontem, se for o mês atual)
+        ano = d1.year if mes_q <= d1.month else d1.year - 1
+        ini = date(ano, mes_q, 1)
+        prox = date(ano + (mes_q == 12), mes_q % 12 + 1, 1)
+        fim = min(prox - timedelta(days=1), d1)
+        nome = _MESES[mes_q - 1]
+        return ini, fim, (f"{nome} fechado" if fim < d1 or fim.day == (prox - timedelta(days=1)).day
+                          else f"{nome} (01 a {fim.strftime('%d/%m')})")
     if _d1_context(question, event):
         return d1, d1, f"D-1 {d1.strftime('%d/%m')}"
     if re.search(r"\b(semana|7 dias|ultimos 7)\b", t):
@@ -3143,20 +3204,27 @@ def _capa_period(question: str, event: dict[str, Any]) -> tuple[date, date, str]
     return d1.replace(day=1), d1, f"mês 01 a {d1.strftime('%d/%m')}"
 
 
-def _capa_rows(ini: date, fim: date, progress: Callable[[str], Any] | None = None) -> tuple[list[dict[str, str]] | None, str]:
-    sql, mes = _capa_template()
+def _capa_rows(ini: date, fim: date, progress: Callable[[str], Any] | None = None, diaria: bool = False,
+               celula: str | None = None) -> tuple[list[dict[str, str]] | None, str]:
+    sql, _ = _capa_template(diaria)
     if not sql:
-        return None, "A visão da CAPA não está configurada (falta queries/capa.sql)."
-    if mes and (ini.strftime("%Y-%m") != mes or fim.strftime("%Y-%m") != mes):
-        return None, (f"O plano carregado na visão da CAPA é de {mes[5:]}/{mes[:4]}; o de "
-                      f"{_MESES[ini.month - 1]} ainda não foi atualizado no arquivo.")
-    key = f"{ini}:{fim}"
+        return None, "A visão de eficiência não está configurada (falta o SQL em queries/)."
+    if ini.strftime("%Y-%m") != fim.strftime("%Y-%m"):
+        return None, "Me pede um mês por vez (ex.: outubro, ou novembro até ontem) que eu trago certinho."
+    mes = ini.strftime("%Y-%m")
+    key = f"{'d' if diaria else 'm'}:{celula or ''}:{ini}:{fim}"
     hit = _CAPA_CACHE.get(key)
     if hit and time.time() - hit[0] < 1800:
         return hit[1], ""
+    cel_v, plano_v, tem_plano = _capa_plano_values(mes)
+    filtro = f"celula_capa = '{celula}'" if celula else "1 = 1"
     filled = _compact_sql(sql.replace("{data_inicio}", ini.isoformat()).replace("{data_fim}", fim.isoformat())
-                          .replace("{mes_plano}", mes or ini.strftime("%Y-%m")))
-    out, problema = _run_app_sql(filled, progress, f"Visão da CAPA ({ini} a {fim})")
+                          .replace("{mes_plano}", mes).replace("{celulas_values}", cel_v)
+                          .replace("{plano_ticket_values}", plano_v).replace("{filtro_celulas}", filtro))
+    out, problema = _run_app_sql(filled, progress, f"Eficiência ({ini} a {fim}{', diária' if diaria else ''})")
+    if out is not None and not tem_plano:
+        for r in out:
+            r["_sem_plano"] = "1"
     if out is not None:
         _CAPA_CACHE[key] = (time.time(), out)
     return out, problema
@@ -3223,7 +3291,8 @@ def _render_capa(rows: list[dict[str, str]], eps: str | None, label: str) -> str
         cel = [r for r in rows if _norm_text(r.get("eps", "")) == eps_k and (_cv(r, "interacoes real") or 0) > 0]
         if not cel:
             continue
-        linhas = [f"⚙️ *Eficiência · `{eps_nome}`* — {label} · visão da CAPA (planejado x realizado)"]
+        sem_plano = any(r.get("_sem_plano") for r in cel)
+        linhas = [f"⚙️ *TMA e SLA · `{eps_nome}`* — {label}" + (" · _sem plano carregado para esse mês_" if sem_plano else "")]
         piores = []
         for r in cel:
             nome = r.get("celula", "")
@@ -3271,12 +3340,12 @@ def _render_capa(rows: list[dict[str, str]], eps: str | None, label: str) -> str
         if cons:
             linhas.append(f"*Consolidado {eps_nome}* · " + " · ".join(cons))
         if piores:  # o pior SLA (abaixo da meta) e o pior TMA (acima do plan), pesados pelo volume de tickets
-            top = []
+            top: dict[str, list[str]] = {}
             for tipo in (2, 1):
                 cand = sorted([p for p in piores if p[0] == tipo], key=lambda x: x[1], reverse=True)
                 if cand:
-                    top.append(f"`{cand[0][2]}` ({cand[0][3]})")
-            linhas.append("👉 *Mais preocupa:* " + " e ".join(top) + ".")
+                    top.setdefault(cand[0][2], []).append(cand[0][3])
+            linhas.append("👉 *Mais preocupa:* " + " e ".join(f"`{c}` ({' e '.join(v)})" for c, v in top.items()) + ".")
         blocos.append("\n".join(linhas))
     return "\n\n".join(blocos)
 
@@ -3382,20 +3451,95 @@ def _render_motivos_efic(rows: list[dict[str, str]], ind: str, label: str, fila:
     return "\n".join(linhas)
 
 
+def _capa_check_referencia(rows: list[dict[str, str]], ini: date, fim: date) -> None:
+    """Mês fechado com referência da planilha oficial (queries/capa_referencia.json): se a Lyra não bater, alerta o time."""
+    try:
+        with open(os.path.join(os.path.dirname(CAPA_SQL_PATH), "capa_referencia.json"), encoding="utf-8") as fh:
+            ref = json.load(fh).get(f"{ini.isoformat()}:{fim.isoformat()}") or {}
+    except Exception:
+        return
+    if not ref:  # só confere quando o período é exatamente um dos que temos da planilha oficial
+        return
+    difs = []
+    for r in rows:
+        cel = r.get("celula", "")
+        alvo = next((v for k, v in ref.items() if _norm_text(k) == _norm_text(cel)), None)
+        if not alvo:
+            continue
+        tma, sla = _cv(r, "tempo atribuicao (ticket)"), _cv(r, "sla")
+        if alvo.get("tma_ticket") and tma is not None and abs(tma - alvo["tma_ticket"]) > max(5, 0.02 * alvo["tma_ticket"]):
+            difs.append(f"{cel}: TMA {_fmt_int(tma)} s x planilha {_fmt_int(alvo['tma_ticket'])} s")
+        if alvo.get("sla") is not None and sla is not None and abs(sla - alvo["sla"]) > 0.01:
+            difs.append(f"{cel}: SLA {_bfmt(sla * 100)}% x planilha {_bfmt(alvo['sla'] * 100)}%")
+    if difs:
+        _alert(f"⚠️ TMA/SLA de {ini.strftime('%d/%m')} a {fim.strftime('%d/%m')} não bateu com a planilha oficial em "
+               f"{len(difs)} ponto(s):\n• "
+               + "\n• ".join(difs[:12]))
+
+
+def _render_capa_diaria(rows: list[dict[str, str]], eps: str | None, label: str, celula: str | None) -> str:
+    """Dia a dia (como o bloco diário da aba CAPA): da célula pedida ou, sem célula, o consolidado da EPS (somas)."""
+    blocos = []
+    for eps_k, eps_nome in (("aec", "AeC"), ("csu", "CSU")):
+        if eps and _compact(eps) != eps_k:
+            continue
+        sel = [r for r in rows if _norm_text(r.get("eps", "")) == eps_k
+               and (not celula or _norm_text(r.get("celula", "")) == _norm_text(celula))]
+        if not sel:
+            continue
+        por_dia: dict[str, list[dict[str, str]]] = {}
+        for r in sel:
+            por_dia.setdefault(str(r.get("data", ""))[:10], []).append(r)
+        alvo = f"`{celula}`" if celula else f"consolidado `{eps_nome}`"
+        linhas = [f"📅 *TMA e SLA por dia · {alvo}* — {label}"]
+        for dia in sorted(por_dia):
+            rs = por_dia[dia]
+            tempo = sum(_cv(r, "soma tempo atribuicao") or 0 for r in rs)
+            tk = sum(_cv(r, "ticket unico real") or 0 for r in rs)
+            tk_p = sum(_cv(r, "ticket unico plan") or 0 for r in rs if _cv(r, "tempo atendimento plan (ticket)"))
+            tempo_p = sum((_cv(r, "ticket unico plan") or 0) * (_cv(r, "tempo atendimento plan (ticket)") or 0) for r in rs)
+            base = sum(_cv(r, "sla base") or 0 for r in rs)
+            dentro = sum(_cv(r, "sla dentro") or 0 for r in rs)
+            try:
+                d = datetime.strptime(dia, "%Y-%m-%d")
+                dia_txt = f"{d.strftime('%d/%m')} {['seg', 'ter', 'qua', 'qui', 'sex', 'sáb', 'dom'][d.weekday()]}"
+            except ValueError:
+                dia_txt = dia
+            partes = [dia_txt]
+            if tk:
+                partes.append(f"TMA {_fmt_int(tempo / tk)} s" + (f" x {_fmt_int(tempo_p / tk_p)} s" if tk_p else ""))
+            if base:
+                sla = dentro / base * 100
+                meta = _capa_sla_meta(celula) if celula else None
+                partes.append(f"SLA {_bfmt(sla)}%" + (f" {'🟢' if sla >= meta else '🔴'}" if meta else ""))
+            if tk:
+                partes.append(f"tickets {_fmt_int(tk)}" + (f" x {_fmt_int(sum(_cv(r, 'ticket unico plan') or 0 for r in rs))}"
+                                                           if any(_cv(r, 'ticket unico plan') for r in rs) else ""))
+            linhas.append(" · ".join(partes))
+        blocos.append("\n".join(linhas))
+    return "\n\n".join(blocos)
+
+
 def _send_capa(event: dict[str, Any], client: Any, eps: str | None, question: str,
                progress: Callable[[str], Any] | None = None) -> str | None:
     ini, fim, label = _capa_period(question, event)
-    rows, problema = _capa_rows(ini, fim, progress)
+    diaria = bool(_DIARIO_RE.search(_norm_text(question)))
+    celula = _fila_ref(question, eps, {}) if diaria else None
+    rows, problema = _capa_rows(ini, fim, progress, diaria=diaria, celula=celula)
     if not rows:
-        return problema or "Não consegui puxar a visão da CAPA agora."
-    texto = _render_capa(rows, eps, label)
+        return problema or "Não consegui puxar TMA e SLA agora."
+    if not diaria:
+        _capa_check_referencia(rows, ini, fim)
+    texto = _render_capa_diaria(rows, eps, label, celula) if diaria else _render_capa(rows, eps, label)
     if not texto:
-        return "A CAPA voltou sem células com volume nesse período."
+        return "Não veio volume nesse período."
+    if not re.search(r"\b(planilha|excel|xlsx|base|arquivo)\b", _norm_text(question)):
+        return texto  # só texto; a planilha vai quando pedirem
     try:
         (client or slack_app.client).files_upload_v2(
             channel=event.get("channel"), thread_ts=_reply_ts(event), content=_capa_xlsx(rows, eps),
-            filename=f"CAPA_{eps or 'iFood'}_{ini.strftime('%d-%m')}_a_{fim.strftime('%d-%m')}.xlsx",
-            title=f"CAPA · {eps or 'iFood'} · {label}", initial_comment=texto)
+            filename=f"TMA_SLA_{eps or 'iFood'}_{ini.strftime('%d-%m')}_a_{fim.strftime('%d-%m')}.xlsx",
+            title=f"TMA e SLA · {eps or 'iFood'} · {label}", initial_comment=texto)
     except Exception:
         logger.warning("CAPA: upload do Excel falhou; mando só o texto", exc_info=True)
         return texto
@@ -4539,6 +4683,406 @@ def _send_team_view(event: dict[str, Any], client: Any, eps: str | None, questio
     if _operator_names_allowed(eps):
         _upload_operators_xlsx(event, client, team, eps, spec["label"], "Base completa da equipe 📋")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Catálogo de consultas fixas. Pergunta recorrente (indicador × nível × período × tipo) vai por SQL pronto do app,
+# com a conta feita aqui; pergunta nova vai para a análise livre, marcada como "feita na hora" e registrada: o formato
+# que se repetir (3+ vezes em 14 dias) entra na lista semanal de candidatos ao catálogo.
+# ---------------------------------------------------------------------------
+CSAT_SQL_FIXO = os.getenv("CSAT_SQL_FIXO", "fallback").strip().lower()  # off | fallback | on (variação e motivos)
+_CSAT_ROWS_CACHE: dict[str, tuple[float, list[dict[str, str]]]] = {}
+_EMAIL_SAFE_RE = re.compile(r"[^a-z0-9@._+-]")
+PESSOAS_OPS_MAX = 8
+PESSOAS_SUP_MAX = 8
+PESSOAS_MIN_AVAL = 5
+PESSOAS_MIN_AVAL_D1 = 3
+
+
+def _query_text(nome: str) -> str | None:
+    try:
+        with open(os.path.join(os.path.dirname(CAPA_SQL_PATH), nome), encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _csat_eps_params(eps: str | None) -> tuple[str, str]:
+    """('AeC', 'CSU') no formato do eps_fila da base e o padrão do e-mail (aec|csu)."""
+    nomes = ["AeC" if _compact(e) == "aec" else "CSU" for e in ([eps] if eps else ["AeC", "CSU"])]
+    return ", ".join(f"'{n}'" for n in nomes), "|".join(_compact(n) for n in nomes)
+
+
+def _csat_sql(nome: str, ini: date, fim: date, params: dict[str, str]) -> str | None:
+    """Consulta fixa de CSAT: base oficial (csat_base.sql, com a Madrugada do MOP) + o template pedido, compactado."""
+    tpl, base = _query_text(nome), _query_text("csat_base.sql")
+    if not tpl or not base:
+        return None
+    mad = ", ".join(f"'{_EMAIL_SAFE_RE.sub('', e.lower())}'" for e in _madrugada_emails()) or "''"
+    base = (base.replace("{base_inicio}", ini.isoformat()).replace("{base_fim}", fim.isoformat())
+            .replace("{lista_madrugada}", mad))
+    sql = tpl.replace("{base}", base)
+    for k, v in params.items():
+        sql = sql.replace("{" + k + "}", v)
+    return _compact_sql(sql)
+
+
+def _csat_fixed_rows(nome: str, ini: date, fim: date, params: dict[str, str], progress: Callable[[str], Any] | None,
+                     rotulo: str) -> tuple[list[dict[str, str]] | None, str]:
+    sql = _csat_sql(nome, ini, fim, params)
+    if not sql:
+        return None, "A consulta fixa de CSAT não está configurada (falta o SQL em queries/)."
+    key = f"{nome}:{hash(sql)}"
+    hit = _CSAT_ROWS_CACHE.get(key)
+    if hit and time.time() - hit[0] < 1800:
+        return hit[1], ""
+    rows, problema = _run_app_sql(sql, progress, rotulo)
+    if rows is not None:
+        _CSAT_ROWS_CACHE[key] = (time.time(), rows)
+    return rows, problema
+
+
+# --- quem mais impacta: operador e supervisor ---------------------------------
+_PESSOAS_RE = re.compile(r"\b(operador\w*|analista\w*|atendente\w*|supervisor\w*|supervisora\w*|coordenador\w*|"
+                         r"equipes?|times)\b")
+_PESSOAS_IMPACTO_RE = re.compile(r"\b(impact\w*|pesa\w*|puxa\w*|ofensor\w*|derrub\w*|contribu\w*|consolidado|"
+                                 r"quem mais|maiores? gaps?|segura\w*|ajuda\w* mais)\b")
+
+
+def _is_pessoas_impacto_request(question: str) -> bool:
+    """"Quais operadores/supervisores mais impactam o CSAT (no consolidado)?" — TMA/SLA por analista seguem a rota deles."""
+    t = _norm_text(question)
+    if not (_PESSOAS_RE.search(t) and _PESSOAS_IMPACTO_RE.search(t)):
+        return False
+    if re.search(r"\b(tma|sla|primeira resposta|tempo)\b", t) and not re.search(r"\bcsat\b", t):
+        return False
+    return not re.search(r"\b(casos?|tickets?|motivos?)\b", t)
+
+
+def _pessoas_impacto_calc(rows: list[dict[str, str]], eps_nome: str, fila: str | None, people: dict[str, dict[str, str]],
+                          dia_meta: date, emails: set[str] | None = None) -> dict[str, Any] | None:
+    """Impacto de cada operador no consolidado (régua do Cockpit aplicada à pessoa): peso dele nas avaliações do
+    conjunto × (CSAT dele − meta da fila dele), somado nas filas em que atendeu, em p.p. Supervisor = soma dos dele.
+    A soma de todos dá o gap do conjunto para a meta (menos o que é de e-mail fora da EPS)."""
+    def mine(r: dict[str, str]) -> bool:
+        return _compact(r.get("eps", "")) == _compact(eps_nome) and (fila is None or _norm_text(r.get("fila", "")) == _norm_text(fila))
+
+    tot = [r for r in rows if r.get("email", "").upper() == "TOTAL" and mine(r)]
+    n_tot = sum(_sql_num(r.get("avaliacoes")) or 0 for r in tot)
+    p_tot = sum(_sql_num(r.get("promotoras")) or 0 for r in tot)
+    if n_tot <= 0:
+        return None
+    com_meta = [(r, _meta_fila(r.get("fila", ""), dia_meta)) for r in tot]
+    am = sum(_sql_num(r.get("avaliacoes")) or 0 for r, m in com_meta if m is not None)
+    meta_cons = sum((_sql_num(r.get("avaliacoes")) or 0) * m for r, m in com_meta if m is not None) / am if am else None
+    ops: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        email = r.get("email", "").lower()
+        if "@" not in email or not mine(r) or (emails is not None and email not in emails):
+            continue
+        a, p = _sql_num(r.get("avaliacoes")) or 0, _sql_num(r.get("promotoras")) or 0
+        meta = _meta_fila(r.get("fila", ""), dia_meta)
+        o = ops.setdefault(email, {"email": email, "aval": 0.0, "prom": 0.0, "acima": 0.0, "aval_meta": 0.0,
+                                   "meta_x": 0.0, "filas": {}})
+        o["aval"] += a
+        o["prom"] += p
+        o["filas"][r.get("fila", "")] = o["filas"].get(r.get("fila", ""), 0) + a
+        if meta is not None:
+            o["acima"] += p - meta / 100 * a  # positivas acima (+) ou abaixo (−) do que a meta pede
+            o["aval_meta"] += a
+            o["meta_x"] += meta * a
+    if not ops:
+        return None
+    for o in ops.values():
+        o["csat"] = o["prom"] / o["aval"] * 100 if o["aval"] else None
+        o["meta"] = o["meta_x"] / o["aval_meta"] if o["aval_meta"] else None
+        o["imp"] = o["acima"] / n_tot * 100 if o["aval_meta"] else None
+        o["fila"] = max(o["filas"], key=o["filas"].get) if o["filas"] else ""
+        p = people.get(o["email"]) or {}
+        o["nome"], o["sup"] = p.get("nome", ""), p.get("supervisor") or "Sem supervisor no MOP"
+    sups: dict[str, dict[str, Any]] = {}
+    for o in ops.values():
+        s = sups.setdefault(o["sup"], {"sup": o["sup"], "aval": 0.0, "prom": 0.0, "acima": 0.0, "aval_meta": 0.0,
+                                       "meta_x": 0.0, "n_ops": 0})
+        for k in ("aval", "prom", "acima", "aval_meta", "meta_x"):
+            s[k] += o[k]
+        s["n_ops"] += 1
+    for s in sups.values():
+        s["csat"] = s["prom"] / s["aval"] * 100 if s["aval"] else None
+        s["meta"] = s["meta_x"] / s["aval_meta"] if s["aval_meta"] else None
+        s["imp"] = s["acima"] / n_tot * 100 if s["aval_meta"] else None
+    return {"n": n_tot, "csat": p_tot / n_tot * 100, "meta": meta_cons, "ops": list(ops.values()),
+            "sups": list(sups.values())}
+
+
+def _pp_signed(v: float | None, dec: int = 2) -> str:
+    if v is None:
+        return "—"
+    return ("+" if v > 0 else "−" if v < 0 else "") + _bfmt(abs(v), dec) + " p.p."
+
+
+def _render_pessoas_impacto(calc: dict[str, Any], alvo: str, label: str, d1: bool, eps: str | None,
+                            titulo_equipe: str = "", so_sup: bool = False, so_ops: bool = False) -> str:
+    gap = calc["csat"] - calc["meta"] if calc["meta"] is not None else None
+    dot = _status_dot(calc["csat"] / calc["meta"] * 100 if calc["meta"] else None)
+    head = (f"{dot} *Quem mais pesa no CSAT ·* `{alvo}`" + (f" · {titulo_equipe}" if titulo_equipe else "")
+            + f" — {label}")
+    linhas = [head, f"CSAT *{_bfmt(calc['csat'])}%*" + (f" (meta {_bfmt(calc['meta'])}% · {_pp_signed(gap, 1)})"
+                                                         if calc["meta"] is not None else "")
+              + f" · n={_fmt_int(calc['n'])}"]
+    minimo = PESSOAS_MIN_AVAL_D1 if d1 else PESSOAS_MIN_AVAL
+    allowed = _operator_names_allowed(eps)
+
+    def who(o: dict[str, Any]) -> str:
+        return _operator_label(o["email"], o["nome"] if allowed else "")
+
+    sups = sorted([s for s in calc["sups"] if s["imp"] is not None], key=lambda s: s["imp"])
+    if sups and not so_ops and not titulo_equipe:
+        linhas += ["", "👥 *Por supervisor* — quem mais puxa para baixo"]
+        for i, s in enumerate([s for s in sups if s["imp"] < 0][:PESSOAS_SUP_MAX], 1):
+            falt = max(0, math.ceil(-s["acima"] - 1e-9))
+            linhas.append(f"{i}. {_nice_name(s['sup'])} · *{_pp_signed(s['imp'])}* · CSAT {_bfmt(s['csat'])}% "
+                          f"(meta {_bfmt(s['meta'])}%) · {s['n_ops']} operador(es) · n={_fmt_int(s['aval'])}"
+                          + (f" · {falt} positivas faltantes" if falt else ""))
+        if not any(s["imp"] < 0 for s in sups):
+            linhas.append("Nenhuma equipe abaixo da meta no recorte. 👏")
+    ops = sorted([o for o in calc["ops"] if o["imp"] is not None and o["aval"] >= minimo], key=lambda o: o["imp"])
+    fora = sum(1 for o in calc["ops"] if o["aval"] < minimo)
+    if not so_sup:
+        neg = [o for o in ops if o["imp"] < 0]
+        linhas += ["", "🧑‍💻 *Por operador* — quem mais puxa para baixo"]
+        for i, o in enumerate(neg[:PESSOAS_OPS_MAX], 1):
+            linhas.append(f"{i}. {who(o)} · {o['fila']} · *{_pp_signed(o['imp'])}* · CSAT {_bfmt(o['csat'])}% "
+                          f"(meta {_bfmt(o['meta'])}%) · n={_fmt_int(o['aval'])}")
+        if not neg:
+            linhas.append("Ninguém abaixo da meta da fila no recorte. 👏")
+        pos = [o for o in reversed(ops) if o["imp"] > 0][:3]
+        if pos:
+            linhas += ["", "💪 *Quem mais segura o resultado*"]
+            linhas += [f"• {who(o)} · {o['fila']} · {_pp_signed(o['imp'])} · CSAT {_bfmt(o['csat'])}% · "
+                       f"n={_fmt_int(o['aval'])}" for o in pos]
+    linhas += ["", f"_Impacto = peso da pessoa nas avaliações de `{alvo}` × (CSAT dela − meta da fila dela), em p.p. do "
+                   f"consolidado (mesma régua do Cockpit para filas); a soma de todo mundo dá o gap para a meta."
+               + (f" Operadores com menos de {minimo} avaliações ficam fora do ranking ({fora}), mas contam na equipe."
+                  if fora else "") + "_"]
+    return "\n".join(linhas)
+
+
+def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, question: str,
+                          say: Callable[..., Any], progress: Callable[[str], Any] | None = None) -> str | None:
+    if eps is None:
+        eps = _eps_of_question(question)
+    ini, fim, label = _capa_period(question, event)
+    d1 = ini == fim
+    fila = _fila_in_question(question, eps)
+    people = _mop_people(eps)
+    t = _norm_text(question)
+    emails: set[str] | None = None
+    titulo_equipe = ""
+    if people and (_TEAM_RE.search(t) or re.search(r"\b(minha|meu|nossa|nosso|meus)\b", t)):
+        kind, leader = _resolve_team(question, event, people)
+        if kind in {"sup", "coord"} and leader:
+            field = "supervisor" if kind == "sup" else "coordenador"
+            emails = {e for e, p in people.items() if _norm_text(p[field]) == _norm_text(leader)}
+            titulo_equipe = f"{'Equipe' if kind == 'sup' else 'Coordenação'} de {_nice_name(leader)}"
+            if eps is None:
+                eps_t = {people[e].get("eps") for e in emails} - {"", None}
+                eps = eps_t.pop() if len(eps_t) == 1 else None
+    eps_lista, eps_like = _csat_eps_params(eps)
+    rows, problema = _csat_fixed_rows("csat_operadores.sql", ini, fim,
+                                      {"eps_lista": eps_lista, "eps_like": eps_like, "filtro_operadores": "1 = 1"},
+                                      progress, f"CSAT por operador ({ini} a {fim})")
+    if rows is None:
+        return problema
+    so_sup = bool(re.search(r"\b(supervisor\w*|supervisora\w*|equipes)\b", t)) and not re.search(
+        r"\b(operador\w*|analista\w*|atendente\w*)\b", t)
+    so_ops = bool(re.search(r"\b(operador\w*|analista\w*|atendente\w*)\b", t)) and not re.search(
+        r"\b(supervisor\w*|supervisora\w*|coordenador\w*|equipes?)\b", t)
+    textos = []
+    for eps_nome in ([eps] if eps else ["AeC", "CSU"]):
+        calc = _pessoas_impacto_calc(rows, eps_nome, fila, people, fim, emails)
+        if calc:
+            textos.append(_render_pessoas_impacto(calc, fila or eps_nome, label, d1, eps, titulo_equipe, so_sup, so_ops))
+    if not textos:
+        return f"Não achei avaliações de {fila or eps or 'AeC/CSU'} em {label}. Quer outro período?"
+    event["_catalog"] = "csat|pessoas|impacto"
+    _say_sections(say, "\n\n".join(textos), event)
+    return None
+
+
+# --- variação e motivos de CSAT por SQL fixo -----------------------------------
+def _csat_variacao_fixa(eps: str | None, fila: str, cur: tuple[date, date], ref: tuple[date, date],
+                        progress: Callable[[str], Any] | None = None) -> dict[str, Any] | None:
+    """Mesmo JSON da seção 7.2 (efeito mix e performance por motivo), calculado aqui a partir do SQL fixo.
+    Sem response rate: o denominador da RR ainda não está definido para a consulta fixa."""
+    eps_lista, _ = _csat_eps_params(eps or _eps_of_question(fila))
+    ini, fim = min(cur[0], ref[0]), max(cur[1], ref[1])
+    fila_sql = fila.replace("'", "''")
+    rows, _ = _csat_fixed_rows("csat_variacao.sql", ini, fim, {
+        "ref_inicio": ref[0].isoformat(), "ref_fim": ref[1].isoformat(), "cur_inicio": cur[0].isoformat(),
+        "cur_fim": cur[1].isoformat(), "eps_lista": eps_lista, "filtro_fila": f"fila_relatorio = '{fila_sql}'"},
+        progress, f"Variação do CSAT fixa ({fila})")
+    if not rows:
+        return None
+    per: dict[str, dict[str, list[float]]] = {"atual": {}, "ref": {}}
+    for r in rows:
+        k = r.get("periodo", "").strip().lower()
+        if k not in per:
+            continue
+        a, p = _sql_num(r.get("avaliacoes")) or 0, _sql_num(r.get("promotoras")) or 0
+        acc = per[k].setdefault(r.get("motivo") or "sem motivo", [0.0, 0.0])
+        acc[0] += a
+        acc[1] += p
+    n_c, n_r = sum(v[0] for v in per["atual"].values()), sum(v[0] for v in per["ref"].values())
+    if not n_c or not n_r:
+        return None
+    c_c = sum(v[1] for v in per["atual"].values()) / n_c * 100
+    c_r = sum(v[1] for v in per["ref"].values()) / n_r * 100
+    mix, perf, top_mix, top_perf = 0.0, 0.0, [], []
+    for m in set(per["atual"]) | set(per["ref"]):
+        ac, pc = per["atual"].get(m, [0.0, 0.0])
+        ar, pr = per["ref"].get(m, [0.0, 0.0])
+        sh_c, sh_r = ac / n_c, ar / n_r
+        cs_r = pr / ar * 100 if ar else None
+        cs_c = pc / ac * 100 if ac else None
+        # mix: Δ participação × (CSAT ref do motivo − CSAT ref da fila); performance: share atual × ΔCSAT do motivo
+        e_mix = (sh_c - sh_r) * ((cs_r if cs_r is not None else c_r) - c_r)
+        e_perf = sh_c * (cs_c - cs_r) if cs_c is not None and cs_r is not None else sh_c * ((cs_c or 0) - c_r)
+        mix += e_mix
+        perf += e_perf
+        top_mix.append({"motivo": m, "share_ref": sh_r * 100, "share_atual": sh_c * 100, "csat_ref": cs_r, "efeito_pp": e_mix})
+        if cs_c is not None and cs_r is not None:
+            top_perf.append({"motivo": m, "csat_ref": cs_r, "csat_atual": cs_c, "share_atual": sh_c * 100, "efeito_pp": e_perf})
+    sgn = lambda total: (lambda x: x["efeito_pp"] * (1 if total > 0 else -1))
+    top_mix.sort(key=sgn(mix), reverse=True)
+    top_perf.sort(key=sgn(perf), reverse=True)
+    return {"csat_ref": c_r, "csat_atual": c_c, "n_ref": n_r, "n_atual": n_c, "mix_pp": mix, "performance_pp": perf,
+            "top_mix": top_mix[:3], "top_performance": top_perf[:3], "_fixa": True}
+
+
+def _csat_motivos_texto(eps: str | None, fila: str | None, ini: date, fim: date, label: str,
+                        progress: Callable[[str], Any] | None = None, top: int = 5) -> str:
+    """Motivos que mais pesam no CSAT (seção 6): participação nas avaliações da fila × (CSAT do motivo − CSAT da fila)."""
+    eps_lista, _ = _csat_eps_params(eps)
+    rows, _ = _csat_fixed_rows("csat_motivos.sql", ini, fim, {"eps_lista": eps_lista}, progress,
+                               f"Motivos de CSAT fixos ({ini} a {fim})")
+    if not rows:
+        return ""
+    blocos = []
+    filas = sorted({r.get("fila", "") for r in rows if r.get("fila")})
+    for f in ([fila] if fila else filas):
+        rs = [r for r in rows if _norm_text(r.get("fila", "")) == _norm_text(f)]
+        n = sum(_sql_num(r.get("avaliacoes")) or 0 for r in rs)
+        if not n:
+            continue
+        c_f = sum(_sql_num(r.get("promotoras")) or 0 for r in rs) / n * 100
+        itens = []
+        for r in rs:
+            a, p = _sql_num(r.get("avaliacoes")) or 0, _sql_num(r.get("promotoras")) or 0
+            if a:
+                itens.append((a / n * (p / a * 100 - c_f), r.get("motivo") or "sem motivo", a, p / a * 100))
+        itens.sort()
+        neg = [x for x in itens if x[0] < 0][:top]
+        if not neg:
+            continue
+        blocos.append(f"`{f}` · CSAT {_bfmt(c_f)}% · n={_fmt_int(n)}\n" + "\n".join(
+            f"• {_motivo_label(m)}: {_pp_signed(imp)} · CSAT {_bfmt(cs)}% · {_bfmt(a / n * 100)}% das avaliações"
+            for imp, m, a, cs in neg))
+    if not blocos:
+        return ""
+    return (f"🎯 *Motivos que mais pesam no CSAT* — {label}\n_impacto = participação do motivo nas avaliações da fila × "
+            "(CSAT do motivo − CSAT da fila)_\n\n" + "\n\n".join(blocos))
+
+
+# --- classificação da pergunta e registro do que ficou fora do catálogo ---------
+_CAT_IND = (("tma", r"\btma\b|tempo medio|tempo de atendimento"), ("sla", r"\bsla\b|primeira resposta|1a resposta"),
+            ("csat", r"\bcsat\b|satisfac\w*|avaliac\w*|promotor\w*|detrator\w*|\bnotas?\b"))
+CATALOG_LOG_KEY = "catalogo:fora"
+CATALOG_LOG_MAX = 400
+CATALOG_REPEAT_MIN = 3
+CATALOG_REPEAT_DAYS = 14
+
+
+def _catalog_shape(question: str, event: dict[str, Any] | None = None) -> dict[str, str] | None:
+    """indicador × nível × período × tipo da pergunta (None = não é pergunta de indicador)."""
+    t = _norm_text(question)
+    ind = "+".join(k for k, rx in _CAT_IND if re.search(rx, t))
+    if not ind:
+        return None
+    nivel = ("caso" if re.search(r"\b(casos?|tickets?|chamados?)\b", t) else
+             "operador" if re.search(r"\b(operador\w*|analista\w*|atendente\w*)\b", t) else
+             "supervisor" if re.search(r"\b(supervisor\w*|coordenador\w*|equipes?|times?)\b", t) else
+             "motivo" if re.search(r"\b(motivos?|ofensor\w*)\b", t) else
+             "fila" if re.search(r"\b(fila|filas|celula\w*)\b", t) or _fila_in_question(question, None) else "eps")
+    try:
+        ini, fim, _ = _capa_period(question, event or {})
+        d1 = _as_date(_today_brazil()) - timedelta(days=1)
+        periodo = ("dia a dia" if _DIARIO_RE.search(t) else "ontem" if ini == fim == d1 else
+                   "mes fechado" if fim < d1 and ini.day == 1 else "semana" if re.search(r"\bsemana\b", t) else
+                   "mes ate ontem" if ini.day == 1 and fim == d1 else "datas")
+    except Exception:
+        periodo = "?"
+    tipo = ("lista" if re.search(r"\b(lista\w*|base|planilha|excel|nominal|quais (casos|tickets))\b", t) else
+            "variacao" if re.search(r"\b(caiu|cair|subiu|piorou|melhorou|variac\w*|por que|porque|pq|compar\w*|evoluc\w*)\b", t) else
+            "impacto" if re.search(r"\b(impact\w*|pesa\w*|puxa\w*|ofensor\w*|piores?|quem mais|maior\w* gap)\b", t) else
+            "resultado")
+    return {"ind": ind, "nivel": nivel, "periodo": periodo, "tipo": tipo, "key": f"{ind}|{nivel}|{periodo}|{tipo}"}
+
+
+def _catalog_log(shape: dict[str, str], question: str, event: dict[str, Any]) -> None:
+    try:
+        log = json.loads(STATE.get(CATALOG_LOG_KEY) or "[]")
+    except ValueError:
+        log = []
+    log.append({"d": _as_date(_today_brazil()).isoformat(), "k": shape["key"], "q": _mask_pii(question)[:160],
+                "c": str(event.get("channel") or "")})
+    try:
+        STATE.set(CATALOG_LOG_KEY, json.dumps(log[-CATALOG_LOG_MAX:], ensure_ascii=False))
+    except Exception:
+        logger.warning("Could not log off-catalog question", exc_info=True)
+
+
+def _catalog_candidates(today: date) -> list[tuple[str, int, list[str]]]:
+    try:
+        log = json.loads(STATE.get(CATALOG_LOG_KEY) or "[]")
+    except ValueError:
+        return []
+    desde = (today - timedelta(days=CATALOG_REPEAT_DAYS)).isoformat()
+    grupos: dict[str, list[str]] = {}
+    for e in log:
+        if e.get("d", "") >= desde:
+            grupos.setdefault(e.get("k", "?"), []).append(e.get("q", ""))
+    return sorted(((k, len(qs), qs[-3:]) for k, qs in grupos.items() if len(qs) >= CATALOG_REPEAT_MIN),
+                  key=lambda x: -x[1])
+
+
+def _catalog_weekly_tick(now: datetime) -> None:
+    """Segunda de manhã: lista para o responsável os formatos de pergunta fora do catálogo que se repetiram."""
+    if now.weekday() != 0 or now.hour < 9:
+        return
+    key = f"catalogo:semana:{now.date().isoformat()}"
+    if STATE.get(key):
+        return
+    STATE.set(key, "ok")
+    cands = _catalog_candidates(now.date())
+    if not cands:
+        return
+    linhas = [f"🧩 Candidatos ao catálogo de consultas (perguntas fora do catálogo que se repetiram {CATALOG_REPEAT_MIN}+ "
+              f"vezes nos últimos {CATALOG_REPEAT_DAYS} dias):"]
+    for k, n, ex in cands[:10]:
+        ind, nivel, periodo, tipo = (k.split("|") + ["?"] * 4)[:4]
+        linhas.append(f"• *{ind.upper()} · {nivel} · {periodo} · {tipo}* — {n}x. Ex.: " + " / ".join(f"_{q}_" for q in ex))
+    linhas.append("Se fizer sentido, eu transformo em consulta fixa.")
+    _alert("\n".join(linhas))
+
+
+FREE_ANALYSIS_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA — ANÁLISE FORA DO CATÁLOGO: esta pergunta não tem consulta pronta no app. Monte a "
+    "análise pedindo à Lyra Indicadores, SEMPRE a partir da base oficial e das regras dela (CSAT: seção 9 e regras de "
+    "fila; TMA/SLA: SQL de eficiência do Anexo, com o corte de SLA por célula). Reaproveite as mesmas fórmulas de "
+    "resultado, meta e impacto que ela já usa; não invente régua nova. Se precisar de uma conta que não está nas regras, "
+    "diga em meia frase como calculou.\n\n")
+FREE_ANALYSIS_NOTE = "_Análise feita na hora (fora das consultas prontas)._"
 
 
 # ---------------------------------------------------------------------------
@@ -6760,6 +7304,10 @@ def _scheduler_tick(now: datetime | None = None) -> None:
     except Exception:
         logger.exception("Team routines tick failed")
     try:
+        _catalog_weekly_tick(now)
+    except Exception:
+        logger.exception("Catalog weekly tick failed")
+    try:
         _agent_health_tick(now)
     except Exception:
         logger.exception("Agent health check failed")
@@ -8536,8 +9084,7 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 return
         if not efic_extra and _is_capa_request(question):
             event["_route"] = "capa"
-            _say(say, "Vou puxar a visão da CAPA (planejado x realizado de volume, TMA e SLA por célula). Leva alguns "
-                      "minutos ⏳", event, in_thread=True)
+            _say(say, "Já puxo TMA e SLA pra você ⏳", event, in_thread=True)
             resp_capa = _send_capa(event, client, eps, question)
             progress.done()
             if resp_capa:
@@ -8551,6 +9098,16 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             progress.done()
             if problem:
                 _say(say, problem, event, in_thread=True)
+            return
+        if not efic_extra and _is_pessoas_impacto_request(question) and (asks or not in_report_thread):
+            event["_route"] = "pessoas_impacto"
+            progress("Vou ver quem mais pesa no CSAT (operadores e supervisores), já te mando. ⏳")
+            try:
+                problem = _send_pessoas_impacto(event, client, eps, question, say, progress)
+            finally:
+                progress.done()
+            if problem:
+                _say(say, problem, event, in_thread)
             return
         count_ref = bool(event.get("thread_ts")) and bool(re.search(
             r"\bquant[oa]s\b.*\b(desses|dessas|destes|destas|deles|delas|casos?|tickets?|pendent\w*)\b", _norm_text(question)))
@@ -8681,10 +9238,16 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                            "se não for só mix, em seguida a esteira de impacto por pilar. Leva alguns minutos ⏳"),
                      event, in_thread=True)
                 cur, ref, l_cur, l_ref = _variation_periods(f"{question} ontem" if d1_ctx else question)
-                var_answer = ask_toqan(_variation_prompt(eps, fila_v, cur, ref), progress_callback=send_progress,
-                                       max_attempts=INTERACTIVE_MAX_POLLS)
+                var_data = {}
+                if CSAT_SQL_FIXO == "on":
+                    var_data = _csat_variacao_fixa(eps, fila_v, cur, ref, send_progress) or {}
+                if not var_data:
+                    var_answer = ask_toqan(_variation_prompt(eps, fila_v, cur, ref), progress_callback=send_progress,
+                                           max_attempts=INTERACTIVE_MAX_POLLS)
+                    var_data = {} if _is_error_answer(var_answer) else (_block_data_from_json(var_answer) or {})
+                if not var_data and CSAT_SQL_FIXO == "fallback":  # a análise do agente não voltou: conta pelo SQL fixo
+                    var_data = _csat_variacao_fixa(eps, fila_v, cur, ref, send_progress) or {}
                 progress.done()
-                var_data = {} if _is_error_answer(var_answer) else (_block_data_from_json(var_answer) or {})
                 rendered = _render_variation(fila_v, var_data, l_cur, l_ref, with_esteira=not mix_only) if var_data else None
                 if rendered:
                     _say_sections(say, rendered, event)
@@ -8715,6 +9278,12 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
         elif not extra and _MOTIVOS_RE.search(_norm_text(question)):
             extra = MOTIVOS_INSTRUCTION
             event["_route"] = "motivos"
+            if CSAT_SQL_FIXO == "on" and not _efic_indicator(question):
+                ini_m, fim_m, label_m = _capa_period(question, event)
+                dados_m = _csat_motivos_texto(eps, _fila_ref(question, eps, event), ini_m, fim_m, label_m, send_progress)
+                if dados_m:
+                    extra += ("DADOS (calculados pelo app com o SQL fixo do CSAT — use só estes números, sem nova "
+                              "consulta):\n" + dados_m + "\n\n")
         elif not extra and _ROSIE_EVAL_RE.search(_norm_text(question)):
             extra = ROSIE_EVAL_INSTRUCTION
         elif not extra and (_COMBO_RE.search(_norm_text(question)) or (
@@ -8734,9 +9303,14 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
         elif not extra and _is_small_talk(question):
             extra = CHAT_INSTRUCTION  # conversa curta: responde rápido, sem subagentes
             event["_route"] = "conversa"
+        shape = _catalog_shape(question, event) if not extra else None
+        free_note = bool(shape)
+        if shape:  # pergunta de indicador sem consulta pronta: análise livre com trilho, registrada para o catálogo
+            event["_route"] = event.get("_route") or f"livre:{shape['key']}"
+            _catalog_log(shape, question, event)
         context = _thread_context(event) or _dm_context(event)
         prompt = (f"{_scope_instruction(eps)}\n\n{_speaker_line(event)}{_date_context(question)}{context}{extra}"
-                  f"{DEFAULTS_INSTRUCTION if not extra else ''}{FULL_ACCESS_INSTRUCTION if _operator_names_allowed(eps) else ''}"
+                  f"{DEFAULTS_INSTRUCTION if not extra else ''}{FREE_ANALYSIS_INSTRUCTION if shape else ''}{FULL_ACCESS_INSTRUCTION if _operator_names_allowed(eps) else ''}"
                   f"{ANSWER_LAYOUT_INSTRUCTION}{_learnings_instruction(eps)}{_table_context(eps)}"
                   f"{_inject_mop_context(question, eps)}"
                   f"{_kb_context(question) if extra == KNOWLEDGE_INSTRUCTION else ''}"
@@ -8794,6 +9368,8 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             if detail:
                 _say(say, detail, event, in_thread=True)
             return
+        if free_note and answer and not esc_q and not _is_error_answer(answer) and re.search(r"\d", answer):
+            answer = answer.rstrip() + "\n\n" + FREE_ANALYSIS_NOTE
         if _looks_sectioned(answer):
             _say_sections(say, answer, event, in_thread)
         else:
