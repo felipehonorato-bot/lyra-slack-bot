@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.33.0"
+APP_VERSION = "5.34.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -3040,6 +3040,14 @@ def _send_case_list(event: dict[str, Any], client: Any, eps: str | None, questio
         return (f"A lista de casos voltou vazia, mas {('a equipe de ' + leader) if leader else f'`{fila}`'} tem {esperado} "
                 f"detratora(s) no período — a consulta falhou do meu lado, não é falta de caso. Já avisei o time; tenta "
                 "de novo daqui a pouco?")
+    if ind in {"sla", "tma"} and (not casos or not casos[1]) and not op_rows:
+        # nada de planilha vazia: o mais comum é a base de filas ainda não ter fechado o dia pedido
+        alvo0 = f"`{fila}`" if fila else f"a equipe de {leader}"
+        if d1:
+            return (f"Não veio nenhuma interação de {alvo0} em {spec['short']} na base de filas: ela ainda não fechou o dia "
+                    "de ontem (costuma entrar mais tarde). Me pede de novo amanhã cedo, ou peça \"da semana\" que eu "
+                    "trago os dias já fechados.")
+        return f"Não veio nenhuma interação de {alvo0} em {spec['short']} na base de filas. Quer outro período?"
     from openpyxl import Workbook
     wb = Workbook()
     wb.remove(wb.active)
@@ -3386,6 +3394,33 @@ def _render_capa(rows: list[dict[str, str]], eps: str | None, label: str) -> str
     return "\n\n".join(blocos)
 
 
+def _capa_resumo(rows: list[dict[str, str]], eps: str | None, label: str) -> str:
+    """Resumo de TMA e SLA para o "como tá a EPS?": consolidado + o que mais preocupa (o detalhe vem no "TMA e SLA")."""
+    completo = _render_capa(rows, eps, label)
+    out = []
+    for parte in re.split(r"\n\n(?=[🔴🟢] \*TMA e SLA ·\*)", completo or ""):
+        linhas = parte.split("\n")
+        if not linhas:
+            continue
+        eps_txt = re.search(r"`([^`]+)`", linhas[0])
+        cons = [l for l in linhas if l.startswith("• TMA") or l.startswith("• SLA")]
+        fora_sla = sum(1 for l in linhas if l.startswith("   • SLA") and "🔴" in l)
+        tot_sla = sum(1 for l in linhas if l.startswith("   • SLA"))
+        fora_tma = sum(1 for l in linhas if l.startswith("   • TMA") and "🔴" in l)
+        tot_tma = sum(1 for l in linhas if l.startswith("   • TMA") and "plan a definir" not in l)
+        preocupa = next((l for l in linhas if l.startswith("↳ Mais preocupa")), "")
+        r = [f"⚙️ *TMA e SLA · `{eps_txt.group(1) if eps_txt else ''}`* — {label}"]
+        r += [c.replace(" (2 min nas Super Cliente, 5 min nas demais)", "") for c in cons[:2]]
+        if tot_tma or tot_sla:
+            r.append(f"• Filas fora: TMA acima do plan em {fora_tma} de {tot_tma} · SLA abaixo da meta em {fora_sla} de {tot_sla}")
+        if preocupa:
+            r.append(preocupa)
+        out.append("\n".join(r))
+    nome = f" da {eps}" if eps else ""
+    return "\n\n".join(out) + (f"\n_Pra ver fila a fila: \"TMA e SLA{nome}\"; dia a dia: \"TMA e SLA dia a dia{nome}\"._"
+                                 if out else "")
+
+
 def _capa_xlsx(rows: list[dict[str, str]], eps: str | None) -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill
@@ -3467,9 +3502,15 @@ def _render_motivos_efic(rows: list[dict[str, str]], ind: str, label: str, fila:
              else "quanto cada motivo derruba o SLA da fila: interações fora do prazo além do que a taxa da fila daria")
     linhas = [f"{titulo} — {label} · _{regua}_"]
     ordem = sorted(por_cel, key=lambda c: -sum(_cv(r, imp_col) or 0 for r in por_cel[c]))
+    sem_mot = lambda r: _norm_text(_motivo_label(r.get("motivo")) or "") in {"", "sem motivo", "null", "none"}
     for cel in ordem:
-        itens = sorted(por_cel[cel], key=lambda r: -(_cv(r, imp_col) or 0))[:top]
+        validos = [r for r in por_cel[cel] if not sem_mot(r)]
+        itens = sorted(validos, key=lambda r: -(_cv(r, imp_col) or 0))[:top]
+        if not itens:
+            continue
         r0 = itens[0]
+        sm = next((r for r in por_cel[cel] if sem_mot(r)), None)
+        peso_sm = (_cv(sm, "peso tratados" if ind == "tma" else "peso sla") or 0) if sm else 0
         if ind == "tma":
             ref = _cv(r0, "tempo atribuicao celula")
             linhas.append("")
@@ -3493,6 +3534,9 @@ def _render_motivos_efic(rows: list[dict[str, str]], ind: str, label: str, fila:
                               f"{_fmt_int(n_i)} interações ({_bfmt(peso * 100)}% da fila)")
                 linhas.append(f"   ↳ {_fmt_int(extra)} fora do prazo a mais do que a média da fila daria"
                               + (f" · tira {_bfmt(extra / total * 100, 1)} p.p. do SLA da fila" if total else ""))
+        if peso_sm >= 0.05:
+            linhas.append(f"   _{_bfmt(peso_sm * 100)}% da fila está sem motivo tabulado: ficou fora do ranking (não dá pra "
+                          "treinar o que não foi tabulado), mas vale cobrar a tabulação._")
     return "\n".join(linhas)
 
 
@@ -3523,8 +3567,9 @@ def _capa_check_referencia(rows: list[dict[str, str]], ini: date, fim: date) -> 
 
 
 def _render_capa_diaria(rows: list[dict[str, str]], eps: str | None, label: str, celula: str | None) -> str:
-    """Dia a dia (como o bloco diário da aba CAPA): da célula pedida ou, sem célula, o consolidado da EPS (somas)."""
+    """Dia a dia no modelo do report: um dia por linha com veredito de TMA (vs plan) e SLA (vs meta) e Leitura."""
     blocos = []
+    dsem = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]
     for eps_k, eps_nome in (("aec", "AeC"), ("csu", "CSU")):
         if eps and _compact(eps) != eps_k:
             continue
@@ -3535,39 +3580,82 @@ def _render_capa_diaria(rows: list[dict[str, str]], eps: str | None, label: str,
         por_dia: dict[str, list[dict[str, str]]] = {}
         for r in sel:
             por_dia.setdefault(str(r.get("data", ""))[:10], []).append(r)
-        alvo = f"`{celula}`" if celula else f"consolidado `{eps_nome}`"
-        linhas = [f"📅 *TMA e SLA por dia · {alvo}* — {label}"]
         dias = sorted(por_dia)
         vol = {d: sum(_cv(r, "ticket unico real") or 0 for r in por_dia[d]) for d in dias}
         tipico = sorted(vol.values())[len(vol) // 2] if vol else 0
+        alvo = f"`{celula}`" if celula else f"`{eps_nome}`"
+        linhas = [f"📅 *TMA e SLA por dia ·* {alvo} *— {label}*",
+                  "_TMA contra o plan do dia · SLA contra a meta"
+                  + (f" ({_fmt_meta(_capa_sla_meta(celula))}%)" if celula else " (90% nas Super Cliente, 80% nas demais, "
+                     "ponderada pelo volume de cada fila)") + "_", ""]
+        serie, pendente = [], None
         for dia in dias:
             rs = por_dia[dia]
-            if dia == dias[-1] and len(dias) > 1 and vol[dia] < 0.5 * tipico:  # último dia ainda não fechou na base
-                linhas.append(f"_{dia[8:10]}/{dia[5:7]}: a base ainda não fechou o dia (só {_fmt_int(vol[dia])} tickets); "
-                              "entra amanhã._")
-                continue
-            tempo = sum(_cv(r, "soma tempo atribuicao") or 0 for r in rs)
-            tk = sum(_cv(r, "ticket unico real") or 0 for r in rs)
-            tk_p = sum(_cv(r, "ticket unico plan") or 0 for r in rs if _cv(r, "tempo atendimento plan (ticket)"))
-            tempo_p = sum((_cv(r, "ticket unico plan") or 0) * (_cv(r, "tempo atendimento plan (ticket)") or 0) for r in rs)
-            base = sum(_cv(r, "sla base") or 0 for r in rs)
-            dentro = sum(_cv(r, "sla dentro") or 0 for r in rs)
             try:
                 d = datetime.strptime(dia, "%Y-%m-%d")
-                dia_txt = f"{d.strftime('%d/%m')} {['seg', 'ter', 'qua', 'qui', 'sex', 'sáb', 'dom'][d.weekday()]}"
+                dia_txt = f"{d.strftime('%d/%m')} {dsem[d.weekday()]}"
             except ValueError:
                 dia_txt = dia
-            partes = [dia_txt]
+            if dia == dias[-1] and len(dias) > 1 and vol[dia] < 0.5 * tipico:  # último dia ainda não fechou na base
+                pendente = dia_txt.split()[0]
+                continue
+            tempo = sum(_cv(r, "soma tempo atribuicao") or 0 for r in rs)
+            tk = vol[dia]
+            tk_p = sum(_cv(r, "ticket unico plan") or 0 for r in rs if _cv(r, "tempo atendimento plan (ticket)"))
+            tempo_p = sum((_cv(r, "ticket unico plan") or 0) * (_cv(r, "tempo atendimento plan (ticket)") or 0) for r in rs)
+            tk_plan = sum(_cv(r, "ticket unico plan") or 0 for r in rs)
+            base = sum(_cv(r, "sla base") or 0 for r in rs)
+            dentro = sum(_cv(r, "sla dentro") or 0 for r in rs)
+            meta_x = sum((_cv(r, "sla base") or 0) * _capa_sla_meta(r.get("celula", "")) for r in rs)
+            tma = tempo / tk if tk else None
+            plan = tempo_p / tk_p if tk_p else None
+            sla = dentro / base * 100 if base else None
+            meta = meta_x / base if base else None
+            ruim = (tma is not None and plan and tma > plan + 0.5) or (sla is not None and meta and sla < meta)
+            cab = f"{'🔴' if ruim else '🟢'} *{dia_txt}*"
             if tk:
-                partes.append(f"TMA {_fmt_int(tempo / tk)} s" + (f" x {_fmt_int(tempo_p / tk_p)} s" if tk_p else ""))
-            if base:
-                sla = dentro / base * 100
-                meta = _capa_sla_meta(celula) if celula else None
-                partes.append(f"SLA {_bfmt(sla)}%" + (f" {'🟢' if sla >= meta else '🔴'}" if meta else ""))
-            if tk:
-                partes.append(f"tickets {_fmt_int(tk)}" + (f" x {_fmt_int(sum(_cv(r, 'ticket unico plan') or 0 for r in rs))}"
-                                                           if any(_cv(r, 'ticket unico plan') for r in rs) else ""))
-            linhas.append(" · ".join(partes))
+                cab += f" · {_fmt_int(tk)} tickets" + (f" ({'+' if tk >= tk_plan else '−'}"
+                                                      f"{_bfmt(abs(tk / tk_plan - 1) * 100, 0)}% vs plan)" if tk_plan else "")
+            linhas.append(cab)
+            if tma is not None:
+                if plan:
+                    v = (f"🔴 {_fmt_int(tma - plan)} s acima do plan {_fmt_int(plan)} s" if tma > plan + 0.5 else
+                         f"🟢 {_fmt_int(plan - tma)} s abaixo do plan {_fmt_int(plan)} s")
+                else:
+                    v = "⚪ plan a definir"
+                linhas.append(f"   • TMA *{_fmt_int(tma)} s* → {v}")
+            if sla is not None:
+                v = (f"🔴 {_bfmt(meta - sla)} p.p. abaixo da meta {_bfmt(meta, 0)}%" if meta and sla < meta else
+                     f"🟢 {_bfmt(sla - meta)} p.p. acima da meta {_bfmt(meta, 0)}%" if meta else "")
+                linhas.append(f"   • SLA *{_bfmt(sla)}%*" + (f" → {v}" if v else ""))
+            linhas.append("")
+            serie.append((dia_txt, tma, plan, sla, meta))
+        if pendente:
+            linhas.append(f"⏳ _{pendente}: a base ainda não fechou o dia; entra amanhã._")
+        while linhas and linhas[-1] == "":
+            linhas.pop()
+        leitura = []
+        t_ok = [x for x in serie if x[1] is not None and x[2]]
+        s_ok = [x for x in serie if x[3] is not None and x[4]]
+        if t_ok:
+            acima = [x for x in t_ok if x[1] > x[2] + 0.5]
+            pior = max(t_ok, key=lambda x: x[1] - x[2])
+            leitura.append(f"TMA acima do plan em {len(acima)} de {len(t_ok)} dias"
+                           + (f"; pior em {pior[0]} ({_fmt_int(pior[1])} s, +{_fmt_int(pior[1] - pior[2])} s)." if acima else "."))
+        if s_ok:
+            abaixo = [x for x in s_ok if x[3] < x[4]]
+            pior = min(s_ok, key=lambda x: x[3] - x[4])
+            leitura.append(f"SLA abaixo da meta em {len(abaixo)} de {len(s_ok)} dias"
+                           + (f"; pior em {pior[0]} ({_bfmt(pior[3])}%, {_bfmt(pior[4] - pior[3])} p.p. abaixo)." if abaixo else "."))
+            fds = [x for x in s_ok if x[0].endswith(("sáb", "dom"))]
+            uteis = [x for x in s_ok if not x[0].endswith(("sáb", "dom"))]
+            if len(fds) >= 2 and uteis:
+                m_f, m_u = sum(x[3] for x in fds) / len(fds), sum(x[3] for x in uteis) / len(uteis)
+                if m_u - m_f >= 3:
+                    leitura.append(f"Fim de semana pior no SLA: média {_bfmt(m_f)}% contra {_bfmt(m_u)}% nos dias úteis; "
+                                   "vale olhar a escala de sábado e domingo.")
+        if leitura:
+            linhas += ["", "💡 *Leitura*"] + [f"↳ {t}" for t in leitura]
         blocos.append("\n".join(linhas))
     return "\n\n".join(blocos)
 
@@ -9327,7 +9415,18 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 table = None
             if table:
                 event["_route"] = "tabela"
-                _say_sections(say, table, event)
+                geral = not re.search(r"\b(csat|nota\w*|avaliac\w*|tma|sla|tempo|primeira resposta|fila\w*|ranking|impact\w*)\b",
+                                      _norm_text(question)) and bool(_capa_template()[0])
+                _say_sections(say, table + ("\n\n_TMA e SLA vêm logo abaixo, só um minutinho._ ⏳" if geral else ""), event)
+                if geral:  # "como tá a AeC?": o retrato inclui eficiência, não só CSAT
+                    try:
+                        ini_c, fim_c, label_c = _capa_period("", event)
+                        rows_c, _ = _capa_rows(ini_c, fim_c, None)
+                        resumo = _capa_resumo(rows_c, eps or _eps_in_text(question), label_c) if rows_c else ""
+                        _say(say, resumo or "TMA e SLA não voltaram agora; se quiser, me pede \"TMA e SLA\" daqui a pouco.",
+                             event, True)
+                    except Exception:
+                        logger.warning("CAPA summary after table failed", exc_info=True)
                 if not (_CAUSE_FOLLOW_RE.search(_norm_text(question)) and focus.get("fila")):
                     return
                 # pergunta dupla ("qual fila mais impacta e quais as causas?"): emenda a análise de causa da fila
