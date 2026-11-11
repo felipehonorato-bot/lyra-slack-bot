@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.31.2"
+APP_VERSION = "5.31.4"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -3231,10 +3231,12 @@ def _capa_rows(ini: date, fim: date, progress: Callable[[str], Any] | None = Non
     return out, problema
 
 
-def _run_app_sql(filled: str, progress: Callable[[str], Any] | None, nome: str) -> tuple[list[dict[str, str]] | None, str]:
+def _run_app_sql(filled: str, progress: Callable[[str], Any] | None, nome: str,
+                 acesso: bool = False) -> tuple[list[dict[str, str]] | None, str]:
     """Manda um SQL pronto do app para a Lyra Indicadores executar como veio; devolve as linhas (cabeçalho normalizado)."""
     # a Lyra Indicadores recusa pedido sem a linha EPS: (seção 1 dela). O recorte já está no SQL, então vai iFood.
-    corpo = ("EPS: iFood\nPedido: SQL pronto do app\n\n"
+    # SQL com e-mail de operador: o app controla quem vê (mesma regra da visão de equipe), então libera a identificação
+    corpo = ("EPS: iFood\nPedido: SQL pronto do app\n" + ("Acesso: completo\nLista: completa\n" if acesso else "") + "\n"
              "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Execute no Databricks EXATAMENTE o SQL abaixo, como UMA "
              "instrução só, sem alterar nada (nem datas, nem fórmulas, nem colunas). Devolva SOMENTE o resultado em CSV "
              "separado por ';', com a linha de cabeçalho exatamente como as colunas saírem, números com ponto decimal e "
@@ -4739,7 +4741,7 @@ def _csat_fixed_rows(nome: str, ini: date, fim: date, params: dict[str, str], pr
     hit = _CSAT_ROWS_CACHE.get(key)
     if hit and time.time() - hit[0] < 1800:
         return hit[1], ""
-    rows, problema = _run_app_sql(sql, progress, rotulo)
+    rows, problema = _run_app_sql(sql, progress, rotulo, acesso=nome == "csat_operadores.sql")
     if rows is not None:
         _CSAT_ROWS_CACHE[key] = (time.time(), rows)
     return rows, problema
@@ -4779,8 +4781,11 @@ def _pessoas_impacto_calc(rows: list[dict[str, str]], eps_nome: str, fila: str |
     am = sum(_sql_num(r.get("avaliacoes")) or 0 for r, m in com_meta if m is not None)
     meta_cons = sum((_sql_num(r.get("avaliacoes")) or 0) * m for r, m in com_meta if m is not None) / am if am else None
     ops: dict[str, dict[str, Any]] = {}
+    by_user = {e.split("@")[0]: e for e in people}
     for r in rows:
-        email = r.get("email", "").lower()
+        email = r.get("email", "").strip().lower()
+        if email and email != "total" and "@" not in email:  # veio só o usuário do e-mail: completa pelo MOP
+            email = by_user.get(email, f"{email}@{_compact(eps_nome)}")
         if "@" not in email or not mine(r) or (emails is not None and email not in emails):
             continue
         a, p = _sql_num(r.get("avaliacoes")) or 0, _sql_num(r.get("promotoras")) or 0
@@ -4907,6 +4912,11 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
         if calc:
             textos.append(_render_pessoas_impacto(calc, fila or eps_nome, label, d1, eps, titulo_equipe, so_sup, so_ops))
     if not textos:
+        n_ops = sum(1 for r in rows if r.get("email", "").strip() and r.get("email", "").upper() != "TOTAL")
+        if rows and n_ops == 0:  # voltou só o total: a Indicadores tirou as linhas de operador
+            _alert(f"⚠️ CSAT por operador ({ini} a {fim}): voltaram só as linhas TOTAL, sem nenhum operador "
+                   "(a Lyra Indicadores tirou os e-mails? confira se ela está na v2.5.6).")
+            return "A consulta voltou sem as linhas dos operadores. Já avisei o time; tenta de novo daqui a pouco?"
         if rows and not any(r.get("email", "").upper() == "TOTAL" for r in rows):  # voltou algo, mas não o que o SQL devolve
             _alert(f"⚠️ CSAT por operador ({ini} a {fim}): a resposta não trouxe as linhas TOTAL do SQL fixo. "
                    f"Colunas: {sorted(rows[0].keys())[:8]} · 1ª linha: {_mask_pii(str(list(rows[0].values())[:5]))}")
