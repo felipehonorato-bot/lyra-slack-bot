@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.31.4"
+APP_VERSION = "5.32.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -4741,7 +4741,7 @@ def _csat_fixed_rows(nome: str, ini: date, fim: date, params: dict[str, str], pr
     hit = _CSAT_ROWS_CACHE.get(key)
     if hit and time.time() - hit[0] < 1800:
         return hit[1], ""
-    rows, problema = _run_app_sql(sql, progress, rotulo, acesso=nome == "csat_operadores.sql")
+    rows, problema = _run_app_sql(sql, progress, rotulo, acesso=nome in {"csat_operadores.sql", "csat_pessoas.sql"})
     if rows is not None:
         _CSAT_ROWS_CACHE[key] = (time.time(), rows)
     return rows, problema
@@ -4823,6 +4823,64 @@ def _pessoas_impacto_calc(rows: list[dict[str, str]], eps_nome: str, fila: str |
             "sups": list(sups.values())}
 
 
+def _pessoas_sql_params(eps: str | None, fila: str | None, people: dict[str, dict[str, str]], dia_meta: date,
+                        emails: set[str] | None, d1: bool) -> dict[str, str]:
+    """Parâmetros do csat_pessoas.sql: metas das filas, vínculo operador → supervisor do MOP e recortes."""
+    esc = lambda v: str(v).replace("'", "''")
+    eps_lista, eps_like = _csat_eps_params(eps)
+    metas = [(f, _meta_fila(f, dia_meta)) for f in FILA_GRUPO_META]
+    metas_v = ", ".join(f"('{esc(f)}', {m:g})" for f, m in metas if m is not None) or "('__sem_meta__', 0)"
+    por_sup: dict[str, list[str]] = {}
+    for e, p in people.items():
+        if emails is not None and e not in emails:
+            continue
+        u = _EMAIL_SAFE_RE.sub("", e.split("@")[0].lower())
+        if u:
+            por_sup.setdefault(p.get("supervisor") or "Sem supervisor no MOP", []).append(u)
+    mop_v = ", ".join(f"('{esc(sup)}', '{'|'.join(sorted(us))}')" for sup, us in sorted(por_sup.items())) \
+        or "('Sem supervisor no MOP', '')"
+    return {"eps_lista": eps_lista, "eps_like": eps_like, "metas_values": metas_v, "mop_values": mop_v,
+            "filtro_fila": f"fila_relatorio = '{esc(fila)}'" if fila else "1 = 1",
+            "filtro_equipe": "mp.u IS NOT NULL" if emails is not None else "1 = 1",
+            "min_aval": str(PESSOAS_MIN_AVAL_D1 if d1 else PESSOAS_MIN_AVAL), "top_ops": str(PESSOAS_OPS_MAX)}
+
+
+def _pessoas_from_rows(rows: list[dict[str, str]], eps_nome: str, people: dict[str, dict[str, str]]) -> dict[str, Any] | None:
+    """Monta o mesmo dicionário de _pessoas_impacto_calc a partir da saída agregada do csat_pessoas.sql."""
+    mine = [r for r in rows if _compact(r.get("eps", "")) == _compact(eps_nome)]
+    tot = next((r for r in mine if r.get("tipo", "").upper() == "TOTAL"), None)
+    n = _sql_num(tot.get("avaliacoes")) if tot else None
+    if not n:
+        return None
+    n_meta, meta_x = _sql_num(tot.get("aval meta")) or 0, _sql_num(tot.get("meta x")) or 0
+    by_user = {e.split("@")[0]: e for e in people}
+
+    def item(r: dict[str, str]) -> dict[str, Any]:
+        a, p = _sql_num(r.get("avaliacoes")) or 0, _sql_num(r.get("promotoras")) or 0
+        am, mx = _sql_num(r.get("aval meta")) or 0, _sql_num(r.get("meta x")) or 0
+        return {"aval": a, "prom": p, "acima": _sql_num(r.get("acima")) or 0, "aval_meta": am,
+                "csat": p / a * 100 if a else None, "meta": mx / am if am else None,
+                "imp": _sql_num(r.get("impacto pp")) if am else None, "n_ops": int(_sql_num(r.get("n ops")) or 0)}
+
+    ops, sups = [], []
+    for r in mine:
+        tipo = r.get("tipo", "").upper()
+        if tipo == "OP":
+            u = r.get("nome", "").strip().lower()
+            email = by_user.get(u) or u  # fora do MOP: fica o usuário do e-mail
+            o = item(r)
+            o.update(email=email, fila=r.get("fila", ""), nome=(people.get(email) or {}).get("nome", ""),
+                     sup=(people.get(email) or {}).get("supervisor") or "")
+            ops.append(o)
+        elif tipo == "SUP":
+            s_ = item(r)
+            s_["sup"] = r.get("nome", "") or "Sem supervisor no MOP"
+            sups.append(s_)
+    fora = next((int(_sql_num(r.get("n ops")) or 0) for r in mine if r.get("tipo", "").upper() == "FORA"), 0)
+    return {"n": n, "csat": (_sql_num(tot.get("promotoras")) or 0) / n * 100, "meta": meta_x / n_meta if n_meta else None,
+            "ops": ops, "sups": sups, "fora": fora}
+
+
 def _pp_signed(v: float | None, dec: int = 2) -> str:
     if v is None:
         return "—"
@@ -4847,24 +4905,24 @@ def _render_pessoas_impacto(calc: dict[str, Any], alvo: str, label: str, d1: boo
     sups = sorted([s for s in calc["sups"] if s["imp"] is not None], key=lambda s: s["imp"])
     if sups and not so_ops and not titulo_equipe:
         linhas += ["", "👥 *Por supervisor* — quem mais puxa para baixo"]
-        for i, s in enumerate([s for s in sups if s["imp"] < 0][:PESSOAS_SUP_MAX], 1):
+        for i, s in enumerate([s for s in sups if s["imp"] < -0.005][:PESSOAS_SUP_MAX], 1):
             falt = max(0, math.ceil(-s["acima"] - 1e-9))
             linhas.append(f"{i}. {_nice_name(s['sup'])} · *{_pp_signed(s['imp'])}* · CSAT {_bfmt(s['csat'])}% "
                           f"(meta {_bfmt(s['meta'])}%) · {s['n_ops']} operador(es) · n={_fmt_int(s['aval'])}"
                           + (f" · {falt} positivas faltantes" if falt else ""))
-        if not any(s["imp"] < 0 for s in sups):
+        if not any(s["imp"] < -0.005 for s in sups):
             linhas.append("Nenhuma equipe abaixo da meta no recorte. 👏")
     ops = sorted([o for o in calc["ops"] if o["imp"] is not None and o["aval"] >= minimo], key=lambda o: o["imp"])
-    fora = sum(1 for o in calc["ops"] if o["aval"] < minimo)
+    fora = calc["fora"] if calc.get("fora") is not None else sum(1 for o in calc["ops"] if o["aval"] < minimo)
     if not so_sup:
-        neg = [o for o in ops if o["imp"] < 0]
+        neg = [o for o in ops if o["imp"] < -0.005]
         linhas += ["", "🧑‍💻 *Por operador* — quem mais puxa para baixo"]
         for i, o in enumerate(neg[:PESSOAS_OPS_MAX], 1):
             linhas.append(f"{i}. {who(o)} · {o['fila']} · *{_pp_signed(o['imp'])}* · CSAT {_bfmt(o['csat'])}% "
                           f"(meta {_bfmt(o['meta'])}%) · n={_fmt_int(o['aval'])}")
         if not neg:
             linhas.append("Ninguém abaixo da meta da fila no recorte. 👏")
-        pos = [o for o in reversed(ops) if o["imp"] > 0][:3]
+        pos = [o for o in reversed(ops) if o["imp"] > 0.005][:3]
         if pos:
             linhas += ["", "💪 *Quem mais segura o resultado*"]
             linhas += [f"• {who(o)} · {o['fila']} · {_pp_signed(o['imp'])} · CSAT {_bfmt(o['csat'])}% · "
@@ -4896,9 +4954,8 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
             if eps is None:
                 eps_t = {people[e].get("eps") for e in emails} - {"", None}
                 eps = eps_t.pop() if len(eps_t) == 1 else None
-    eps_lista, eps_like = _csat_eps_params(eps)
-    rows, problema = _csat_fixed_rows("csat_operadores.sql", ini, fim,
-                                      {"eps_lista": eps_lista, "eps_like": eps_like, "filtro_operadores": "1 = 1"},
+    rows, problema = _csat_fixed_rows("csat_pessoas.sql", ini, fim,
+                                      _pessoas_sql_params(eps, fila, people, fim, emails, d1),
                                       progress, f"CSAT por operador ({ini} a {fim})")
     if rows is None:
         return problema
@@ -4908,16 +4965,16 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
         r"\b(supervisor\w*|supervisora\w*|coordenador\w*|equipes?)\b", t)
     textos = []
     for eps_nome in ([eps] if eps else ["AeC", "CSU"]):
-        calc = _pessoas_impacto_calc(rows, eps_nome, fila, people, fim, emails)
+        calc = _pessoas_from_rows(rows, eps_nome, people)
         if calc:
             textos.append(_render_pessoas_impacto(calc, fila or eps_nome, label, d1, eps, titulo_equipe, so_sup, so_ops))
     if not textos:
-        n_ops = sum(1 for r in rows if r.get("email", "").strip() and r.get("email", "").upper() != "TOTAL")
-        if rows and n_ops == 0:  # voltou só o total: a Indicadores tirou as linhas de operador
-            _alert(f"⚠️ CSAT por operador ({ini} a {fim}): voltaram só as linhas TOTAL, sem nenhum operador "
-                   "(a Lyra Indicadores tirou os e-mails? confira se ela está na v2.5.6).")
+        tipos = {r.get("tipo", "").upper() for r in rows}
+        if rows and "TOTAL" in tipos and not tipos & {"OP", "SUP"}:  # voltou só o total: a Indicadores tirou as pessoas
+            _alert(f"⚠️ CSAT por operador ({ini} a {fim}): voltaram só as linhas TOTAL, sem operador nem supervisor "
+                   "(a Lyra Indicadores tirou a identificação? confira se ela está na v2.5.6).")
             return "A consulta voltou sem as linhas dos operadores. Já avisei o time; tenta de novo daqui a pouco?"
-        if rows and not any(r.get("email", "").upper() == "TOTAL" for r in rows):  # voltou algo, mas não o que o SQL devolve
+        if rows and "TOTAL" not in tipos:  # voltou algo, mas não o que o SQL devolve
             _alert(f"⚠️ CSAT por operador ({ini} a {fim}): a resposta não trouxe as linhas TOTAL do SQL fixo. "
                    f"Colunas: {sorted(rows[0].keys())[:8]} · 1ª linha: {_mask_pii(str(list(rows[0].values())[:5]))}")
             return "A consulta voltou num formato que eu não consegui ler. Já avisei o time; tenta de novo daqui a pouco?"
