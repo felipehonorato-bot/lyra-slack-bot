@@ -47,6 +47,10 @@ sups AS (
     FROM pessoas p JOIN tot t ON t.eps = p.eps
     GROUP BY p.eps, p.sup
 ),
+sem_mop AS (   -- amostra de quem atendeu e não está no MOP de hoje (para o time corrigir o MOP)
+    SELECT * FROM pessoas WHERE sup = 'Sem supervisor no MOP'
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY eps ORDER BY aval DESC) <= 8
+),
 ops_rank AS (
     SELECT * FROM pessoas
     WHERE aval >= {min_aval} AND aval_meta > 0
@@ -64,3 +68,5 @@ UNION ALL
 SELECT 'SUP', eps, sup, '', aval, prom, acima, aval_meta, meta_x, n_ops, imp FROM sups
 UNION ALL
 SELECT 'OP', eps, usuario, fila, aval, prom, acima, aval_meta, meta_x, 1, imp FROM ops_rank
+UNION ALL
+SELECT 'SEMMOP', eps, usuario, fila, aval, prom, NULL, NULL, NULL, 1, NULL FROM sem_mop

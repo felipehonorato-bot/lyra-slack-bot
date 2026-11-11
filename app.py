@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.32.0"
+APP_VERSION = "5.33.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -3288,17 +3288,65 @@ def _capa_sla_meta(celula: str) -> float:
     return metas.get(_norm_text(celula), CAPA_SLA_META_PADRAO)
 
 
+CAPA_MIN_TICKETS = 20  # célula com volume residual (ex.: fila desativada) não entra na mensagem
+
+
 def _render_capa(rows: list[dict[str, str]], eps: str | None, label: str) -> str:
+    """TMA e SLA no modelo do report das 9h: título com o consolidado, bloco por fila (valor → veredito) e Leitura."""
     blocos = []
+
+    def tma_vs_plan(v: float, plan: float | None) -> str:
+        if not plan:
+            return "⚪ plan a definir"
+        d = v - plan
+        if d > 0.5:
+            return f"🔴 {_fmt_int(d)} s acima do plan {_fmt_int(plan)} s"
+        return f"🟢 {_fmt_int(-d)} s abaixo do plan {_fmt_int(plan)} s" if d < -0.5 else "🟢 no plan"
+
+    def sla_vs_meta(v: float, meta: float) -> str:
+        if v < meta:
+            return f"🔴 {_bfmt(meta - v)} p.p. abaixo da meta {_fmt_meta(meta)}%"
+        return f"🟢 {_bfmt(v - meta)} p.p. acima da meta {_fmt_meta(meta)}%" if v > meta else "🟢 na meta"
+
     for eps_k, eps_nome in (("aec", "AeC"), ("csu", "CSU")):
         if eps and _compact(eps) != eps_k:
             continue
-        cel = [r for r in rows if _norm_text(r.get("eps", "")) == eps_k and (_cv(r, "interacoes real") or 0) > 0]
+        cel_all = [r for r in rows if _norm_text(r.get("eps", "")) == eps_k and (_cv(r, "interacoes real") or 0) > 0]
+        cel = [r for r in cel_all if (_cv(r, "ticket unico real") or 0) >= CAPA_MIN_TICKETS]
         if not cel:
             continue
         sem_plano = any(r.get("_sem_plano") for r in cel)
-        linhas = [f"⚙️ *TMA e SLA · `{eps_nome}`* — {label}" + (" · _sem plano carregado para esse mês_" if sem_plano else "")]
-        piores = []
+        # consolidado com as somas (nunca média das células)
+        s_tempo = sum(_cv(r, "soma tempo atribuicao") or 0 for r in cel_all)
+        s_tk = sum(_cv(r, "ticket unico real") or 0 for r in cel_all)
+        s_tk_p = sum(_cv(r, "ticket unico plan") or 0 for r in cel_all if _cv(r, "tempo atendimento plan (ticket)"))
+        s_tempo_p = sum((_cv(r, "ticket unico plan") or 0) * (_cv(r, "tempo atendimento plan (ticket)") or 0) for r in cel_all)
+        s_base = sum(_cv(r, "sla base") or 0 for r in cel_all)
+        s_dentro = sum(_cv(r, "sla dentro") or 0 for r in cel_all)
+        tk_plan_all = sum(_cv(r, "ticket unico plan") or 0 for r in cel_all)
+        tma_c = s_tempo / s_tk if s_tk and s_tempo else None
+        tma_cp = s_tempo_p / s_tk_p if s_tk_p else None
+        sla_c = s_dentro / s_base * 100 if s_base else None
+        off_c = tma_c is not None and tma_cp is not None and tma_c > tma_cp + 0.5
+        head = f"{'🔴' if off_c else '🟢'} *TMA e SLA ·* `{eps_nome}` *— {label}*"
+        if tma_c is not None:
+            head += f" · TMA {_fmt_int(tma_c)} s" + (f" (plan {_fmt_int(tma_cp)} s)" if tma_cp else "")
+        if sla_c is not None:
+            head += f" · SLA {_bfmt(sla_c)}%"
+        linhas = [head]
+        if sem_plano:
+            linhas.append("_Sem plano carregado para esse mês: comparo só o realizado._")
+        linhas += ["", f"📍 *Consolidado {eps_nome}*"]
+        if tma_c is not None:
+            linhas.append(f"• TMA *{_fmt_int(tma_c)} s* → {tma_vs_plan(tma_c, tma_cp)}")
+        if sla_c is not None:
+            linhas.append(f"• SLA de 1ª resposta *{_bfmt(sla_c)}%* (2 min nas Super Cliente, 5 min nas demais)")
+        if s_tk:
+            linhas.append(f"• Tickets *{_fmt_int(s_tk)}*" + (f" → {_bfmt(abs(s_tk / tk_plan_all - 1) * 100)}% "
+                                                          f"{'acima' if s_tk >= tk_plan_all else 'abaixo'} do plan "
+                                                          f"{_fmt_int(tk_plan_all)}" if tk_plan_all else ""))
+        linhas += ["", "🗂️ *Por fila*"]
+        piores, leitura = [], []
         for r in cel:
             nome = r.get("celula", "")
             tma, tma_p = _cv(r, "tempo atribuicao (ticket)"), _cv(r, "tempo atendimento plan (ticket)")
@@ -3307,50 +3355,33 @@ def _render_capa(rows: list[dict[str, str]], eps: str | None, label: str) -> str
             tk, tk_p = _cv(r, "ticket unico real"), _cv(r, "ticket unico plan")
             mi, mi_p = _cv(r, "media interacoes real"), _cv(r, "media interacoes plan")
             sla_pct = sla * 100 if sla is not None and sla <= 1.5 else sla
-            ruim_tma = tma is not None and tma_p and tma > tma_p
+            ruim_tma = tma is not None and bool(tma_p) and tma > tma_p + 0.5
             ruim_sla = sla_pct is not None and sla_pct < meta
-            icon = "🔴" if ruim_tma and ruim_sla else ("🟡" if ruim_tma or ruim_sla else "🟢")
-            partes = [f"{icon} `{nome}`"]
+            vol = (f" · {_fmt_int(tk)} tickets" + (f" ({'+' if tk >= tk_p else '−'}{_bfmt(abs(tk / tk_p - 1) * 100, 0)}% "
+                                                   f"vs plan)" if tk_p else "")) if tk is not None else ""
+            linhas.append(f"{'🔴' if ruim_tma or ruim_sla else '🟢'} `{nome}`{vol}")
             if tma is not None:
-                partes.append(f"TMA {_fmt_int(tma)} s" + (f" x {_fmt_int(tma_p)} s ({'+' if tma - tma_p >= 0 else '−'}"
-                                                         f"{_fmt_int(abs(tma - tma_p))} s)" if tma_p else ""))
+                linhas.append(f"   • TMA *{_fmt_int(tma)} s* → {tma_vs_plan(tma, tma_p)}")
             if sla_pct is not None:
-                partes.append(f"SLA {corte or ''} {_bfmt(sla_pct)}% (meta {_fmt_meta(meta)}%)".replace("  ", " "))
-            if tk is not None:
-                partes.append(f"tickets {_fmt_int(tk)}" + (f" x {_fmt_int(tk_p)} ({'+' if tk >= tk_p else '−'}"
-                                                           f"{_bfmt(abs(tk / tk_p - 1) * 100)}%)" if tk_p else ""))
-            if mi is not None:
-                partes.append(f"{_bfmt(mi, 2)} interações/ticket" + (f" (plan {_bfmt(mi_p, 2)})" if mi_p else ""))
-            linhas.append(" · ".join(partes))
-            peso = (tk or 0)
+                linhas.append(f"   • SLA{(' ' + corte) if corte else ''} *{_bfmt(sla_pct)}%* → {sla_vs_meta(sla_pct, meta)}")
+            peso = tk or 0
             if ruim_sla:
                 piores.append((2, (meta - sla_pct) * peso, nome, f"SLA {_bfmt(meta - sla_pct)} p.p. abaixo da meta"))
             if ruim_tma:
                 piores.append((1, (tma - tma_p) * peso, nome, f"TMA {_fmt_int(tma - tma_p)} s acima do plan"))
-        # consolidado com as somas (nunca média das células)
-        s_tempo = sum(_cv(r, "soma tempo atribuicao") or 0 for r in cel)
-        s_tk = sum(_cv(r, "ticket unico real") or 0 for r in cel)
-        s_tk_p = sum(_cv(r, "ticket unico plan") or 0 for r in cel if _cv(r, "tempo atendimento plan (ticket)"))
-        s_tempo_p = sum((_cv(r, "ticket unico plan") or 0) * (_cv(r, "tempo atendimento plan (ticket)") or 0) for r in cel)
-        s_base = sum(_cv(r, "sla base") or 0 for r in cel)
-        s_dentro = sum(_cv(r, "sla dentro") or 0 for r in cel)
-        cons = []
-        if s_tk and s_tempo:
-            cons.append(f"TMA {_fmt_int(s_tempo / s_tk)} s" + (f" x {_fmt_int(s_tempo_p / s_tk_p)} s" if s_tk_p else ""))
-        if s_base:
-            cons.append(f"SLA {_bfmt(s_dentro / s_base * 100)}%")
-        tk_plan_all = sum(_cv(r, "ticket unico plan") or 0 for r in cel)
-        if s_tk:
-            cons.append(f"tickets {_fmt_int(s_tk)}" + (f" x {_fmt_int(tk_plan_all)}" if tk_plan_all else ""))
-        if cons:
-            linhas.append(f"*Consolidado {eps_nome}* · " + " · ".join(cons))
+                if mi and mi_p and mi > mi_p * 1.03:
+                    leitura.append(f"`{nome}`: {_bfmt(mi, 2)} interações por ticket (plan {_bfmt(mi_p, 2)}): o ticket "
+                                   "está voltando mais vezes para a fila, e isso puxa o TMA.")
         if piores:  # o pior SLA (abaixo da meta) e o pior TMA (acima do plan), pesados pelo volume de tickets
             top: dict[str, list[str]] = {}
             for tipo in (2, 1):
                 cand = sorted([p for p in piores if p[0] == tipo], key=lambda x: x[1], reverse=True)
                 if cand:
                     top.setdefault(cand[0][2], []).append(cand[0][3])
-            linhas.append("👉 *Mais preocupa:* " + " e ".join(f"`{c}` ({' e '.join(v)})" for c, v in top.items()) + ".")
+            leitura.insert(0, "Mais preocupa: " + " e ".join(f"`{c}` ({' e '.join(v)})" for c, v in top.items()) + ".")
+        else:
+            leitura.insert(0, "Todas as filas dentro do plan de TMA e da meta de SLA. 👏")
+        linhas += ["", "💡 *Leitura*"] + [f"↳ {t}" for t in leitura[:3]]
         blocos.append("\n".join(linhas))
     return "\n\n".join(blocos)
 
@@ -3432,8 +3463,8 @@ def _render_motivos_efic(rows: list[dict[str, str]], ind: str, label: str, fila:
     if not por_cel:
         return ""
     titulo = ("⏱️ *Motivos que mais pesam no TMA*" if ind == "tma" else "⏰ *Motivos que mais pesam no SLA de 1ª resposta*")
-    regua = ("tempo de atribuição por interação; impacto = horas de operação acima da média da célula" if ind == "tma"
-             else "impacto = interações fora do prazo além da taxa da célula")
+    regua = ("quanto cada motivo puxa o tempo da fila: (tempo do motivo − média da fila) × tratados" if ind == "tma"
+             else "quanto cada motivo derruba o SLA da fila: interações fora do prazo além do que a taxa da fila daria")
     linhas = [f"{titulo} — {label} · _{regua}_"]
     ordem = sorted(por_cel, key=lambda c: -sum(_cv(r, imp_col) or 0 for r in por_cel[c]))
     for cel in ordem:
@@ -3441,18 +3472,27 @@ def _render_motivos_efic(rows: list[dict[str, str]], ind: str, label: str, fila:
         r0 = itens[0]
         if ind == "tma":
             ref = _cv(r0, "tempo atribuicao celula")
-            linhas.append(f"`{cel}` · tempo de atribuição {_fmt_int(ref or 0)} s/interação")
+            linhas.append("")
+            linhas.append(f"`{cel}` · média da fila: {_fmt_int(ref or 0)} s por interação")
             for r in itens:
-                linhas.append(f"• {_motivo_label(r.get('motivo'))} — {_fmt_int(_cv(r, 'tempo atribuicao motivo') or 0)} s · "
-                              f"{_fmt_int(_cv(r, 'tratados') or 0)} tratados ({_bfmt((_cv(r, 'peso tratados') or 0) * 100)}%) · "
-                              f"+{_bfmt(_cv(r, imp_col) or 0)} h")
+                t_m = _cv(r, "tempo atribuicao motivo") or 0
+                peso = _cv(r, "peso tratados") or 0
+                linhas.append(f"• *{_motivo_label(r.get('motivo'))}*: {_fmt_int(t_m)} s, *{_fmt_int(t_m - (ref or 0))} s acima* "
+                              f"da média · {_fmt_int(_cv(r, 'tratados') or 0)} tratados ({_bfmt(peso * 100)}% da fila)")
+                linhas.append(f"   ↳ puxa a média da fila em +{_bfmt(peso * (t_m - (ref or 0)), 1)} s · "
+                              f"{_bfmt(_cv(r, imp_col) or 0)} h a mais de operação no período")
         else:
             ref = _cv(r0, "sla celula")
-            linhas.append(f"`{cel}` · SLA {r0.get('corte sla', '')} {_bfmt((ref or 0) * 100)}%")
+            linhas.append("")
+            linhas.append(f"`{cel}` · SLA da fila {r0.get('corte sla', '')}: {_bfmt((ref or 0) * 100)}%")
             for r in itens:
-                linhas.append(f"• {_motivo_label(r.get('motivo'))} — SLA {_bfmt((_cv(r, 'sla motivo') or 0) * 100)}% · "
-                              f"{_fmt_int(_cv(r, 'interacoes sla') or 0)} interações "
-                              f"({_bfmt((_cv(r, 'peso sla') or 0) * 100)}%) · +{_fmt_int(_cv(r, imp_col) or 0)} fora do prazo")
+                n_i, peso = _cv(r, "interacoes sla") or 0, _cv(r, "peso sla") or 0
+                total = n_i / peso if peso else 0
+                extra = _cv(r, imp_col) or 0
+                linhas.append(f"• *{_motivo_label(r.get('motivo'))}*: SLA {_bfmt((_cv(r, 'sla motivo') or 0) * 100)}% · "
+                              f"{_fmt_int(n_i)} interações ({_bfmt(peso * 100)}% da fila)")
+                linhas.append(f"   ↳ {_fmt_int(extra)} fora do prazo a mais do que a média da fila daria"
+                              + (f" · tira {_bfmt(extra / total * 100, 1)} p.p. do SLA da fila" if total else ""))
     return "\n".join(linhas)
 
 
@@ -3497,8 +3537,15 @@ def _render_capa_diaria(rows: list[dict[str, str]], eps: str | None, label: str,
             por_dia.setdefault(str(r.get("data", ""))[:10], []).append(r)
         alvo = f"`{celula}`" if celula else f"consolidado `{eps_nome}`"
         linhas = [f"📅 *TMA e SLA por dia · {alvo}* — {label}"]
-        for dia in sorted(por_dia):
+        dias = sorted(por_dia)
+        vol = {d: sum(_cv(r, "ticket unico real") or 0 for r in por_dia[d]) for d in dias}
+        tipico = sorted(vol.values())[len(vol) // 2] if vol else 0
+        for dia in dias:
             rs = por_dia[dia]
+            if dia == dias[-1] and len(dias) > 1 and vol[dia] < 0.5 * tipico:  # último dia ainda não fechou na base
+                linhas.append(f"_{dia[8:10]}/{dia[5:7]}: a base ainda não fechou o dia (só {_fmt_int(vol[dia])} tickets); "
+                              "entra amanhã._")
+                continue
             tempo = sum(_cv(r, "soma tempo atribuicao") or 0 for r in rs)
             tk = sum(_cv(r, "ticket unico real") or 0 for r in rs)
             tk_p = sum(_cv(r, "ticket unico plan") or 0 for r in rs if _cv(r, "tempo atendimento plan (ticket)"))
@@ -3527,6 +3574,8 @@ def _render_capa_diaria(rows: list[dict[str, str]], eps: str | None, label: str,
 
 def _send_capa(event: dict[str, Any], client: Any, eps: str | None, question: str,
                progress: Callable[[str], Any] | None = None) -> str | None:
+    if eps is None:
+        eps = _eps_in_text(question)  # "TMA e SLA da AeC": só a AeC, mesmo num canal com visão completa
     ini, fim, label = _capa_period(question, event)
     diaria = bool(_DIARIO_RE.search(_norm_text(question)))
     celula = _fila_ref(question, eps, {}) if diaria else None
@@ -4702,6 +4751,7 @@ PESSOAS_OPS_MAX = 8
 PESSOAS_SUP_MAX = 8
 PESSOAS_MIN_AVAL = 5
 PESSOAS_MIN_AVAL_D1 = 3
+PESSOAS_SUP_MIN_AVAL = 30  # equipe com amostra menor não entra no ranking de supervisor (conta no consolidado)
 
 
 def _query_text(nome: str) -> str | None:
@@ -4877,7 +4927,8 @@ def _pessoas_from_rows(rows: list[dict[str, str]], eps_nome: str, people: dict[s
             s_["sup"] = r.get("nome", "") or "Sem supervisor no MOP"
             sups.append(s_)
     fora = next((int(_sql_num(r.get("n ops")) or 0) for r in mine if r.get("tipo", "").upper() == "FORA"), 0)
-    return {"n": n, "csat": (_sql_num(tot.get("promotoras")) or 0) / n * 100, "meta": meta_x / n_meta if n_meta else None,
+    sem_mop = [r.get("nome", "") for r in mine if r.get("tipo", "").upper() == "SEMMOP"]
+    return {"sem_mop_ex": sem_mop, "n": n, "csat": (_sql_num(tot.get("promotoras")) or 0) / n * 100, "meta": meta_x / n_meta if n_meta else None,
             "ops": ops, "sups": sups, "fora": fora}
 
 
@@ -4902,7 +4953,10 @@ def _render_pessoas_impacto(calc: dict[str, Any], alvo: str, label: str, d1: boo
     def who(o: dict[str, Any]) -> str:
         return _operator_label(o["email"], o["nome"] if allowed else "")
 
-    sups = sorted([s for s in calc["sups"] if s["imp"] is not None], key=lambda s: s["imp"])
+    sem = next((s for s in calc["sups"] if s["sup"] == "Sem supervisor no MOP"), None)
+    peq = [s for s in calc["sups"] if s is not sem and s["aval"] < PESSOAS_SUP_MIN_AVAL]
+    sups = sorted([s for s in calc["sups"] if s["imp"] is not None and s is not sem and s not in peq],
+                  key=lambda s: s["imp"])
     if sups and not so_ops and not titulo_equipe:
         linhas += ["", "👥 *Por supervisor* — quem mais puxa para baixo"]
         for i, s in enumerate([s for s in sups if s["imp"] < -0.005][:PESSOAS_SUP_MAX], 1):
@@ -4930,7 +4984,13 @@ def _render_pessoas_impacto(calc: dict[str, Any], alvo: str, label: str, d1: boo
     linhas += ["", f"_Impacto = peso da pessoa nas avaliações de `{alvo}` × (CSAT dela − meta da fila dela), em p.p. do "
                    f"consolidado (mesma régua do Cockpit para filas); a soma de todo mundo dá o gap para a meta."
                + (f" Operadores com menos de {minimo} avaliações ficam fora do ranking ({fora}), mas contam na equipe."
-                  if fora else "") + "_"]
+                  if fora else "")
+               + (f" Equipes com menos de {PESSOAS_SUP_MIN_AVAL} avaliações ficam fora do ranking de supervisor ({len(peq)})."
+                  if peq and not so_ops and not titulo_equipe else "") + "_"]
+    if sem and sem["aval"] and not titulo_equipe:
+        linhas.insert(2, f"⚠️ {sem['n_ops']} operador(es) com {_fmt_int(sem['aval'])} avaliações "
+                         f"({_bfmt(sem['aval'] / calc['n'] * 100, 0)}% do total) não estão no MOP de hoje (saíram, mudaram de "
+                         "e-mail ou estão sem supervisor): contam no consolidado, mas ficam fora do ranking de supervisor.")
     return "\n".join(linhas)
 
 
@@ -4966,6 +5026,13 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
     textos = []
     for eps_nome in ([eps] if eps else ["AeC", "CSU"]):
         calc = _pessoas_from_rows(rows, eps_nome, people)
+        sem = next((s for s in (calc or {}).get("sups", []) if s["sup"] == "Sem supervisor no MOP"), None)
+        akey = f"pessoas_semmop:{eps_nome}:{_as_date(_today_brazil()).isoformat()}"
+        if calc and sem and sem["aval"] > 0.1 * calc["n"] and not STATE.get(akey):
+            STATE.set(akey, "1")
+            _alert(f"📋 MOP da {eps_nome}: {sem['n_ops']} operadores que atenderam em {label} não estão no MOP de hoje "
+                   f"({_bfmt(sem['aval'] / calc['n'] * 100, 0)}% das avaliações). Exemplos (usuário do e-mail): "
+                   + ", ".join(calc.get("sem_mop_ex", [])[:8]) + ". Se forem ativos, vale corrigir o e-mail no MOP.")
         if calc:
             textos.append(_render_pessoas_impacto(calc, fila or eps_nome, label, d1, eps, titulo_equipe, so_sup, so_ops))
     if not textos:
@@ -4980,6 +5047,132 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
             return "A consulta voltou num formato que eu não consegui ler. Já avisei o time; tenta de novo daqui a pouco?"
         return f"Não achei avaliações de {fila or eps or 'AeC/CSU'} em {label}. Quer outro período?"
     event["_catalog"] = "csat|pessoas|impacto"
+    _say_sections(say, "\n\n".join(textos), event)
+    return None
+
+
+# --- quem mais pesa no TMA: analista e supervisor (seção 7.1d, SQL fixo) ---------
+TMA_PESSOAS_MIN_TICKETS = 20
+TMA_PESSOAS_MIN_TICKETS_D1 = 5
+
+
+def _is_tma_pessoas_request(question: str) -> bool:
+    """"Quais analistas/supervisores mais impactam o TMA?" (e "TMA por analista")."""
+    t = _norm_text(question)
+    if not re.search(r"\btma\b|tempo medio de atendimento", t) or re.search(r"\b(csat|casos?|tickets? (de|do|da)|motivos?)\b", t):
+        return False
+    if not _PESSOAS_RE.search(t):
+        return False
+    return bool(_PESSOAS_IMPACTO_RE.search(t) or re.search(r"\bpor (analista|operador|atendente|supervisor\w*)\b", t))
+
+
+def _tma_pessoas_text(rows: list[dict[str, str]], eps_nome: str, people: dict[str, dict[str, str]], alvo: str,
+                      label: str, eps: str | None, titulo_equipe: str, so_sup: bool, so_ops: bool, minimo: int) -> str:
+    mine = [r for r in rows if _compact(r.get("eps", "")) == _compact(eps_nome)]
+    tot = next((r for r in mine if r.get("tipo", "").upper() == "TOTAL"), None)
+    tk = _sql_num(tot.get("tickets")) if tot else None
+    if not tk:
+        return ""
+    tma = (_sql_num(tot.get("tempo")) or 0) / tk
+    by_user = {e.split("@")[0]: e for e in people}
+    allowed = _operator_names_allowed(eps)
+    sec = lambda v: ("+" if v > 0 else "−" if v < 0 else "") + _bfmt(abs(v), 1) + " s"
+    linhas = [f"⏱️ *Quem mais pesa no TMA ·* `{alvo}`" + (f" · {titulo_equipe}" if titulo_equipe else "")
+              + f" *— {label}* · TMA {_fmt_int(tma)} s · {_fmt_int(tk)} tickets"]
+    sups = [r for r in mine if r.get("tipo", "").upper() == "SUP"]
+    sem = next((r for r in sups if r.get("nome") == "Sem supervisor no MOP"), None)
+    sups = sorted([r for r in sups if r is not sem and (_sql_num(r.get("tickets")) or 0) >= 100],
+                  key=lambda r: -(_sql_num(r.get("impacto s")) or 0))
+    if sups and not so_ops and not titulo_equipe:
+        linhas += ["", "👥 *Por supervisor* — quem mais puxa o TMA para cima"]
+        for i, r in enumerate([r for r in sups if (_sql_num(r.get("impacto s")) or 0) > 0.05][:PESSOAS_SUP_MAX], 1):
+            t_eq = (_sql_num(r.get("tempo")) or 0) / max(_sql_num(r.get("tickets")) or 1, 1)
+            linhas.append(f"{i}. {_nice_name(r.get('nome', ''))} · *{sec(_sql_num(r.get('impacto s')) or 0)}* · "
+                          f"TMA da equipe {_fmt_int(t_eq)} s · {int(_sql_num(r.get('n ops')) or 0)} analista(s) · "
+                          f"{_fmt_int(_sql_num(r.get('tickets')) or 0)} tickets")
+        if not any((_sql_num(r.get("impacto s")) or 0) > 0.05 for r in sups):
+            linhas.append("Nenhuma equipe puxando o TMA para cima. 👏")
+    ops = [r for r in mine if r.get("tipo", "").upper() == "OP"]
+
+    def who(r: dict[str, str]) -> str:
+        u = r.get("nome", "").strip().lower()
+        email = by_user.get(u) or u
+        return _operator_label(email, (people.get(email) or {}).get("nome", "") if allowed else "")
+
+    def op_line(r: dict[str, str]) -> str:
+        t_op = (_sql_num(r.get("tempo")) or 0) / max(_sql_num(r.get("tickets")) or 1, 1)
+        it = (_sql_num(r.get("tratados")) or 0) / max(_sql_num(r.get("tickets")) or 1, 1)
+        return (f"{who(r)} · {r.get('fila', '')} · *{sec(_sql_num(r.get('impacto s')) or 0)}* · TMA {_fmt_int(t_op)} s "
+                f"(fila {_fmt_int(_sql_num(r.get('tma fila s')) or 0)} s) · {_bfmt(it, 2)} interações/ticket · "
+                f"{_fmt_int(_sql_num(r.get('tickets')) or 0)} tickets")
+
+    if not so_sup:
+        up = sorted([r for r in ops if (_sql_num(r.get("impacto s")) or 0) > 0.05], key=lambda r: -(_sql_num(r.get("impacto s")) or 0))
+        linhas += ["", "🧑‍💻 *Por analista* — quem mais puxa o TMA para cima"]
+        linhas += [f"{i}. {op_line(r)}" for i, r in enumerate(up[:PESSOAS_OPS_MAX], 1)] or ["Ninguém puxando o TMA para cima. 👏"]
+        down = sorted([r for r in ops if (_sql_num(r.get("impacto s")) or 0) < -0.05], key=lambda r: _sql_num(r.get("impacto s")) or 0)[:3]
+        if down:
+            linhas += ["", "💪 *Quem mais segura o TMA*"] + [f"• {op_line(r)}" for r in down]
+    fora = next((int(_sql_num(r.get("n ops")) or 0) for r in mine if r.get("tipo", "").upper() == "FORA"), 0)
+    if sem and not titulo_equipe and (_sql_num(sem.get("tickets")) or 0) > 0.1 * tk:
+        linhas.insert(1, f"⚠️ {int(_sql_num(sem.get('n ops')) or 0)} analista(s) com {_fmt_int(_sql_num(sem.get('tickets')) or 0)} "
+                         "tickets não estão no MOP de hoje: contam no TMA, mas ficam fora do ranking de supervisor.")
+    linhas += ["", f"_Impacto = TMA de `{alvo}` − TMA sem a pessoa (ou sem a equipe), em segundos; positivo puxa para cima. "
+                   "Régua por analista (seção 7.1d): o ticket conta para cada analista que o atendeu, então o TMA aqui fica um "
+                   "pouco diferente do oficial." + (f" Com menos de {minimo} tickets fica fora do ranking ({fora})." if fora else "")
+               + "_"]
+    return "\n".join(linhas)
+
+
+def _send_tma_pessoas(event: dict[str, Any], client: Any, eps: str | None, question: str,
+                      say: Callable[..., Any], progress: Callable[[str], Any] | None = None) -> str | None:
+    if eps is None:
+        eps = _eps_of_question(question)
+    ini, fim, label = _capa_period(question, event)
+    d1 = ini == fim
+    fila = _fila_in_question(question, eps)
+    people = _mop_people(eps)
+    t = _norm_text(question)
+    emails, titulo_equipe = None, ""
+    if people and (_TEAM_RE.search(t) or re.search(r"\b(minha|meu|nossa|nosso|meus)\b", t)):
+        kind, leader = _resolve_team(question, event, people)
+        if kind in {"sup", "coord"} and leader:
+            field = "supervisor" if kind == "sup" else "coordenador"
+            emails = {e for e, p in people.items() if _norm_text(p[field]) == _norm_text(leader)}
+            titulo_equipe = f"{'Equipe' if kind == 'sup' else 'Coordenação'} de {_nice_name(leader)}"
+    base_p = _pessoas_sql_params(eps, None, people, fim, emails, d1)
+    minimo = TMA_PESSOAS_MIN_TICKETS_D1 if d1 else TMA_PESSOAS_MIN_TICKETS
+    tpl = _query_text("tma_pessoas.sql")
+    if not tpl:
+        return "A visão de TMA por analista não está configurada (falta queries/tma_pessoas.sql)."
+    params = {"data_inicio": ini.isoformat(), "data_fim": fim.isoformat(), "eps_like": base_p["eps_like"],
+              "filtro_fila": f"fila = '{fila}'" if fila else "1 = 1", "mop_values": base_p["mop_values"],
+              "filtro_equipe": base_p["filtro_equipe"], "min_tickets": str(minimo), "top_ops": str(PESSOAS_OPS_MAX)}
+    sql = tpl
+    for k, v in params.items():
+        sql = sql.replace("{" + k + "}", v)
+    sql = _compact_sql(sql)
+    key = f"tma_pessoas:{hash(sql)}"
+    hit = _CSAT_ROWS_CACHE.get(key)
+    if hit and time.time() - hit[0] < 1800:
+        rows, problema = hit[1], ""
+    else:
+        rows, problema = _run_app_sql(sql, progress, f"TMA por analista ({ini} a {fim})", acesso=True)
+        if rows is not None:
+            _CSAT_ROWS_CACHE[key] = (time.time(), rows)
+    if rows is None:
+        return problema
+    so_sup = bool(re.search(r"\b(supervisor\w*|equipes)\b", t)) and not re.search(r"\b(operador\w*|analista\w*|atendente\w*)\b", t)
+    so_ops = bool(re.search(r"\b(operador\w*|analista\w*|atendente\w*)\b", t)) and not re.search(r"\b(supervisor\w*|coordenador\w*|equipes?)\b", t)
+    textos = [x for x in (_tma_pessoas_text(rows, e, people, fila or e, label, eps, titulo_equipe, so_sup, so_ops, minimo)
+                          for e in ([eps] if eps else ["AeC", "CSU"])) if x]
+    if not textos:
+        if rows and not any(r.get("tipo", "").upper() == "TOTAL" for r in rows):
+            _alert(f"⚠️ TMA por analista ({ini} a {fim}): a resposta não veio no formato do SQL fixo. "
+                   f"Colunas: {sorted(rows[0].keys())[:8]}")
+            return "A consulta voltou num formato que eu não consegui ler. Já avisei o time; tenta de novo daqui a pouco?"
+        return f"Não achei atendimento de {fila or eps or 'AeC/CSU'} em {label}. Quer outro período?"
+    event["_catalog"] = "tma|pessoas|impacto"
     _say_sections(say, "\n\n".join(textos), event)
     return None
 
@@ -9184,6 +9377,16 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             progress.done()
             if problem:
                 _say(say, problem, event, in_thread=True)
+            return
+        if not efic_extra and _is_tma_pessoas_request(question) and (asks or not in_report_thread):
+            event["_route"] = "tma_pessoas"
+            progress("Vou ver quem mais pesa no TMA (analistas e supervisores), já te mando. ⏳")
+            try:
+                problem = _send_tma_pessoas(event, client, eps, question, say, progress)
+            finally:
+                progress.done()
+            if problem:
+                _say(say, problem, event, in_thread)
             return
         if not efic_extra and _is_pessoas_impacto_request(question) and (asks or not in_report_thread):
             event["_route"] = "pessoas_impacto"
