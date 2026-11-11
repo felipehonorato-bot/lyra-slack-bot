@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.34.0"
+APP_VERSION = "5.35.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -3611,7 +3611,7 @@ def _render_capa_diaria(rows: list[dict[str, str]], eps: str | None, label: str,
             plan = tempo_p / tk_p if tk_p else None
             sla = dentro / base * 100 if base else None
             meta = meta_x / base if base else None
-            ruim = (tma is not None and plan and tma > plan + 0.5) or (sla is not None and meta and sla < meta)
+            ruim = (tma is not None and plan and tma > plan + 0.5) or (sla is not None and meta and sla < meta - 0.05)
             cab = f"{'🔴' if ruim else '🟢'} *{dia_txt}*"
             if tk:
                 cab += f" · {_fmt_int(tk)} tickets" + (f" ({'+' if tk >= tk_plan else '−'}"
@@ -3625,8 +3625,10 @@ def _render_capa_diaria(rows: list[dict[str, str]], eps: str | None, label: str,
                     v = "⚪ plan a definir"
                 linhas.append(f"   • TMA *{_fmt_int(tma)} s* → {v}")
             if sla is not None:
-                v = (f"🔴 {_bfmt(meta - sla)} p.p. abaixo da meta {_bfmt(meta, 0)}%" if meta and sla < meta else
-                     f"🟢 {_bfmt(sla - meta)} p.p. acima da meta {_bfmt(meta, 0)}%" if meta else "")
+                m_txt = _bfmt(meta, 0) if meta and abs(meta - round(meta)) < 0.05 else _bfmt(meta or 0, 1)
+                v = ("" if not meta else f"🟢 na meta {m_txt}%" if abs(sla - meta) < 0.05 else
+                     f"🔴 {_bfmt(meta - sla)} p.p. abaixo da meta {m_txt}%" if sla < meta else
+                     f"🟢 {_bfmt(sla - meta)} p.p. acima da meta {m_txt}%")
                 linhas.append(f"   • SLA *{_bfmt(sla)}%*" + (f" → {v}" if v else ""))
             linhas.append("")
             serie.append((dia_txt, tma, plan, sla, meta))
@@ -3643,7 +3645,7 @@ def _render_capa_diaria(rows: list[dict[str, str]], eps: str | None, label: str,
             leitura.append(f"TMA acima do plan em {len(acima)} de {len(t_ok)} dias"
                            + (f"; pior em {pior[0]} ({_fmt_int(pior[1])} s, +{_fmt_int(pior[1] - pior[2])} s)." if acima else "."))
         if s_ok:
-            abaixo = [x for x in s_ok if x[3] < x[4]]
+            abaixo = [x for x in s_ok if x[3] < x[4] - 0.05]
             pior = min(s_ok, key=lambda x: x[3] - x[4])
             leitura.append(f"SLA abaixo da meta em {len(abaixo)} de {len(s_ok)} dias"
                            + (f"; pior em {pior[0]} ({_bfmt(pior[3])}%, {_bfmt(pior[4] - pior[3])} p.p. abaixo)." if abaixo else "."))
@@ -5027,7 +5029,8 @@ def _pp_signed(v: float | None, dec: int = 2) -> str:
 
 
 def _render_pessoas_impacto(calc: dict[str, Any], alvo: str, label: str, d1: bool, eps: str | None,
-                            titulo_equipe: str = "", so_sup: bool = False, so_ops: bool = False) -> str:
+                            titulo_equipe: str = "", so_sup: bool = False, so_ops: bool = False,
+                            completo: bool = False) -> str:
     gap = calc["csat"] - calc["meta"] if calc["meta"] is not None else None
     dot = _status_dot(calc["csat"] / calc["meta"] * 100 if calc["meta"] else None)
     head = (f"{dot} *Quem mais pesa no CSAT ·* `{alvo}`" + (f" · {titulo_equipe}" if titulo_equipe else "")
@@ -5046,13 +5049,14 @@ def _render_pessoas_impacto(calc: dict[str, Any], alvo: str, label: str, d1: boo
     sups = sorted([s for s in calc["sups"] if s["imp"] is not None and s is not sem and s not in peq],
                   key=lambda s: s["imp"])
     if sups and not so_ops and not titulo_equipe:
-        linhas += ["", "👥 *Por supervisor* — quem mais puxa para baixo"]
-        for i, s in enumerate([s for s in sups if s["imp"] < -0.005][:PESSOAS_SUP_MAX], 1):
+        linhas += ["", "👥 *Por supervisor* — " + ("todas as equipes, de quem mais puxa para baixo a quem mais ajuda"
+                                                   if completo else "quem mais puxa para baixo")]
+        for i, s in enumerate(sups if completo else [s for s in sups if s["imp"] < -0.005][:PESSOAS_SUP_MAX], 1):
             falt = max(0, math.ceil(-s["acima"] - 1e-9))
             linhas.append(f"{i}. {_nice_name(s['sup'])} · *{_pp_signed(s['imp'])}* · CSAT {_bfmt(s['csat'])}% "
                           f"(meta {_bfmt(s['meta'])}%) · {s['n_ops']} operador(es) · n={_fmt_int(s['aval'])}"
                           + (f" · {falt} positivas faltantes" if falt else ""))
-        if not any(s["imp"] < -0.005 for s in sups):
+        if not completo and not any(s["imp"] < -0.005 for s in sups):
             linhas.append("Nenhuma equipe abaixo da meta no recorte. 👏")
     ops = sorted([o for o in calc["ops"] if o["imp"] is not None and o["aval"] >= minimo], key=lambda o: o["imp"])
     fora = calc["fora"] if calc.get("fora") is not None else sum(1 for o in calc["ops"] if o["aval"] < minimo)
@@ -5093,7 +5097,7 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
     t = _norm_text(question)
     emails: set[str] | None = None
     titulo_equipe = ""
-    if people and (_TEAM_RE.search(t) or re.search(r"\b(minha|meu|nossa|nosso|meus)\b", t)):
+    if people and not re.search(r"\btod[oa]s\b", t) and (_TEAM_RE.search(t) or re.search(r"\b(minha|meu|nossa|nosso|meus)\b", t)):
         kind, leader = _resolve_team(question, event, people)
         if kind in {"sup", "coord"} and leader:
             field = "supervisor" if kind == "sup" else "coordenador"
@@ -5102,16 +5106,22 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
             if eps is None:
                 eps_t = {people[e].get("eps") for e in emails} - {"", None}
                 eps = eps_t.pop() if len(eps_t) == 1 else None
-    rows, problema = _csat_fixed_rows("csat_pessoas.sql", ini, fim,
-                                      _pessoas_sql_params(eps, fila, people, fim, emails, d1),
-                                      progress, f"CSAT por operador ({ini} a {fim})")
+    completo = bool(_ABERTURA_RE.search(t))
+    quer_arquivo = bool(_WANTS_FILE_RE.search(t))
+    params = _pessoas_sql_params(eps, fila, people, fim, emails, d1)
+    if completo or quer_arquivo:  # todos os operadores (a lista completa vai na planilha)
+        params["top_ops"] = "5000"
+    rows, problema = _csat_fixed_rows("csat_pessoas.sql", ini, fim, params, progress, f"CSAT por operador ({ini} a {fim})")
+    if rows is None and params["top_ops"] == "5000":  # a lista inteira não voltou: tenta os 50 que mais pesam
+        params["top_ops"] = "50"
+        rows, problema = _csat_fixed_rows("csat_pessoas.sql", ini, fim, params, progress, f"CSAT por operador ({ini} a {fim})")
     if rows is None:
         return problema
     so_sup = bool(re.search(r"\b(supervisor\w*|supervisora\w*|equipes)\b", t)) and not re.search(
         r"\b(operador\w*|analista\w*|atendente\w*)\b", t)
     so_ops = bool(re.search(r"\b(operador\w*|analista\w*|atendente\w*)\b", t)) and not re.search(
         r"\b(supervisor\w*|supervisora\w*|coordenador\w*|equipes?)\b", t)
-    textos = []
+    textos, calcs = [], []
     for eps_nome in ([eps] if eps else ["AeC", "CSU"]):
         calc = _pessoas_from_rows(rows, eps_nome, people)
         sem = next((s for s in (calc or {}).get("sups", []) if s["sup"] == "Sem supervisor no MOP"), None)
@@ -5122,7 +5132,9 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
                    f"({_bfmt(sem['aval'] / calc['n'] * 100, 0)}% das avaliações). Exemplos (usuário do e-mail): "
                    + ", ".join(calc.get("sem_mop_ex", [])[:8]) + ". Se forem ativos, vale corrigir o e-mail no MOP.")
         if calc:
-            textos.append(_render_pessoas_impacto(calc, fila or eps_nome, label, d1, eps, titulo_equipe, so_sup, so_ops))
+            textos.append(_render_pessoas_impacto(calc, fila or eps_nome, label, d1, eps, titulo_equipe, so_sup, so_ops,
+                                                  completo))
+            calcs.append((eps_nome, calc))
     if not textos:
         tipos = {r.get("tipo", "").upper() for r in rows}
         if rows and "TOTAL" in tipos and not tipos & {"OP", "SUP"}:  # voltou só o total: a Indicadores tirou as pessoas
@@ -5135,8 +5147,55 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
             return "A consulta voltou num formato que eu não consegui ler. Já avisei o time; tenta de novo daqui a pouco?"
         return f"Não achei avaliações de {fila or eps or 'AeC/CSU'} em {label}. Quer outro período?"
     event["_catalog"] = "csat|pessoas|impacto"
+    n_ops = sum(len(c["ops"]) for _, c in calcs)
+    if quer_arquivo or (completo and n_ops > 15):
+        try:
+            (client or slack_app.client).files_upload_v2(
+                channel=event.get("channel"), thread_ts=_reply_ts(event), content=_csat_pessoas_xlsx(calcs, eps),
+                filename=f"CSAT_por_supervisor_{(fila or eps or 'iFood').replace(' ', '_')}_{ini.strftime('%d-%m')}_a_{fim.strftime('%d-%m')}.xlsx",
+                title=f"CSAT por supervisor e operador · {fila or eps or 'iFood'} · {label}",
+                initial_comment="\n\n".join(textos) + "\n\n📎 Na planilha: todas as equipes e todos os operadores, com as "
+                                                      "fórmulas de CSAT e do impacto.")
+            return None
+        except Exception:
+            logger.warning("CSAT por pessoa: upload do Excel falhou; mando só o texto", exc_info=True)
     _say_sections(say, "\n\n".join(textos), event)
     return None
+
+
+def _csat_pessoas_xlsx(calcs: list[tuple[str, dict[str, Any]]], eps: str | None) -> bytes:
+    """Excel com fórmulas: CSAT = promotoras ÷ avaliações; impacto = (promotoras − meta × avaliações) ÷ avaliações do
+    conjunto × 100 (régua da pessoa contra a meta da fila dela)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    wb = Workbook()
+    wb.remove(wb.active)
+    allowed = _operator_names_allowed(eps)
+    for tipo, titulo in (("sups", "Por supervisor"), ("ops", "Operadores")):
+        ws = wb.create_sheet(titulo)
+        ws.append(["EPS", "Supervisor" if tipo == "sups" else "Operador", "Fila" if tipo == "ops" else "Operadores",
+                   "Avaliações", "Promotoras", "CSAT (%)", "Meta (%)", "Avaliações do conjunto", "Impacto (p.p.)",
+                   "Positivas faltantes"])
+        for c in ws[1]:
+            c.font, c.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="EA1D2C")
+        i = 1
+        for eps_nome, calc in calcs:
+            itens = sorted([x for x in calc[tipo] if x.get("meta") is not None], key=lambda x: x["imp"] or 0)
+            for x in itens:
+                i += 1
+                nome = (_nice_name(x["sup"]) if tipo == "sups" else
+                        (f"{x['nome']} · {x['email']}" if allowed and x.get("nome") else x["email"]))
+                ws.append([eps_nome, nome, x.get("n_ops") if tipo == "sups" else x.get("fila", ""), x["aval"], x["prom"],
+                           None, round(x["meta"], 2), calc["n"], None, None])
+                ws.cell(row=i, column=6, value=f"=IFERROR(E{i}/D{i}*100,\"\")")
+                ws.cell(row=i, column=9, value=f"=(E{i}-G{i}/100*D{i})/H{i}*100")
+                ws.cell(row=i, column=10, value=f"=MAX(0,ROUNDUP(G{i}/100*D{i}-E{i},0))")
+        for col, w in zip("ABCDEFGHIJ", (8, 44, 24, 12, 12, 10, 10, 20, 14, 18)):
+            ws.column_dimensions[col].width = w
+        ws.freeze_panes = "C2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 # --- quem mais pesa no TMA: analista e supervisor (seção 7.1d, SQL fixo) ---------
@@ -5151,11 +5210,67 @@ def _is_tma_pessoas_request(question: str) -> bool:
         return False
     if not _PESSOAS_RE.search(t):
         return False
-    return bool(_PESSOAS_IMPACTO_RE.search(t) or re.search(r"\bpor (analista|operador|atendente|supervisor\w*)\b", t))
+    return bool(_PESSOAS_IMPACTO_RE.search(t) or re.search(r"\bpor (analista|operador|atendente|supervisor\w*)\b", t)
+                or _ABERTURA_RE.search(t))
+
+
+_ABERTURA_RE = re.compile(r"\b(abertura|todos os|todas as|lista completa|completa|completo|excel|planilha|xlsx)\b")
+
+
+def _tma_pessoas_xlsx(rows: list[dict[str, str]], eps_list: list[str], people: dict[str, dict[str, str]]) -> bytes:
+    """Excel com fórmulas: por supervisor (todas as equipes) e o ranking de analistas; TMA e impacto calculados na planilha."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    wb = Workbook()
+    wb.remove(wb.active)
+    by_user = {e.split("@")[0]: e for e in people}
+    for tipo, titulo in (("SUP", "Por supervisor"), ("OP", "Analistas (ranking)")):
+        ws = wb.create_sheet(titulo)
+        head = ["EPS", "Supervisor" if tipo == "SUP" else "Analista", "Fila" if tipo == "OP" else "Analistas",
+                "Tratados", "Tickets", "Tempo total (s)", "TMA (s)", "TMA do conjunto (s)", "Impacto no TMA (s)",
+                "Interações com 1ª resposta", "Dentro do SLA", "SLA (%)", "SLA do conjunto (%)", "Impacto no SLA (p.p.)"]
+        ws.append(head)
+        for c in ws[1]:
+            c.font, c.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="EA1D2C")
+        i = 1
+        for eps_nome in eps_list:
+            tot = next((r for r in rows if r.get("tipo", "").upper() == "TOTAL" and _compact(r.get("eps", "")) == _compact(eps_nome)), None)
+            if not tot:
+                continue
+            t_all, n_all = _sql_num(tot.get("tempo")) or 0, _sql_num(tot.get("tickets")) or 0
+            b_all, d_all = _sql_num(tot.get("sla base")) or 0, _sql_num(tot.get("sla dentro")) or 0
+            sel = [r for r in rows if r.get("tipo", "").upper() == tipo and _compact(r.get("eps", "")) == _compact(eps_nome)]
+            sel.sort(key=lambda r: -(_sql_num(r.get("impacto s")) or 0))
+            for r in sel:
+                i += 1
+                if tipo == "SUP":
+                    nome, terceira = _nice_name(r.get("nome", "")), int(_sql_num(r.get("n ops")) or 0)
+                else:
+                    u = r.get("nome", "").strip().lower()
+                    e = by_user.get(u) or u
+                    nome, terceira = ((people.get(e) or {}).get("nome") or e), r.get("fila", "")
+                ws.append([eps_nome, nome, terceira, _sql_num(r.get("tratados")), _sql_num(r.get("tickets")),
+                           round(_sql_num(r.get("tempo")) or 0), None, round(t_all / n_all, 1) if n_all else None, None,
+                           _sql_num(r.get("sla base")), _sql_num(r.get("sla dentro")), None,
+                           round(d_all / b_all * 100, 2) if b_all else None, None])
+                ws.cell(row=i, column=12, value=f"=IFERROR(K{i}/J{i}*100,\"\")")
+                # impacto no SLA = −(fora da pessoa − interações dela × taxa fora do conjunto) ÷ interações do conjunto × 100
+                if b_all:
+                    ws.cell(row=i, column=14, value=f"=IFERROR(-((J{i}-K{i})-J{i}*(1-{d_all:.0f}/{b_all:.0f}))/{b_all:.0f}*100,\"\")")
+                ws.cell(row=i, column=7, value=f"=IFERROR(F{i}/E{i},\"\")")
+                # impacto = TMA do conjunto − TMA do conjunto sem a pessoa/equipe
+                ws.cell(row=i, column=9, value=f"=IFERROR({t_all:.0f}/{n_all:.0f}-({t_all:.0f}-F{i})/({n_all:.0f}-E{i}),\"\")")
+        for col, w in zip("ABCDEFGHIJKLMN", (8, 40, 24, 11, 11, 15, 10, 18, 18, 18, 14, 10, 18, 20)):
+            ws.column_dimensions[col].width = w
+        ws.freeze_panes = "C2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 def _tma_pessoas_text(rows: list[dict[str, str]], eps_nome: str, people: dict[str, dict[str, str]], alvo: str,
-                      label: str, eps: str | None, titulo_equipe: str, so_sup: bool, so_ops: bool, minimo: int) -> str:
+                      label: str, eps: str | None, titulo_equipe: str, so_sup: bool, so_ops: bool, minimo: int,
+                      completo: bool = False) -> str:
     mine = [r for r in rows if _compact(r.get("eps", "")) == _compact(eps_nome)]
     tot = next((r for r in mine if r.get("tipo", "").upper() == "TOTAL"), None)
     tk = _sql_num(tot.get("tickets")) if tot else None
@@ -5172,13 +5287,15 @@ def _tma_pessoas_text(rows: list[dict[str, str]], eps_nome: str, people: dict[st
     sups = sorted([r for r in sups if r is not sem and (_sql_num(r.get("tickets")) or 0) >= 100],
                   key=lambda r: -(_sql_num(r.get("impacto s")) or 0))
     if sups and not so_ops and not titulo_equipe:
-        linhas += ["", "👥 *Por supervisor* — quem mais puxa o TMA para cima"]
-        for i, r in enumerate([r for r in sups if (_sql_num(r.get("impacto s")) or 0) > 0.05][:PESSOAS_SUP_MAX], 1):
+        linhas += ["", "👥 *Por supervisor* — " + ("todas as equipes, de quem mais puxa o TMA para cima a quem mais segura"
+                                                   if completo else "quem mais puxa o TMA para cima")]
+        lista_sup = sups if completo else [r for r in sups if (_sql_num(r.get("impacto s")) or 0) > 0.05][:PESSOAS_SUP_MAX]
+        for i, r in enumerate(lista_sup, 1):
             t_eq = (_sql_num(r.get("tempo")) or 0) / max(_sql_num(r.get("tickets")) or 1, 1)
             linhas.append(f"{i}. {_nice_name(r.get('nome', ''))} · *{sec(_sql_num(r.get('impacto s')) or 0)}* · "
                           f"TMA da equipe {_fmt_int(t_eq)} s · {int(_sql_num(r.get('n ops')) or 0)} analista(s) · "
                           f"{_fmt_int(_sql_num(r.get('tickets')) or 0)} tickets")
-        if not any((_sql_num(r.get("impacto s")) or 0) > 0.05 for r in sups):
+        if not completo and not any((_sql_num(r.get("impacto s")) or 0) > 0.05 for r in sups):
             linhas.append("Nenhuma equipe puxando o TMA para cima. 👏")
     ops = [r for r in mine if r.get("tipo", "").upper() == "OP"]
 
@@ -5213,7 +5330,7 @@ def _tma_pessoas_text(rows: list[dict[str, str]], eps_nome: str, people: dict[st
 
 
 def _send_tma_pessoas(event: dict[str, Any], client: Any, eps: str | None, question: str,
-                      say: Callable[..., Any], progress: Callable[[str], Any] | None = None) -> str | None:
+                      say: Callable[..., Any], progress: Callable[[str], Any] | None = None, ind: str = "tma") -> str | None:
     if eps is None:
         eps = _eps_of_question(question)
     ini, fim, label = _capa_period(question, event)
@@ -5222,20 +5339,241 @@ def _send_tma_pessoas(event: dict[str, Any], client: Any, eps: str | None, quest
     people = _mop_people(eps)
     t = _norm_text(question)
     emails, titulo_equipe = None, ""
-    if people and (_TEAM_RE.search(t) or re.search(r"\b(minha|meu|nossa|nosso|meus)\b", t)):
+    if people and not re.search(r"\btod[oa]s\b", t) and (_TEAM_RE.search(t) or re.search(r"\b(minha|meu|nossa|nosso|meus)\b", t)):
         kind, leader = _resolve_team(question, event, people)
         if kind in {"sup", "coord"} and leader:
             field = "supervisor" if kind == "sup" else "coordenador"
             emails = {e for e, p in people.items() if _norm_text(p[field]) == _norm_text(leader)}
             titulo_equipe = f"{'Equipe' if kind == 'sup' else 'Coordenação'} de {_nice_name(leader)}"
     base_p = _pessoas_sql_params(eps, None, people, fim, emails, d1)
+    if _ABERTURA_RE.search(t) or _WANTS_FILE_RE.search(t):  # todos os analistas (a lista completa vai na planilha)
+        base_p["top_ops"] = "5000"
     minimo = TMA_PESSOAS_MIN_TICKETS_D1 if d1 else TMA_PESSOAS_MIN_TICKETS
     tpl = _query_text("tma_pessoas.sql")
     if not tpl:
         return "A visão de TMA por analista não está configurada (falta queries/tma_pessoas.sql)."
     params = {"data_inicio": ini.isoformat(), "data_fim": fim.isoformat(), "eps_like": base_p["eps_like"],
               "filtro_fila": f"fila = '{fila}'" if fila else "1 = 1", "mop_values": base_p["mop_values"],
-              "filtro_equipe": base_p["filtro_equipe"], "min_tickets": str(minimo), "top_ops": str(PESSOAS_OPS_MAX)}
+              "filtro_equipe": base_p["filtro_equipe"], "min_tickets": str(minimo),
+              "top_ops": base_p["top_ops"] if base_p["top_ops"] == "5000" else str(PESSOAS_OPS_MAX)}
+    sql = tpl
+    for k, v in params.items():
+        sql = sql.replace("{" + k + "}", v)
+    sql = _compact_sql(sql)
+    capa_out: dict[str, Any] = {}
+
+    def _capa_bg() -> None:  # TMA oficial (régua da CAPA) em paralelo, para abrir a resposta com o número que se cobra
+        try:
+            capa_out["rows"] = _capa_rows(ini, fim, None)[0] if _capa_template()[0] else None
+        except Exception:
+            capa_out["rows"] = None
+    capa_t = threading.Thread(target=_capa_bg, daemon=True)
+    capa_t.start()
+    key = f"tma_pessoas:{hash(sql)}"
+    hit = _CSAT_ROWS_CACHE.get(key)
+    if hit and time.time() - hit[0] < 1800:
+        rows, problema = hit[1], ""
+    else:
+        rows, problema = _run_app_sql(sql, progress, f"{ind.upper()} por analista ({ini} a {fim})", acesso=True)
+        if rows is None and params["top_ops"] == "5000":  # a lista inteira não voltou: tenta os 50 que mais pesam
+            sql = sql.replace("<= 5000", "<= 50")
+            rows, problema = _run_app_sql(sql, progress, f"{ind.upper()} por analista ({ini} a {fim})", acesso=True)
+        if rows is not None:
+            _CSAT_ROWS_CACHE[key] = (time.time(), rows)
+    if rows is None:
+        return problema
+    so_sup = bool(re.search(r"\b(supervisor\w*|equipes)\b", t)) and not re.search(r"\b(operador\w*|analista\w*|atendente\w*)\b", t)
+    so_ops = bool(re.search(r"\b(operador\w*|analista\w*|atendente\w*)\b", t)) and not re.search(r"\b(supervisor\w*|coordenador\w*|equipes?)\b", t)
+    completo = bool(_ABERTURA_RE.search(t))
+    capa_t.join(timeout=240)
+    oficial: dict[str, str] = {}
+    for r in (capa_out.get("rows") or []) if ind == "tma" else []:
+        nome_c = r.get("celula", "")
+        if fila and _norm_text(nome_c) != _norm_text(fila) and not _norm_text(nome_c).startswith(_norm_text(fila)):
+            continue
+        tma_c, plan_c = _cv(r, "tempo atribuicao (ticket)"), _cv(r, "tempo atendimento plan (ticket)")
+        if tma_c is None:
+            continue
+        eps_c = "AeC" if _norm_text(r.get("eps", "")) == "aec" else "CSU"
+        if fila:
+            v = ("⚪ plan a definir" if not plan_c else f"🔴 {_fmt_int(tma_c - plan_c)} s acima do plan {_fmt_int(plan_c)} s"
+                 if tma_c > plan_c + 0.5 else f"🟢 {_fmt_int(plan_c - tma_c)} s abaixo do plan {_fmt_int(plan_c)} s")
+            oficial[eps_c] = f"📍 *TMA oficial de `{nome_c}`* (régua da operação): *{_fmt_int(tma_c)} s* → {v}"
+    textos = []
+    for e in ([eps] if eps else ["AeC", "CSU"]):
+        render = _tma_pessoas_text if ind == "tma" else _sla_pessoas_text
+        x = render(rows, e, people, fila or e, label, eps, titulo_equipe, so_sup, so_ops, minimo, completo)
+        if x:
+            if oficial.get(e):
+                head, _, resto = x.partition("\n")
+                x = f"{head}\n{oficial[e]}\n{resto}"
+            textos.append(x)
+    if not textos:
+        if rows and not any(r.get("tipo", "").upper() == "TOTAL" for r in rows):
+            _alert(f"⚠️ TMA por analista ({ini} a {fim}): a resposta não veio no formato do SQL fixo. "
+                   f"Colunas: {sorted(rows[0].keys())[:8]}")
+            return "A consulta voltou num formato que eu não consegui ler. Já avisei o time; tenta de novo daqui a pouco?"
+        return f"Não achei atendimento de {fila or eps or 'AeC/CSU'} em {label}. Quer outro período?"
+    event["_catalog"] = f"{ind}|pessoas|impacto"
+    n_an = sum(1 for r in rows if r.get("tipo", "").upper() == "OP")
+    if re.search(r"\b(excel|planilha|xlsx|arquivo)\b", t) or (completo and n_an > 15):
+        try:
+            (client or slack_app.client).files_upload_v2(
+                channel=event.get("channel"), thread_ts=_reply_ts(event),
+                content=_tma_pessoas_xlsx(rows, [eps] if eps else ["AeC", "CSU"], people),
+                filename=f"{ind.upper()}_por_supervisor_{(fila or eps or 'iFood').replace(' ', '_')}_{ini.strftime('%d-%m')}_a_{fim.strftime('%d-%m')}.xlsx",
+                title=f"{ind.upper()} por supervisor · {fila or eps or 'iFood'} · {label}",
+                initial_comment="\n\n".join(textos) + "\n\n📎 Na planilha: todas as equipes e o ranking de analistas, com as "
+                                                      "fórmulas de TMA, SLA e impacto.")
+            return None
+        except Exception:
+            logger.warning("TMA por supervisor: upload do Excel falhou; mando só o texto", exc_info=True)
+    _say_sections(say, "\n\n".join(textos), event)
+    return None
+
+
+def _is_sla_pessoas_request(question: str) -> bool:
+    """"Quais analistas/supervisores mais derrubam o SLA?" (e "SLA por operador/supervisor")."""
+    t = _norm_text(question)
+    if not re.search(r"\bsla\b|primeira resposta|1a resposta", t) or re.search(r"\b(csat|casos?|motivos?)\b", t):
+        return False
+    if not _PESSOAS_RE.search(t):
+        return False
+    return bool(_PESSOAS_IMPACTO_RE.search(t) or re.search(r"\bpor (analista|operador|atendente|supervisor\w*)\b", t)
+                or _ABERTURA_RE.search(t) or re.search(r"\b(derrub\w*|estour\w*|fora do prazo)\b", t))
+
+
+def _sla_of(r: dict[str, str]) -> float | None:
+    b = _sql_num(r.get("sla base")) or 0
+    return (_sql_num(r.get("sla dentro")) or 0) / b * 100 if b else None
+
+
+def _sla_pessoas_text(rows: list[dict[str, str]], eps_nome: str, people: dict[str, dict[str, str]], alvo: str,
+                      label: str, eps: str | None, titulo_equipe: str, so_sup: bool, so_ops: bool, minimo: int,
+                      completo: bool = False) -> str:
+    mine = [r for r in rows if _compact(r.get("eps", "")) == _compact(eps_nome)]
+    tot = next((r for r in mine if r.get("tipo", "").upper() == "TOTAL"), None)
+    sla_t = _sla_of(tot) if tot else None
+    if sla_t is None:
+        return ""
+    by_user = {e.split("@")[0]: e for e in people}
+    allowed = _operator_names_allowed(eps)
+    pp = lambda v: ("+" if v > 0 else "−" if v < 0 else "") + _bfmt(abs(v), 2) + " p.p."
+    imp = lambda r: _sql_num(r.get("impacto sla pp")) or 0
+    linhas = [f"⏰ *Quem mais pesa no SLA de 1ª resposta ·* `{alvo}`" + (f" · {titulo_equipe}" if titulo_equipe else "")
+              + f" *— {label}* · SLA {_bfmt(sla_t)}% · {_fmt_int(_sql_num(tot.get('sla base')) or 0)} interações medidas"]
+    sups = [r for r in mine if r.get("tipo", "").upper() == "SUP"]
+    sem = next((r for r in sups if r.get("nome") == "Sem supervisor no MOP"), None)
+    sups = sorted([r for r in sups if r is not sem and (_sql_num(r.get("sla base")) or 0) >= 100], key=imp)
+    if sups and not so_ops and not titulo_equipe:
+        linhas += ["", "👥 *Por supervisor* — " + ("todas as equipes, de quem mais derruba o SLA a quem mais segura"
+                                                   if completo else "quem mais derruba o SLA")]
+        lista = sups if completo else [r for r in sups if imp(r) < -0.005][:PESSOAS_SUP_MAX]
+        for i, r in enumerate(lista, 1):
+            linhas.append(f"{i}. {_nice_name(r.get('nome', ''))} · *{pp(imp(r))}* · SLA da equipe {_bfmt(_sla_of(r) or 0)}% · "
+                          f"{int(_sql_num(r.get('n ops')) or 0)} analista(s) · {_fmt_int(_sql_num(r.get('sla base')) or 0)} interações")
+        if not lista:
+            linhas.append("Nenhuma equipe derrubando o SLA. 👏")
+    ops = [r for r in mine if r.get("tipo", "").upper() == "OP" and (_sql_num(r.get("sla base")) or 0) >= minimo]
+
+    def who(r: dict[str, str]) -> str:
+        u = r.get("nome", "").strip().lower()
+        email = by_user.get(u) or u
+        return _operator_label(email, (people.get(email) or {}).get("nome", "") if allowed else "")
+
+    def op_line(r: dict[str, str]) -> str:
+        corte = "2 min" if r.get("fila", "").startswith("CX Super Cliente") else "5 min"
+        return (f"{who(r)} · {r.get('fila', '')} · *{pp(imp(r))}* · SLA {corte} {_bfmt(_sla_of(r) or 0)}% · "
+                f"{_fmt_int(_sql_num(r.get('sla base')) or 0)} interações")
+
+    if not so_sup:
+        down = sorted([r for r in ops if imp(r) < -0.005], key=imp)
+        linhas += ["", "🧑‍💻 *Por analista* — quem mais derruba o SLA"]
+        linhas += [f"{i}. {op_line(r)}" for i, r in enumerate(down[:PESSOAS_OPS_MAX], 1)] or ["Ninguém derrubando o SLA. 👏"]
+        up = sorted([r for r in ops if imp(r) > 0.005], key=imp, reverse=True)[:3]
+        if up:
+            linhas += ["", "💪 *Quem mais segura o SLA*"] + [f"• {op_line(r)}" for r in up]
+    if sem and not titulo_equipe and (_sql_num(sem.get("sla base")) or 0) > 0.1 * (_sql_num(tot.get("sla base")) or 1):
+        linhas.insert(1, f"⚠️ {int(_sql_num(sem.get('n ops')) or 0)} analista(s) com {_fmt_int(_sql_num(sem.get('sla base')) or 0)} "
+                         "interações não estão no MOP de hoje: contam no SLA, mas ficam fora do ranking de supervisor.")
+    linhas += ["", f"_Impacto = interações fora do prazo a mais do que a taxa de `{alvo}` daria, em p.p. do SLA do conjunto; "
+                   "negativo derruba. Corte de 2 min nas CX Super Cliente e 5 min nas demais, como na operação. "
+                   "Supervisor = soma da equipe._"]
+    return "\n".join(linhas)
+
+
+def _equipe_efic_text(rows: list[dict[str, str]], eps_nome: str, people: dict[str, dict[str, str]], titulo: str,
+                      label: str, eps: str | None, inds: set[str]) -> str:
+    """Bloco de TMA e SLA da equipe (mesma conversa da visão de equipe de CSAT)."""
+    mine = [r for r in rows if _compact(r.get("eps", "")) == _compact(eps_nome)]
+    tot = next((r for r in mine if r.get("tipo", "").upper() == "TOTAL"), None)
+    sup = [r for r in mine if r.get("tipo", "").upper() == "SUP" and r.get("nome") != "Sem supervisor no MOP"]
+    if not tot or not sup:
+        return ""
+    s_tk = sum(_sql_num(r.get("tickets")) or 0 for r in sup)
+    s_t = sum(_sql_num(r.get("tempo")) or 0 for r in sup)
+    s_b = sum(_sql_num(r.get("sla base")) or 0 for r in sup)
+    s_d = sum(_sql_num(r.get("sla dentro")) or 0 for r in sup)
+    t_all, n_all = _sql_num(tot.get("tempo")) or 0, _sql_num(tot.get("tickets")) or 0
+    by_user = {e.split("@")[0]: e for e in people}
+    allowed = _operator_names_allowed(eps)
+
+    def who(r: dict[str, str]) -> str:
+        u = r.get("nome", "").strip().lower()
+        email = by_user.get(u) or u
+        return _operator_label(email, (people.get(email) or {}).get("nome", "") if allowed else "")
+
+    ops = [r for r in mine if r.get("tipo", "").upper() == "OP"]
+    linhas = [f"⚙️ *TMA e SLA · {titulo}* — {label}"]
+    if "tma" in inds and s_tk and n_all:
+        tma_e, tma_all = s_t / s_tk, t_all / n_all
+        imp_e = tma_all - (t_all - s_t) / (n_all - s_tk) if n_all > s_tk else 0
+        linhas.append(f"• TMA da equipe *{_fmt_int(tma_e)} s* (`{eps_nome}` {_fmt_int(tma_all)} s na mesma régua) → "
+                      f"{'🔴' if imp_e > 0.05 else '🟢'} {'+' if imp_e >= 0 else '−'}{_bfmt(abs(imp_e), 1)} s no TMA da {eps_nome}")
+        top = sorted([r for r in ops if (_sql_num(r.get("impacto s")) or 0) > 0.05], key=lambda r: -(_sql_num(r.get("impacto s")) or 0))[:3]
+        if top:
+            linhas.append("   ↳ quem mais puxa o TMA: " + "; ".join(
+                f"{who(r)} ({_fmt_int((_sql_num(r.get('tempo')) or 0) / max(_sql_num(r.get('tickets')) or 1, 1))} s)" for r in top))
+    if "sla" in inds and s_b:
+        sla_e, sla_all = s_d / s_b * 100, _sla_of(tot) or 0
+        imp_s = sum(_sql_num(r.get("impacto sla pp")) or 0 for r in sup)
+        linhas.append(f"• SLA de 1ª resposta da equipe *{_bfmt(sla_e)}%* (`{eps_nome}` {_bfmt(sla_all)}%) → "
+                      f"{'🔴' if imp_s < -0.005 else '🟢'} {'+' if imp_s >= 0 else '−'}{_bfmt(abs(imp_s), 2)} p.p. no SLA da {eps_nome}")
+        top = sorted([r for r in ops if (_sql_num(r.get("impacto sla pp")) or 0) < -0.005 and (_sql_num(r.get("sla base")) or 0) >= 20],
+                     key=lambda r: _sql_num(r.get("impacto sla pp")) or 0)[:3]
+        if top:
+            linhas.append("   ↳ quem mais derruba o SLA: " + "; ".join(f"{who(r)} ({_bfmt(_sla_of(r) or 0)}%)" for r in top))
+    if len(linhas) == 1:
+        return ""
+    linhas.append("_Régua por analista (o ticket conta para cada um que o atendeu). Detalhe: \"quais analistas mais "
+                  "impactam o TMA/SLA da minha equipe\"._")
+    return "\n".join(linhas)
+
+
+def _team_efic_rows(event: dict[str, Any], eps: str | None, question: str,
+                    progress: Callable[[str], Any] | None = None) -> tuple[list[dict[str, str]] | None, dict, str, str, str | None]:
+    """Roda o SQL de TMA/SLA por pessoa recortado na equipe da pergunta. Retorna (rows, people, titulo, label, eps)."""
+    if eps is None:
+        eps = _eps_of_question(question)
+    people = _mop_people(eps)
+    ini, fim, label = _capa_period(question, event)
+    kind, leader = _resolve_team(question, event, people) if people else ("none", None)
+    if kind not in {"sup", "coord"} or not leader:
+        return None, people, "", label, eps
+    field = "supervisor" if kind == "sup" else "coordenador"
+    emails = {e for e, p in people.items() if _norm_text(p[field]) == _norm_text(leader)}
+    if eps is None:
+        eps_t = {people[e].get("eps") for e in emails} - {"", None}
+        eps = eps_t.pop() if len(eps_t) == 1 else None
+    titulo = f"{'Equipe' if kind == 'sup' else 'Coordenação'} de {_nice_name(leader)}"
+    base_p = _pessoas_sql_params(eps, None, people, fim, emails, ini == fim)
+    tpl = _query_text("tma_pessoas.sql")
+    if not tpl:
+        return None, people, titulo, label, eps
+    params = {"data_inicio": ini.isoformat(), "data_fim": fim.isoformat(), "eps_like": base_p["eps_like"],
+              "filtro_fila": "1 = 1", "mop_values": base_p["mop_values"], "filtro_equipe": base_p["filtro_equipe"],
+              "min_tickets": str(TMA_PESSOAS_MIN_TICKETS_D1 if ini == fim else TMA_PESSOAS_MIN_TICKETS),
+              "top_ops": str(PESSOAS_OPS_MAX)}
     sql = tpl
     for k, v in params.items():
         sql = sql.replace("{" + k + "}", v)
@@ -5243,26 +5581,318 @@ def _send_tma_pessoas(event: dict[str, Any], client: Any, eps: str | None, quest
     key = f"tma_pessoas:{hash(sql)}"
     hit = _CSAT_ROWS_CACHE.get(key)
     if hit and time.time() - hit[0] < 1800:
+        return hit[1], people, titulo, label, eps
+    rows, _ = _run_app_sql(sql, progress, f"TMA e SLA da equipe ({ini} a {fim})", acesso=True)
+    if rows is not None:
+        _CSAT_ROWS_CACHE[key] = (time.time(), rows)
+    return rows, people, titulo, label, eps
+
+
+# --- CSAT dia a dia (consulta fixa; mesmo layout do dia a dia de TMA e SLA) ------------------------------------------
+def _is_csat_diario_request(question: str) -> bool:
+    t = _norm_text(question)
+    return bool(_DIARIO_RE.search(t)) and bool(re.search(r"\b(csat|nota\w*|avaliac\w*|satisfac\w*)\b", t)) and not re.search(
+        r"\b(operador\w*|analista\w*|supervisor\w*|equipe|casos?|motivos?)\b", t)
+
+
+def _render_csat_diario(rows: list[dict[str, str]], eps: str | None, label: str, fila: str | None) -> str:
+    dsem = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]
+    blocos = []
+    for eps_nome in ([eps] if eps else ["AeC", "CSU"]):
+        sel = [r for r in rows if _compact(r.get("eps", "")) == _compact(eps_nome)
+               and (not fila or _norm_text(r.get("fila", "")) == _norm_text(fila))]
+        if not sel:
+            continue
+        por_dia: dict[str, list[dict[str, str]]] = {}
+        for r in sel:
+            por_dia.setdefault(str(r.get("data", ""))[:10], []).append(r)
+        alvo = f"`{fila}`" if fila else f"`{eps_nome}`"
+        linhas = [f"📅 *CSAT por dia ·* {alvo} *— {label}*",
+                  "_CSAT contra a meta" + (" da fila" if fila else " (a de cada fila, ponderada pelas avaliações do dia)")
+                  + "; dia = data da avaliação_", ""]
+        serie = []
+        for dia in sorted(por_dia):
+            rs = por_dia[dia]
+            n = sum(_sql_num(r.get("avaliacoes")) or 0 for r in rs)
+            p = sum(_sql_num(r.get("promotoras")) or 0 for r in rs)
+            if not n:
+                continue
+            try:
+                d = date.fromisoformat(dia)
+            except ValueError:
+                continue
+            metas = [((_sql_num(r.get("avaliacoes")) or 0), _meta_fila(r.get("fila", ""), d)) for r in rs]
+            am = sum(a for a, m in metas if m is not None)
+            meta = sum(a * m for a, m in metas if m is not None) / am if am else None
+            csat = p / n * 100
+            m_txt = (_bfmt(meta, 0) if abs(meta - round(meta)) < 0.05 else _bfmt(meta, 1)) if meta is not None else ""
+            ruim = meta is not None and csat < meta - 0.05
+            v = ("⚪ sem meta" if meta is None else f"🟢 na meta {m_txt}%" if abs(csat - meta) < 0.05 else
+                 f"🔴 {_bfmt(meta - csat)} p.p. abaixo da meta {m_txt}%" if csat < meta else
+                 f"🟢 {_bfmt(csat - meta)} p.p. acima da meta {m_txt}%")
+            dia_txt = f"{d.strftime('%d/%m')} {dsem[d.weekday()]}"
+            linhas += [f"{'🔴' if ruim else '🟢'} *{dia_txt}* · n={_fmt_int(n)}", f"   • CSAT *{_bfmt(csat)}%* → {v}", ""]
+            serie.append((dia_txt, csat, meta, n))
+        while linhas and linhas[-1] == "":
+            linhas.pop()
+        if not serie:
+            continue
+        com_meta = [x for x in serie if x[2] is not None]
+        leitura = []
+        if com_meta:
+            abaixo = [x for x in com_meta if x[1] < x[2] - 0.05]
+            pior = min(com_meta, key=lambda x: x[1] - x[2])
+            leitura.append(f"CSAT abaixo da meta em {len(abaixo)} de {len(com_meta)} dias"
+                           + (f"; pior em {pior[0]} ({_bfmt(pior[1])}%, {_bfmt(pior[2] - pior[1])} p.p. abaixo)." if abaixo else "."))
+        if len(serie) >= 4:
+            ini_m = sum(x[1] for x in serie[:len(serie) // 2]) / (len(serie) // 2)
+            fim_m = sum(x[1] for x in serie[len(serie) // 2:]) / (len(serie) - len(serie) // 2)
+            if abs(fim_m - ini_m) >= 1:
+                leitura.append(f"Tendência de {'melhora' if fim_m > ini_m else 'piora'}: média {_bfmt(ini_m)}% na primeira "
+                               f"metade do período e {_bfmt(fim_m)}% na segunda.")
+        if leitura:
+            linhas += ["", "💡 *Leitura*"] + [f"↳ {t}" for t in leitura]
+        blocos.append("\n".join(linhas))
+    return "\n\n".join(blocos)
+
+
+def _send_csat_diario(event: dict[str, Any], eps: str | None, question: str,
+                      progress: Callable[[str], Any] | None = None, client: Any = None) -> str:
+    if eps is None:
+        eps = _eps_in_text(question)
+    ini, fim, label = _capa_period(question, event)
+    fila = _fila_in_question(question, eps)
+    eps_lista, _ = _csat_eps_params(eps)
+    rows, problema = _csat_fixed_rows("csat_diario.sql", ini, fim, {
+        "eps_lista": eps_lista, "filtro_fila": f"fila_relatorio = '{fila}'" if fila else "1 = 1"},
+        progress, f"CSAT por dia ({ini} a {fim})")
+    if rows is None:
+        return problema or "Não consegui puxar o CSAT por dia agora. Tenta de novo daqui a pouco?"
+    texto = _render_csat_diario(rows, eps, label, fila)
+    if not texto:
+        return f"Não veio avaliação de {fila or eps or 'AeC/CSU'} em {label}."
+    if _WANTS_FILE_RE.search(_norm_text(question)) and _upload_xlsx(
+            event, client, _rows_xlsx([("CSAT por dia", rows, {"CSAT (%)": "=IFERROR({promotoras}{r}/{avaliacoes}{r}*100,\"\")"})]),
+            f"CSAT_por_dia_{(fila or eps or 'iFood').replace(' ', '_')}.xlsx", f"CSAT por dia · {fila or eps or 'iFood'} · {label}",
+            texto):
+        return ""
+    return texto
+
+
+# --- Por que o TMA / o SLA mudou: mix x performance (mesma lógica da variação do CSAT) ---------------------------------
+_VARIACAO_RE = re.compile(r"\b(caiu|cair|caindo|subiu|subir|subindo|piorou|piorando|melhorou|melhorando|varia\w*|"
+                          r"por que|porque|pq|o que (aconteceu|mudou|explica)|explica\w*|aument\w*|diminu\w*|mix|"
+                          r"performance|piora\w*|melhora\w*)\b")
+
+
+def _is_efic_variacao_request(question: str) -> bool:
+    t = _norm_text(question)
+    return bool(_efic_indicator(question)) and bool(_VARIACAO_RE.search(t)) and not re.search(
+        r"\b(operador\w*|analista\w*|supervisor\w*|equipe|casos?|como funciona|o que e|o que significa)\b", t)
+
+
+def _efic_variacao_calc(rows: list[dict[str, str]], ind: str, grupo: str) -> dict[str, Any] | None:
+    """Decompõe a variação do TMA por interação (ind=tma) ou do SLA (ind=sla) em efeito mix e efeito performance."""
+    per: dict[str, dict[str, list[float]]] = {"atual": {}, "ref": {}}
+    for r in rows:
+        k = r.get("periodo", "").strip().lower()
+        if k not in per or _norm_text(r.get("celula", "")) != _norm_text(grupo):
+            continue
+        if ind == "tma":
+            peso, val = _sql_num(r.get("tratados")) or 0, _sql_num(r.get("tempo")) or 0
+        else:
+            peso, val = _sql_num(r.get("sla base")) or 0, _sql_num(r.get("sla dentro")) or 0
+        acc = per[k].setdefault(_motivo_label(r.get("motivo")) or "sem motivo", [0.0, 0.0])
+        acc[0] += peso
+        acc[1] += val
+    n_c, n_r = sum(v[0] for v in per["atual"].values()), sum(v[0] for v in per["ref"].values())
+    if not n_c or not n_r:
+        return None
+    esc = 1.0 if ind == "tma" else 100.0  # TMA em segundos; SLA em %
+    v_c = sum(v[1] for v in per["atual"].values()) / n_c * esc
+    v_r = sum(v[1] for v in per["ref"].values()) / n_r * esc
+    itens = []
+    for m in set(per["atual"]) | set(per["ref"]):
+        pc, xc = per["atual"].get(m, [0.0, 0.0])
+        pr, xr = per["ref"].get(m, [0.0, 0.0])
+        sh_c, sh_r = pc / n_c, pr / n_r
+        m_c = xc / pc * esc if pc else None
+        m_r = xr / pr * esc if pr else None
+        mix = (sh_c - sh_r) * ((m_r if m_r is not None else v_r) - v_r)
+        perf = sh_c * ((m_c if m_c is not None else 0) - (m_r if m_r is not None else v_r)) if pc else 0.0
+        itens.append({"motivo": m, "sh_c": sh_c * 100, "sh_r": sh_r * 100, "m_c": m_c, "m_r": m_r, "mix": mix, "perf": perf,
+                      "n_c": pc, "n_r": pr})
+    return {"v_c": v_c, "v_r": v_r, "n_c": n_c, "n_r": n_r, "mix": sum(i["mix"] for i in itens),
+            "perf": sum(i["perf"] for i in itens), "itens": itens}
+
+
+def _render_efic_variacao(calc: dict[str, Any], ind: str, alvo: str, l_cur: str, l_ref: str) -> str:
+    un = (lambda v: f"{'+' if v >= 0 else '−'}{_bfmt(abs(v), 1)} s") if ind == "tma" else \
+        (lambda v: f"{'+' if v >= 0 else '−'}{_bfmt(abs(v), 1)} p.p.")
+    val = (lambda v: f"{_fmt_int(v)} s") if ind == "tma" else (lambda v: f"{_bfmt(v)}%")
+    ruim = (lambda d: d > 0) if ind == "tma" else (lambda d: d < 0)  # TMA subir é ruim; SLA cair é ruim
+    delta = calc["v_c"] - calc["v_r"]
+    nome = "TMA por interação" if ind == "tma" else "SLA de 1ª resposta"
+    titulo = "⏱️ *Por que o TMA mudou" if ind == "tma" else "⏰ *Por que o SLA mudou"
+    linhas = [f"{titulo} ·* `{alvo}` *— {l_cur} x {l_ref}*",
+              f"{'🔴' if ruim(delta) else '🟢'} {nome}: *{val(calc['v_r'])}* → *{val(calc['v_c'])}* ({un(delta)})", ""]
+    sgn = 1 if delta >= 0 else -1
+    mix_top = sorted([i for i in calc["itens"] if i["m_r"] is not None], key=lambda i: -i["mix"] * sgn)[:3]
+    perf_top = sorted([i for i in calc["itens"] if i["m_c"] is not None and i["m_r"] is not None],
+                      key=lambda i: -i["perf"] * sgn)[:3]
+    linhas.append(f"🔀 *Mix (o que chegou):* *{un(calc['mix'])}* — efeito de mudar a participação de cada motivo")
+    for i in mix_top:
+        if abs(i["mix"]) < 0.05:
+            continue
+        linhas.append(f"   ↳ {i['motivo']}: {_bfmt(i['sh_r'])}% → {_bfmt(i['sh_c'])}% "
+                      f"{'dos tratados' if ind == 'tma' else 'das interações'}, motivo de {val(i['m_r'])} ({un(i['mix'])})")
+    linhas.append(f"⚙️ *Performance (o atendimento):* *{un(calc['perf'])}* — o mesmo motivo "
+                  + ("levando mais ou menos tempo" if ind == "tma" else "respondendo mais rápido ou mais devagar"))
+    for i in perf_top:
+        if abs(i["perf"]) < 0.05:
+            continue
+        linhas.append(f"   ↳ {i['motivo']}: {val(i['m_r'])} → {val(i['m_c'])} · {_bfmt(i['sh_c'])}% "
+                      f"{'dos tratados' if ind == 'tma' else 'das interações'} ({un(i['perf'])})")
+    maior = "performance" if abs(calc["perf"]) >= abs(calc["mix"]) else "mix"
+    piorou = ruim(delta)
+    if maior == "performance":
+        leitura = ("A maior parte vem de *performance*: é o atendimento. Vale olhar procedimento, ferramenta e escala nos "
+                   "motivos acima." if piorou else
+                   "A maior parte vem de *performance*: o atendimento melhorou nos motivos acima. Vale entender o que "
+                   "mudou para manter.")
+    else:
+        leitura = ("A maior parte vem de *mix*: é o tipo de contato que chegou, não necessariamente o time. Vale olhar a "
+                   "origem do volume desses motivos." if piorou else
+                   "A maior parte vem de *mix*: chegou contato mais favorável. A melhora não é do atendimento, então "
+                   "pode não se sustentar.")
+    linhas += ["", "💡 *Leitura*", f"↳ {leitura}",
+               "", f"_Mix = Σ (participação atual − ref) × (valor ref do motivo − valor ref total); performance = Σ "
+                   f"participação atual × (valor atual − ref do motivo). Mix + performance = variação "
+                   f"({un(calc['mix'] + calc['perf'])}). " + ("TMA por interação (tempo de atribuição), como nos motivos."
+                                                             if ind == "tma" else "Corte de 2 min nas Super Cliente, 5 min nas demais.")
+               + "_"]
+    return "\n".join(linhas)
+
+
+def _efic_variacao_xlsx(calc: dict[str, Any], ind: str, alvo: str, l_cur: str, l_ref: str) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Mix x performance"
+    un = "s" if ind == "tma" else "%"
+    ws.append(["Motivo", f"Base ref ({l_ref})", f"Base atual ({l_cur})", "Participação ref", "Participação atual",
+               f"Valor ref ({un})", f"Valor atual ({un})", f"Valor ref total ({un})", "Efeito mix", "Efeito performance"])
+    for c in ws[1]:
+        c.font, c.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="EA1D2C")
+    itens = sorted(calc["itens"], key=lambda i: -(i["n_c"] + i["n_r"]))
+    last = len(itens) + 1
+    for k, i in enumerate(itens, start=2):
+        ws.append([i["motivo"], i["n_r"], i["n_c"], None, None, i["m_r"], i["m_c"], round(calc["v_r"], 4), None, None])
+        ws.cell(row=k, column=4, value=f"=B{k}/SUM($B$2:$B${last})")
+        ws.cell(row=k, column=5, value=f"=C{k}/SUM($C$2:$C${last})")
+        ws.cell(row=k, column=9, value=f'=(E{k}-D{k})*(IF(F{k}="",H{k},F{k})-H{k})')
+        ws.cell(row=k, column=10, value=f'=IF(C{k}=0,0,E{k}*(G{k}-IF(F{k}="",H{k},F{k})))')
+    ws.append(["TOTAL", f"=SUM(B2:B{last})", f"=SUM(C2:C{last})", None, None, None, None, None,
+               f"=SUM(I2:I{last})", f"=SUM(J2:J{last})"])
+    for col, w in zip("ABCDEFGHIJ", (34, 16, 16, 16, 16, 14, 14, 18, 14, 18)):
+        ws.column_dimensions[col].width = w
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _send_efic_variacao(event: dict[str, Any], client: Any, eps: str | None, question: str,
+                        progress: Callable[[str], Any] | None = None) -> str | None:
+    ind = _efic_indicator(question) or "tma"
+    if eps is None:
+        eps = _eps_in_text(question)
+    fila = _fila_in_question(question, eps) or _fila_ref(question, eps, event)
+    cur, ref, l_cur, l_ref = _variation_periods(question)
+    tpl = _query_text("eficiencia_variacao.sql")
+    if not tpl:
+        return "A variação de TMA e SLA não está configurada (falta queries/eficiencia_variacao.sql)."
+    eps_lista = ", ".join(f"'{e}'" for e in (["AEC", "CSU"] if not eps else [_compact(eps).upper()]))
+    params = {"cur_inicio": cur[0].isoformat(), "cur_fim": cur[1].isoformat(), "ref_inicio": ref[0].isoformat(),
+              "ref_fim": ref[1].isoformat(), "eps_lista": eps_lista,
+              "filtro_celula": f"dp.celula_capa = '{fila}'" if fila else "1 = 1",
+              "por_celula": "true" if fila else "false"}
+    sql = tpl
+    for k, v in params.items():
+        sql = sql.replace("{" + k + "}", v)
+    sql = _compact_sql(sql)
+    key = f"efic_var:{hash(sql)}"
+    hit = _CSAT_ROWS_CACHE.get(key)
+    if hit and time.time() - hit[0] < 1800:
         rows, problema = hit[1], ""
     else:
-        rows, problema = _run_app_sql(sql, progress, f"TMA por analista ({ini} a {fim})", acesso=True)
+        rows, problema = _run_app_sql(sql, progress, f"Variação de {ind.upper()} ({fila or eps or 'iFood'})")
         if rows is not None:
             _CSAT_ROWS_CACHE[key] = (time.time(), rows)
     if rows is None:
         return problema
-    so_sup = bool(re.search(r"\b(supervisor\w*|equipes)\b", t)) and not re.search(r"\b(operador\w*|analista\w*|atendente\w*)\b", t)
-    so_ops = bool(re.search(r"\b(operador\w*|analista\w*|atendente\w*)\b", t)) and not re.search(r"\b(supervisor\w*|coordenador\w*|equipes?)\b", t)
-    textos = [x for x in (_tma_pessoas_text(rows, e, people, fila or e, label, eps, titulo_equipe, so_sup, so_ops, minimo)
-                          for e in ([eps] if eps else ["AeC", "CSU"])) if x]
+    grupos = [fila] if fila else ([_compact(eps).upper()] if eps else ["AEC", "CSU"])
+    textos, calcs = [], []
+    for g in grupos:
+        calc = _efic_variacao_calc(rows, ind, g)
+        if calc:
+            alvo = g if fila else ("AeC" if g == "AEC" else "CSU")
+            textos.append(_render_efic_variacao(calc, ind, alvo, l_cur, l_ref))
+            calcs.append((calc, alvo))
     if not textos:
-        if rows and not any(r.get("tipo", "").upper() == "TOTAL" for r in rows):
-            _alert(f"⚠️ TMA por analista ({ini} a {fim}): a resposta não veio no formato do SQL fixo. "
-                   f"Colunas: {sorted(rows[0].keys())[:8]}")
-            return "A consulta voltou num formato que eu não consegui ler. Já avisei o time; tenta de novo daqui a pouco?"
-        return f"Não achei atendimento de {fila or eps or 'AeC/CSU'} em {label}. Quer outro período?"
-    event["_catalog"] = "tma|pessoas|impacto"
-    _say_sections(say, "\n\n".join(textos), event)
-    return None
+        return f"Não veio volume de {fila or eps or 'AeC/CSU'} nos dois períodos ({l_cur} x {l_ref})."
+    event["_catalog"] = f"{ind}|variacao"
+    texto = "\n\n".join(textos)
+    if _WANTS_FILE_RE.search(_norm_text(question)):
+        try:
+            (client or slack_app.client).files_upload_v2(
+                channel=event.get("channel"), thread_ts=_reply_ts(event),
+                content=_efic_variacao_xlsx(calcs[0][0], ind, calcs[0][1], l_cur, l_ref),
+                filename=f"Variacao_{ind.upper()}_{calcs[0][1].replace(' ', '_')}.xlsx",
+                title=f"Variação de {ind.upper()} · {calcs[0][1]}", initial_comment=texto)
+            return None
+        except Exception:
+            logger.warning("Variação de eficiência: upload falhou", exc_info=True)
+    return texto
+
+
+_WANTS_FILE_RE = re.compile(r"\b(excel|planilha|xlsx|arquivo|base completa)\b")
+
+
+def _rows_xlsx(sheets: list[tuple[str, list[dict[str, str]], dict[str, str]]]) -> bytes:
+    """Planilha simples a partir das linhas da consulta; formulas = {coluna nova: fórmula com {r} para a linha}."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    wb = Workbook()
+    wb.remove(wb.active)
+    for title, rows, formulas in sheets:
+        ws = wb.create_sheet(title[:31])
+        cols = list(rows[0].keys()) if rows else []
+        ws.append([c.upper() for c in cols] + list(formulas))
+        for c in ws[1]:
+            c.font, c.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="EA1D2C")
+        letra = {c: ws.cell(row=1, column=i + 1).column_letter for i, c in enumerate(cols)}
+        for k, r in enumerate(rows, start=2):
+            ws.append([(_sql_num(r[c]) if _sql_num(r[c]) is not None and not re.match(r"\d{4}-\d{2}-\d{2}", str(r[c]))
+                        else r[c]) for c in cols])
+            for j, f in enumerate(formulas.values()):
+                ws.cell(row=k, column=len(cols) + j + 1, value=f.format(r=k, **letra))
+        for i in range(1, len(cols) + len(formulas) + 1):
+            ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = 18
+        ws.freeze_panes = "A2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _upload_xlsx(event: dict[str, Any], client: Any, content: bytes, filename: str, title: str, text: str) -> bool:
+    try:
+        (client or slack_app.client).files_upload_v2(channel=event.get("channel"), thread_ts=_reply_ts(event),
+                                                     content=content, filename=filename, title=title, initial_comment=text)
+        return True
+    except Exception:
+        logger.warning("Upload do Excel falhou (%s); mando só o texto", filename, exc_info=True)
+        return False
 
 
 # --- variação e motivos de CSAT por SQL fixo -----------------------------------
@@ -8637,7 +9267,7 @@ def _scope_rows(rows: list[dict[str, Any]], eps: str | None) -> list[dict[str, A
 _TABLE_BLOCK_RE = re.compile(r"\b(motivo|motivos|operador\w*|analista\w*|atendente\w*|quem|nomes?|nominal|supervisor\w*|coordenador\w*|"
                              r"equipe|por que|porque|pq|semana|semanal|tma|sla|nps|reabertura|volume|grafico|excel|"
                              r"planilha|quadrante|q4|reincid\w*|ofensor\w*|dispersao|compar\w*|evolucao|tendencia|turno\w*|horari\w*|"
-                             r"por hora|faixa\w*|regia\w*|cidade\w*|produto\w*|"
+                             r"por hora|faixa\w*|regia\w*|cidade\w*|produto\w*|diari\w*|dia a dia|por dia|cada dia|"
                              r"\d{1,2}/\d{1,2}|bu|food|multi)\b")
 _TABLE_RESULT_RE = re.compile(r"\b(resultado|csat|como (esta|estao|ta|tao|foi|foram|anda|andam))\b")
 _TABLE_IMPACT_RE = re.compile(r"\b(mais impacta\w*|maior impacto|mais impacto|impacta mais|pior|piores|"
@@ -9458,8 +10088,33 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                     "DADOS (calculados pelo app com as regras da CAPA — use só estes números):\n" + texto_e + "\n\n")
             else:
                 progress.done()
+                if _WANTS_FILE_RE.search(_norm_text(question)) and _upload_xlsx(
+                        event, client, _rows_xlsx([(f"Motivos {nome_ind}", rows_e, {})]),
+                        f"Motivos_{ind_e.upper()}_{(fila_e2 or eps or 'iFood').replace(' ', '_')}.xlsx",
+                        f"Motivos de {nome_ind} · {fila_e2 or eps or 'iFood'} · {label_e}", texto_e):
+                    return
                 _say(say, texto_e, event, in_thread=True)
                 return
+        if not efic_extra and _is_efic_variacao_request(question) and (asks or not in_report_thread):
+            event["_route"] = "efic_variacao"
+            ind_v = _efic_indicator(question) or "tma"
+            _say(say, f"Vou separar o que mudou no {ind_v.upper()} entre mix (o que chegou) e performance (o atendimento). "
+                      "Já te trago ⏳", event, in_thread=True)
+            resp_v = _send_efic_variacao(event, client, eps, question, progress)
+            progress.done()
+            if resp_v:
+                _say_sections(say, resp_v, event) if resp_v.startswith(("⏱️", "⏰")) else _say(say, resp_v, event, in_thread=True)
+            return
+        if not efic_extra and _is_csat_diario_request(question):
+            event["_route"] = "csat_diario"
+            _say(say, "Já puxo o CSAT dia a dia pra você ⏳", event, in_thread=True)
+            txt_cd = _send_csat_diario(event, eps, question, None, client)
+            if txt_cd:
+                _say(say, txt_cd, event, in_thread=True)
+            if not _is_capa_request(question.replace("csat", "").replace("CSAT", "")):
+                progress.done()
+                return
+            question = re.sub(r"(?i)\bcsat\b", "", question)  # "CSAT, TMA e SLA dia a dia": segue para o de TMA e SLA
         if not efic_extra and _is_capa_request(question):
             event["_route"] = "capa"
             _say(say, "Já puxo TMA e SLA pra você ⏳", event, in_thread=True)
@@ -9477,11 +10132,20 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             if problem:
                 _say(say, problem, event, in_thread=True)
             return
-        if not efic_extra and _is_tma_pessoas_request(question) and (asks or not in_report_thread):
-            event["_route"] = "tma_pessoas"
-            progress("Vou ver quem mais pesa no TMA (analistas e supervisores), já te mando. ⏳")
+        tq = _norm_text(question)
+        if (not efic_extra and event.get("thread_ts") and _PESSOAS_RE.search(tq) and _ABERTURA_RE.search(tq)
+                and not re.search(r"\b(csat|tma|sla|nota\w*)\b", tq)):
+            ctx_t = _thread_context(event)
+            if "Quem mais pesa no SLA" in ctx_t:
+                question = f"{question} (SLA)"
+            elif "Quem mais pesa no TMA" in ctx_t or "TMA" in ctx_t[-3000:]:  # "manda no excel" depois de uma resposta de TMA
+                question = f"{question} (TMA)"
+        ind_p = ("sla" if _is_sla_pessoas_request(question) else "tma" if _is_tma_pessoas_request(question) else None)
+        if not efic_extra and ind_p and (asks or not in_report_thread):
+            event["_route"] = f"{ind_p}_pessoas"
+            progress(f"Vou ver quem mais pesa no {ind_p.upper()} (analistas e supervisores), já te mando. ⏳")
             try:
-                problem = _send_tma_pessoas(event, client, eps, question, say, progress)
+                problem = _send_tma_pessoas(event, client, eps, question, say, progress, ind=ind_p)
             finally:
                 progress.done()
             if problem:
@@ -9513,9 +10177,42 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             pass
         elif _is_team_request(question) and not analytical and (asks or not in_report_thread):
             event["_route"] = "equipe"
+            tq = _norm_text(question)
+            pede = {k for k, rx in (("csat", r"\b(csat|nota\w*|avaliac\w*|satisfac\w*)\b"), ("tma", r"\btma\b|tempo medio"),
+                                    ("sla", r"\bsla\b|primeira resposta")) if re.search(rx, tq)}
+            inds = pede or {"csat", "tma", "sla"}  # "resultado da equipe" = todos os indicadores
             progress("Vou montar o resultado da equipe, já te mando. ⏳")
+            efic: dict[str, Any] = {}
+
+            def _efic_bg() -> None:
+                try:
+                    efic["out"] = _team_efic_rows(event, eps, question, None)
+                except Exception:
+                    logger.warning("Team view: TMA/SLA da equipe falhou", exc_info=True)
+                    efic["out"] = None
+            t_ef = threading.Thread(target=_efic_bg, daemon=True)
+            if inds & {"tma", "sla"} and _capa_template()[0]:
+                t_ef.start()
+            problem = None
             try:
-                problem = _send_team_view(event, client, eps, question, say, in_thread)
+                if "csat" in inds:
+                    problem = _send_team_view(event, client, eps, question, say, in_thread)
+                if t_ef.is_alive() or efic:
+                    t_ef.join(timeout=600)
+                    rows_e, people_e, titulo_e, label_e, eps_e = efic.get("out") or (None, {}, "", "", eps)
+                    txt = ""
+                    if rows_e:
+                        txt = "\n\n".join(x for x in (_equipe_efic_text(rows_e, e, people_e, titulo_e, label_e, eps_e,
+                                                                         inds & {"tma", "sla"})
+                                                       for e in ([eps_e] if eps_e else ["AeC", "CSU"])) if x)
+                    if txt:
+                        _say_sections(say, txt, event)
+                    elif "csat" not in inds and not titulo_e:  # "TMA de todos os supervisores": abertura completa
+                        for ind_x in sorted(inds & {"tma", "sla"}, reverse=True):
+                            problem = _send_tma_pessoas(event, client, eps, f"{question} abertura", say, None, ind=ind_x)
+                    elif "csat" not in inds:
+                        problem = problem or ("Não consegui puxar TMA e SLA da equipe agora. Me diz de quem é a equipe "
+                                              "(ex.: \"TMA da equipe da Supervisora 3\") ou tenta de novo daqui a pouco.")
             finally:
                 progress.done()
             if problem:
