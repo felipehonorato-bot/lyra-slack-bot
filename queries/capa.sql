@@ -1,7 +1,6 @@
--- MES_PLANO: 2026-11
 -- Visão da CAPA v2 (eficiência CX) — handoff validado contra '11 - NOVEMBRO v1' e já executado no Databricks.
--- Fórmulas sem alteração. O app troca {data_inicio}, {data_fim} e {mes_plano}.
--- Manutenção mensal: MES_PLANO, plano_ticket, celulas, de_para.
+-- Fórmulas sem alteração. O app troca {data_inicio}, {data_fim}, {mes_plano} e o plano do mês (células e ticket
+-- único por dia), que vem de queries/capa_planos.json (aba PLAN de cada Excel mensal). Filas novas: de_para.
 -- Colunas extras no fim (SOMA TEMPO ATRIBUIÇÃO, SLA BASE, SLA DENTRO): só para o consolidado da EPS com somas.
 -- =====================================================================
 -- VISÃO DA CAPA — NOVEMBRO/26 (reproduz a aba CAPA do "11 - NOVEMBRO v1")
@@ -555,37 +554,14 @@ de_para AS (
 --    média de interações plan (CAPA col. D) e tempo de atendimento plan (PLAN col. H)
 celulas AS (
     SELECT * FROM VALUES
-    ( 1, 'AEC', 'CX Suporte',                              5, 1.80, 288.8888889),
-    ( 2, 'AEC', 'Madrugada',                               5, 1.89, 297.3544974),
-    ( 3, 'AEC', 'CX Review - AeC',                         5, 2.05, 302.4390244),
-    ( 4, 'CSU', 'CX Review - CSU',                         5, 2.05, 302.4390244),
-    ( 5, 'AEC', 'CX Super Cliente - AeC',                  2, 1.73, 419.0751445),
-    ( 6, 'CSU', 'CX Super Cliente - CSU',                  2, 1.73, 393.0635838),
-    ( 7, 'CSU', 'PF Cancelamento',                         5, 1.23, 365.8536585),
-    ( 8, 'CSU', 'PF Super Clientes',                       5, 1.23, 325.2032520),  -- trocar para 2 se entrar na regra "super"
-    ( 9, 'CSU', 'PF Revisão Manual',                       5, 1.27, 322.8346457),
-    (10, 'CSU', 'CX Denúncia',                             5, 1.00, 540.0000000),
-    (11, 'CSU', 'Fraudes DX',                              5, 1.00, 550.0000000),
-    (12, 'CSU', 'DX - PF Contestação',                     5, 1.00,        NULL),
-    (13, 'CSU', 'DX - PF Contestação Bloqueio temporário', 5, 1.00,        NULL),
-    (14, 'AEC', 'Fila desativada 37 - Canarinhos',         5, 1.00,        NULL)
+    {celulas_values}
     AS t(ordem, eps, celula_capa, corte_sla_min, media_interacoes_plan, tempo_atendimento_plan)
 ),
 
 -- 4) Plano diário de ticket único (aba PLAN col. D), 01 a 30/11 — 1 valor por dia, na ordem
 plano_ticket AS (
     SELECT * FROM VALUES
-    ('CX Suporte'            , ARRAY(8665, 6057, 5606, 5926, 5752, 7489, 7868, 8630, 5691, 5264, 5516, 5475, 7302, 7412, 8113, 5597, 5153, 5347, 5328, 6780, 7145, 7946, 5318, 4954, 5024, 5236, 8486, 9802, 10894, 7057)),
-    ('Madrugada'             , ARRAY(761, 578, 553, 580, 563, 669, 678, 700, 540, 516, 539, 529, 638, 633, 654, 534, 509, 529, 520, 610, 619, 645, 509, 488, 501, 504, 723, 802, 826, 671)),
-    ('CX Review - AeC'       , ARRAY(2563, 2171, 2152, 2243, 2176, 2309, 2223, 2084, 2009, 1991, 2074, 2013, 2134, 2056, 1927, 2003, 1984, 2068, 2005, 2126, 2048, 1920, 1912, 1894, 1972, 1913, 2256, 2349, 2083, 2505)),
-    ('CX Review - CSU'       , ARRAY(1381, 1169, 1159, 1208, 1172, 1243, 1197, 1123, 1082, 1072, 1117, 1084, 1149, 1107, 1038, 1079, 1068, 1113, 1080, 1144, 1102, 1034, 1030, 1020, 1062, 1030, 1214, 1265, 1121, 1349)),
-    ('CX Super Cliente - AeC', ARRAY(1036, 837, 786, 844, 826, 886, 904, 847, 792, 744, 798, 781, 837, 856, 801, 811, 764, 820, 802, 860, 880, 821, 777, 732, 785, 770, 1063, 1139, 932, 820)),
-    ('CX Super Cliente - CSU', ARRAY(1924, 1556, 1459, 1567, 1534, 1646, 1679, 1572, 1471, 1380, 1481, 1451, 1556, 1589, 1487, 1507, 1419, 1522, 1491, 1595, 1634, 1524, 1443, 1358, 1457, 1428, 1975, 2117, 1731, 1525)),
-    ('PF Cancelamento'       , ARRAY(3116, 2510, 2368, 2156, 2226, 2397, 2702, 2530, 2482, 2340, 2130, 2198, 2367, 2669, 2497, 2431, 2291, 2086, 2153, 2318, 2613, 2445, 2552, 2405, 2189, 2259, 3015, 3674, 3641, 3169)),
-    ('PF Super Clientes'     , ARRAY(985, 870, 870, 897, 878, 940, 1013, 805, 859, 859, 885, 866, 927, 1000, 794, 868, 868, 895, 875, 937, 1010, 802, 927, 926, 954, 933, 1238, 1443, 1215, 1213)),
-    ('PF Revisão Manual'     , ARRAY(559, 430, 406, 408, 409, 456, 476, 447, 381, 359, 361, 361, 403, 421, 395, 390, 368, 370, 370, 413, 432, 405, 432, 407, 410, 410, 457, 478, 448, 460)),
-    ('CX Denúncia'           , ARRAY(1951, 1286, 1219, 1246, 1278, 1398, 1549, 1617, 1255, 1136, 1230, 1183, 1274, 1445, 1485, 1263, 1194, 1226, 1197, 1280, 1388, 1464, 1213, 1134, 1249, 1219, 1268, 1400, 1456, 1251)),
-    ('Fraudes DX'            , ARRAY(1711, 1047, 946, 1057, 1169, 1378, 1392, 1386, 993, 935, 965, 993, 1142, 1411, 1489, 966, 941, 940, 1051, 1079, 1464, 1378, 932, 834, 1002, 1111, 1248, 1235, 1408, 961))
+    {plano_ticket_values}
     AS t(celula_capa, tickets_dia)
 ),
 

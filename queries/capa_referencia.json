@@ -1,0 +1,136 @@
+{
+ "2026-10-01:2026-10-31": {
+  "CX Suporte": {
+   "tma_ticket": 510.9,
+   "sla": 0.7613,
+   "ticket_unico_real": 178514
+  },
+  "Madrugada": {
+   "tma_ticket": 551.4,
+   "sla": 0.9055,
+   "ticket_unico_real": 8905
+  },
+  "CX Review - AeC": {
+   "tma_ticket": 801.9,
+   "sla": 0.7908,
+   "ticket_unico_real": 50024
+  },
+  "CX Review - CSU": {
+   "tma_ticket": 583.0,
+   "sla": 0.8201,
+   "ticket_unico_real": 29162
+  },
+  "CX Super Cliente - AeC": {
+   "tma_ticket": 730.8,
+   "sla": 0.7756,
+   "ticket_unico_real": 27134
+  },
+  "CX Super Cliente - CSU": {
+   "tma_ticket": 627.7,
+   "sla": 0.8531,
+   "ticket_unico_real": 40502
+  },
+  "PF Cancelamento": {
+   "tma_ticket": 403.9,
+   "sla": 0.8194,
+   "ticket_unico_real": 54421
+  },
+  "PF Super Clientes": {
+   "tma_ticket": 262.3,
+   "sla": 0.953,
+   "ticket_unico_real": 19993
+  },
+  "PF Revisão Manual": {
+   "tma_ticket": 329.9,
+   "sla": 0.9702,
+   "ticket_unico_real": 11166
+  },
+  "CX Denúncia": {
+   "tma_ticket": 522.4,
+   "sla": 0.818,
+   "ticket_unico_real": 28864
+  },
+  "Fraudes DX": {
+   "tma_ticket": 387.1,
+   "sla": 0.7245,
+   "ticket_unico_real": 52569
+  },
+  "DX - PF Contestação": {
+   "tma_ticket": 373.8,
+   "sla": 0.3093,
+   "ticket_unico_real": 4641
+  },
+  "DX - PF Contestação Bloqueio temporário": {
+   "tma_ticket": 396.3,
+   "sla": 0.2749,
+   "ticket_unico_real": 17942
+  }
+ },
+ "2026-11-01:2026-11-05": {
+  "CX Suporte": {
+   "tma_ticket": 499.8,
+   "sla": 0.7939,
+   "ticket_unico_real": 32803
+  },
+  "Madrugada": {
+   "tma_ticket": 488.7,
+   "sla": 0.8947,
+   "ticket_unico_real": 1715
+  },
+  "CX Review - AeC": {
+   "tma_ticket": 720.1,
+   "sla": 0.6865,
+   "ticket_unico_real": 9902
+  },
+  "CX Review - CSU": {
+   "tma_ticket": 511.6,
+   "sla": 0.9444,
+   "ticket_unico_real": 5112
+  },
+  "CX Super Cliente - AeC": {
+   "tma_ticket": 705.2,
+   "sla": 0.744,
+   "ticket_unico_real": 4819
+  },
+  "CX Super Cliente - CSU": {
+   "tma_ticket": 628.7,
+   "sla": 0.8866,
+   "ticket_unico_real": 7133
+  },
+  "PF Cancelamento": {
+   "tma_ticket": 453.2,
+   "sla": 0.8871,
+   "ticket_unico_real": 9181
+  },
+  "PF Super Clientes": {
+   "tma_ticket": 239.6,
+   "sla": 0.9952,
+   "ticket_unico_real": 2738
+  },
+  "PF Revisão Manual": {
+   "tma_ticket": 314.0,
+   "sla": 0.9186,
+   "ticket_unico_real": 2125
+  },
+  "CX Denúncia": {
+   "tma_ticket": 513.4,
+   "sla": 0.8312,
+   "ticket_unico_real": 5230
+  },
+  "Fraudes DX": {
+   "tma_ticket": 458.6,
+   "sla": 0.8836,
+   "ticket_unico_real": 6357
+  },
+  "DX - PF Contestação": {
+   "tma_ticket": 421.5,
+   "sla": 0.3339,
+   "ticket_unico_real": 594
+  },
+  "DX - PF Contestação Bloqueio temporário": {
+   "tma_ticket": 423.3,
+   "sla": 0.3456,
+   "ticket_unico_real": 2454
+  }
+ }
+}
