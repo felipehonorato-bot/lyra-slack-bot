@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.35.0"
+APP_VERSION = "5.35.1"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -3239,6 +3239,14 @@ def _capa_rows(ini: date, fim: date, progress: Callable[[str], Any] | None = Non
     return out, problema
 
 
+APP_SQL_MAX_CONCURRENT = int(os.getenv("APP_SQL_MAX_CONCURRENT", "2"))
+APP_SQL_RETRIES = int(os.getenv("APP_SQL_RETRIES", "3"))
+APP_SQL_RETRY_WAIT_S = int(os.getenv("APP_SQL_RETRY_WAIT_S", "20"))
+_APP_SQL_SLOTS = threading.BoundedSemaphore(APP_SQL_MAX_CONCURRENT)
+_APP_SQL_BUSY_RE = re.compile(r"admission timeout|acquiring slot|too many (concurrent|queued)|queue (is )?full|"
+                              r"warehouse .*(busy|overloaded)|rate limit", re.I)
+
+
 def _run_app_sql(filled: str, progress: Callable[[str], Any] | None, nome: str,
                  acesso: bool = False) -> tuple[list[dict[str, str]] | None, str]:
     """Manda um SQL pronto do app para a Lyra Indicadores executar como veio; devolve as linhas (cabeçalho normalizado)."""
@@ -3250,18 +3258,29 @@ def _run_app_sql(filled: str, progress: Callable[[str], Any] | None, nome: str,
              "separado por ';', com a linha de cabeçalho exatamente como as colunas saírem, números com ponto decimal e "
              "sem separador de milhar. Se a execução falhar, devolva só: ERRO: <mensagem do Databricks>.\n\n```sql\n"
              + filled + "\n```")
-    try:
-        if TOQAN_INDICADORES_KEY:
-            conv, req = create_conversation(corpo, TOQAN_INDICADORES_KEY)
-            ans = get_answer(conv, req, progress_callback=progress, api_key=TOQAN_INDICADORES_KEY,
-                             max_attempts=INTERACTIVE_MAX_POLLS)
-        else:
-            ans = ask_toqan("Chame a *Lyra Indicadores* e passe a ela, sem mudar nada, a tarefa abaixo. Devolva SOMENTE "
-                            "o que ela responder.\n\n" + corpo, progress_callback=progress,
-                            max_attempts=INTERACTIVE_MAX_POLLS)
-    except Exception as exc:
-        return None, f"A consulta falhou ({str(exc)[:120]})."
+    ans = ""
+    for tentativa in range(APP_SQL_RETRIES + 1):
+        try:
+            with _APP_SQL_SLOTS:  # poucas consultas ao mesmo tempo: o warehouse recusa quando lota ("admission timeout")
+                if TOQAN_INDICADORES_KEY:
+                    conv, req = create_conversation(corpo, TOQAN_INDICADORES_KEY)
+                    ans = get_answer(conv, req, progress_callback=progress, api_key=TOQAN_INDICADORES_KEY,
+                                     max_attempts=INTERACTIVE_MAX_POLLS)
+                else:
+                    ans = ask_toqan("Chame a *Lyra Indicadores* e passe a ela, sem mudar nada, a tarefa abaixo. Devolva "
+                                    "SOMENTE o que ela responder.\n\n" + corpo, progress_callback=progress,
+                                    max_attempts=INTERACTIVE_MAX_POLLS)
+        except Exception as exc:
+            return None, f"A consulta falhou ({str(exc)[:120]})."
+        if not _APP_SQL_BUSY_RE.search(str(ans)) or tentativa == APP_SQL_RETRIES:
+            break
+        logger.info("%s: warehouse lotado, tentando de novo em %ss", nome, APP_SQL_RETRY_WAIT_S)
+        time.sleep(APP_SQL_RETRY_WAIT_S)
     parsed = None if _is_error_answer(ans) else _parse_data_csv(ans)
+    if not parsed and _APP_SQL_BUSY_RE.search(str(ans)):
+        logger.warning("%s: warehouse lotado mesmo depois de %s tentativas", nome, APP_SQL_RETRIES + 1)
+        return None, ("O Databricks está com fila cheia agora e a consulta não entrou. Tenta de novo em alguns minutos? "
+                      "Se repetir, eu aviso o time.")
     if not parsed:
         _alert(f"⚠️ {nome} sem resultado. Resposta: ```{str(ans)[:500]}```")
         return None, "A consulta não voltou agora. Já avisei o time; tenta de novo daqui a pouco?"
