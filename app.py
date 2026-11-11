@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.31.0"
+APP_VERSION = "5.31.1"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -7478,7 +7478,18 @@ def _diagnostics_text() -> str:
                 else ("⚠️ não consegui checar (falta o escopo channels:read/groups:read no app do Slack)"
                       if "missing_scope" in msg else f"⚠️ não consegui checar ({type(exc).__name__}: {msg[:80]})")
 
-    lines = [f"🩺 *Diagnóstico da Lyra* · app v{APP_VERSION} · no ar desde {_BOOT_AT[:16].replace('T', ' ')}", ""]
+    boot_br = datetime.fromisoformat(_BOOT_AT).astimezone(BRAZIL_TIMEZONE).strftime("%d/%m %H:%M")
+    lines = [f"🩺 *Diagnóstico da Lyra* · app v{APP_VERSION} · no ar desde {boot_br} (horário de Brasília)", ""]
+    q_dir = os.path.dirname(CAPA_SQL_PATH)
+    q_need = ["capa.sql", "capa_diaria.sql", "capa_planos.json", "motivos_eficiencia.sql", "csat_base.sql",
+              "csat_operadores.sql", "csat_motivos.sql", "csat_variacao.sql"]
+    q_miss = [f for f in q_need if not os.path.exists(os.path.join(q_dir, f))]
+    lines.append("🧮 *Consultas prontas* · " + ("✅ pasta queries completa" if not q_miss else
+                                               "❌ faltam em queries/: " + ", ".join(q_miss))
+                 + " · " + ("✅ chave da Lyra Indicadores (direto)" if TOQAN_INDICADORES_KEY else
+                            "⚠️ sem TOQAN_INDICADORES_KEY: o SQL vai pela Lyra principal (mais lento)")
+                 + f" · CSAT fixo: {CSAT_SQL_FIXO}")
+    lines.append("")
     lines.append("📍 *Controles das EPSs (STATUS_CHANNELS)*")
     if not STATUS_CHANNELS:
         lines.append("• ❌ STATUS_CHANNELS vazio no Railway: a Lyra não lê nenhum controle.")
