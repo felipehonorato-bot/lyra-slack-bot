@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.31.1"
+APP_VERSION = "5.31.2"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -633,7 +633,8 @@ def _alert(text: str) -> None:
     logger.warning("ALERTA: %s", text)
     for target in [t.strip() for t in ALERT_CHANNEL.split(",") if t.strip()]:
         try:
-            slack_app.client.chat_postMessage(channel=target, text=f"⚠️ Lyra — {text}")
+            slack_app.client.chat_postMessage(channel=target, text=f"Lyra — {text}" if text.lstrip().startswith("⚠️")
+                                              else f"⚠️ Lyra — {text}")
         except Exception:
             logger.exception("Could not post alert to %s", target)
 
@@ -3232,7 +3233,9 @@ def _capa_rows(ini: date, fim: date, progress: Callable[[str], Any] | None = Non
 
 def _run_app_sql(filled: str, progress: Callable[[str], Any] | None, nome: str) -> tuple[list[dict[str, str]] | None, str]:
     """Manda um SQL pronto do app para a Lyra Indicadores executar como veio; devolve as linhas (cabeçalho normalizado)."""
-    corpo = ("TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Execute no Databricks EXATAMENTE o SQL abaixo, como UMA "
+    # a Lyra Indicadores recusa pedido sem a linha EPS: (seção 1 dela). O recorte já está no SQL, então vai iFood.
+    corpo = ("EPS: iFood\nPedido: SQL pronto do app\n\n"
+             "TAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Execute no Databricks EXATAMENTE o SQL abaixo, como UMA "
              "instrução só, sem alterar nada (nem datas, nem fórmulas, nem colunas). Devolva SOMENTE o resultado em CSV "
              "separado por ';', com a linha de cabeçalho exatamente como as colunas saírem, números com ponto decimal e "
              "sem separador de milhar. Se a execução falhar, devolva só: ERRO: <mensagem do Databricks>.\n\n```sql\n"
@@ -4904,6 +4907,10 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
         if calc:
             textos.append(_render_pessoas_impacto(calc, fila or eps_nome, label, d1, eps, titulo_equipe, so_sup, so_ops))
     if not textos:
+        if rows and not any(r.get("email", "").upper() == "TOTAL" for r in rows):  # voltou algo, mas não o que o SQL devolve
+            _alert(f"⚠️ CSAT por operador ({ini} a {fim}): a resposta não trouxe as linhas TOTAL do SQL fixo. "
+                   f"Colunas: {sorted(rows[0].keys())[:8]} · 1ª linha: {_mask_pii(str(list(rows[0].values())[:5]))}")
+            return "A consulta voltou num formato que eu não consegui ler. Já avisei o time; tenta de novo daqui a pouco?"
         return f"Não achei avaliações de {fila or eps or 'AeC/CSU'} em {label}. Quer outro período?"
     event["_catalog"] = "csat|pessoas|impacto"
     _say_sections(say, "\n\n".join(textos), event)
@@ -8281,7 +8288,8 @@ def _scope_rows(rows: list[dict[str, Any]], eps: str | None) -> list[dict[str, A
 
 _TABLE_BLOCK_RE = re.compile(r"\b(motivo|motivos|operador\w*|analista\w*|atendente\w*|quem|nomes?|nominal|supervisor\w*|coordenador\w*|"
                              r"equipe|por que|porque|pq|semana|semanal|tma|sla|nps|reabertura|volume|grafico|excel|"
-                             r"planilha|quadrante|q4|reincid\w*|ofensor\w*|dispersao|compar\w*|evolucao|tendencia|"
+                             r"planilha|quadrante|q4|reincid\w*|ofensor\w*|dispersao|compar\w*|evolucao|tendencia|turno\w*|horari\w*|"
+                             r"por hora|faixa\w*|regia\w*|cidade\w*|produto\w*|"
                              r"\d{1,2}/\d{1,2}|bu|food|multi)\b")
 _TABLE_RESULT_RE = re.compile(r"\b(resultado|csat|como (esta|estao|ta|tao|foi|foram|anda|andam))\b")
 _TABLE_IMPACT_RE = re.compile(r"\b(mais impacta\w*|maior impacto|mais impacto|impacta mais|pior|piores|"
