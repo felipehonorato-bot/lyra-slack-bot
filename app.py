@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.39.3"
+APP_VERSION = "5.39.4"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -6307,7 +6307,16 @@ def _interprete_msg(question: str, eps: str | None, contexto: str, quem: str) ->
     hoje = _as_date(_today_brazil())
     dsem = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"][hoje.weekday()]
     filas = EPS_CELULAS.get(eps or "", []) if eps else [f for cel in EPS_CELULAS.values() for f in cel]
-    return (f"HOJE: {hoje.isoformat()} ({dsem})\n"
+    d1 = hoje - timedelta(days=1)
+    seg = hoje - timedelta(days=hoje.weekday())
+    seg_ant = seg - timedelta(days=7)
+    mes_ant_fim = hoje.replace(day=1) - timedelta(days=1)
+    cal = (f"CALENDÁRIO (use estas datas, não calcule): ontem = {d1.isoformat()} · esta semana = {seg.isoformat()} a "
+           f"{max(seg, d1).isoformat() if seg <= d1 else seg.isoformat()} (segunda até ontem) · semana passada = "
+           f"{seg_ant.isoformat()} a {(seg - timedelta(days=1)).isoformat()} (segunda a domingo) · últimos 7 dias = "
+           f"{(hoje - timedelta(days=7)).isoformat()} a {d1.isoformat()} · mês atual = {hoje.replace(day=1).isoformat()} a "
+           f"{d1.isoformat()} · mês passado = {mes_ant_fim.replace(day=1).isoformat()} a {mes_ant_fim.isoformat()}\n")
+    return (f"HOJE: {hoje.isoformat()} ({dsem})\n" + cal +
             f"EPS DO CANAL: {eps or 'iFood (todas)'}\n"
             f"FILAS DA EPS: {', '.join(filas)}\n"
             f"LÍDERES DO MOP: {', '.join(_lideres_mop(eps)) or '(MOP indisponível)'}\n"
@@ -9315,6 +9324,14 @@ def _is_followup_text(text: str) -> bool:
     return len(t.split()) <= 3 or bool(_FOLLOWUP_RE.match(t))
 
 
+def _conversa_ctx(event: dict[str, Any]) -> str:
+    """Conversa anterior em qualquer lugar: thread de canal ou DM (thread da DM ou últimas mensagens)."""
+    try:
+        return _thread_context(event) or _dm_context(event)
+    except Exception:
+        return ""
+
+
 def _dm_context(event: dict[str, Any]) -> str:
     """DM: manda junto as últimas mensagens da conversa (ou da thread da DM), para 'ontem' ou 'da AeC' completar o
     pedido anterior em vez de virar pergunta nova."""
@@ -10616,7 +10633,7 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
     if INTERPRETE_MODE == "shadow" and TOQAN_INTERPRETE_KEY and q_shadow.strip() and not _INTERPRETE_CMD_RE.match(q_cmd) \
             and not _INTERPRETACOES_CMD_RE.match(q_cmd) and not _DIAG_RE.search(_norm_text(q_cmd)):
         try:  # a conversa é lida agora, antes da resposta do app entrar na thread
-            ctx_s = _thread_context(event) if event.get("thread_ts") else ""
+            ctx_s = _conversa_ctx(event)
             _, eps_s = _event_scope(event)
             threading.Thread(target=_interprete_shadow, args=(event, q_shadow, eps_s, ctx_s, _speaker_line(event)),
                              daemon=True).start()
@@ -10724,7 +10741,7 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
         m_int = _INTERPRETE_CMD_RE.match(re.sub(r"^\s*@?lyra\b[\s,:]*", "", question, flags=re.I))
         if m_int:  # "@Lyra interpreta: <pergunta>": mostra como a IA leu, sem responder a pergunta
             event["_route"] = "interprete_teste"
-            ctx_i = _thread_context(event) if event.get("thread_ts") else ""
+            ctx_i = _conversa_ctx(event)
             it, raw = _interpretar(m_int.group(1), eps, ctx_i, _speaker_line(event))
             _say(say, ("🧠 *Como eu li:* _" + m_int.group(1).strip()[:200] + "_\n" + _interpretacao_txt(it)) if it else
                  f"🧠 Não consegui interpretar agora ({str(raw)[:200]}).", event, True)
@@ -10817,9 +10834,10 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
         efic_extra = ""
         # continuação na thread sem dizer o indicador ("quero a abertura diária só da Super Cliente"): herda o da conversa
         tq0 = _norm_text(question)
-        if (event.get("thread_ts") and not re.search(r"\b(csat|tma|sla|nota\w*|primeira resposta|avaliac\w*)\b", tq0)
+        if ((event.get("thread_ts") or event.get("channel_type") == "im")
+                and not re.search(r"\b(csat|tma|sla|nota\w*|primeira resposta|avaliac\w*)\b", tq0)
                 and _FOLLOWUP_DADOS_RE.search(tq0)):
-            ctx0 = _thread_context(event)[-4000:]
+            ctx0 = _conversa_ctx(event)[-4000:]
             casos_m = re.findall(r"📋 \*(CSAT|SLA 1ª resposta|TMA)\*", ctx0)
             herdado = (f"casos de {casos_m[-1].split()[0]}" if casos_m and re.search(r"\b(base|casos?|lista|planilha|excel|"
                                                                                        r"d ?-? ?1|ontem|semana)\b", tq0) else
@@ -10913,7 +10931,7 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
         tq = _norm_text(question)
         if (not efic_extra and event.get("thread_ts") and _PESSOAS_RE.search(tq) and _ABERTURA_RE.search(tq)
                 and not re.search(r"\b(csat|tma|sla|nota\w*)\b", tq)):
-            ctx_t = _thread_context(event)
+            ctx_t = _conversa_ctx(event)
             if "Quem mais pesa no SLA" in ctx_t:
                 question = f"{question} (SLA)"
             elif "Quem mais pesa no TMA" in ctx_t or "TMA" in ctx_t[-3000:]:  # "manda no excel" depois de uma resposta de TMA
