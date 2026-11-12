@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.35.2"
+APP_VERSION = "5.39.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -2875,7 +2875,8 @@ SLA_LIMITE_PADRAO_S = 300
 
 def _is_case_list_request(question: str) -> bool:
     t = _norm_text(question)
-    if not (_CASE_FIELDS_RE.search(t) and _CASE_IND_RE.search(t)):
+    sem_ind = not _CASE_IND_RE.search(t) and bool(re.search(r"\b(casos?|tickets?|caso a caso)\b", t))
+    if not (_CASE_FIELDS_RE.search(t) and (_CASE_IND_RE.search(t) or sem_ind)):
         return False
     # "casos" sozinho só vale com pedido de lista/base/número (evita "quantos casos..." e perguntas de causa)
     return bool(re.search(r"\b(numero|numeros|lista|base|abertura|planilha|excel|traz|traga|manda|mande|envia|envie|"
@@ -3236,6 +3237,15 @@ def _capa_period(question: str, event: dict[str, Any]) -> tuple[date, date, str]
             return ini, fim, f"{ini.strftime('%d/%m')} a {fim.strftime('%d/%m')}"
         except ValueError:
             pass
+    m_um = re.search(r"\b(\d{1,2})/(\d{1,2})\b", t)
+    if m_um:  # "resultado do dia 09/11": só esse dia
+        try:
+            dd, mm = int(m_um.group(1)), int(m_um.group(2))
+            dia = date(d1.year if mm <= d1.month else d1.year - 1, mm, dd)
+            if dia <= d1 and (d1 - dia).days <= 92:  # só data recente ("24/7" não é data)
+                return dia, dia, f"dia {dia.strftime('%d/%m')}"
+        except ValueError:
+            pass
     mes_q = next((n for nome, n in _MES_NOMES.items() if re.search(rf"\b{nome}\b", t)), None)
     if mes_q is None and re.search(r"\b(mes passado|mes anterior|ultimo mes|mes fechado)\b", t):
         mes_q = (d1.replace(day=1) - timedelta(days=1)).month
@@ -3480,6 +3490,71 @@ def _capa_resumo(rows: list[dict[str, str]], eps: str | None, label: str) -> str
     nome = f" da {eps}" if eps else ""
     return "\n\n".join(out) + (f"\n_Pra ver fila a fila: \"TMA e SLA{nome}\"; dia a dia: \"TMA e SLA dia a dia{nome}\"._"
                                  if out else "")
+
+
+_IND_PEDIDO_RES = (("csat", r"\b(csat|nota\w*|avaliac\w*|satisfac\w*|promotor\w*|detrator\w*)\b"),
+                   ("tma", r"\btma\b|tempo medio|tempo de atendimento|tempo de atribuicao"),
+                   ("sla", r"\bsla\b|primeira resposta|1a resposta|estour\w*|fora do prazo"))
+
+
+def _inds_citados(question: str) -> set[str]:
+    """Indicadores que a pergunta cita. Vazio = não especificou: a resposta é de todos (CSAT, TMA e SLA), na regra da EPS."""
+    t = _norm_text(question)
+    return {k for k, rx in _IND_PEDIDO_RES if re.search(rx, t)}
+
+
+_RESULTADO_GERAL_RE = re.compile(r"\b(resultado\w*|como (foi|ficou|ficaram|ta|esta|estao|foram|anda|andam)|desempenho|"
+                                 r"fechou|fechamento|panorama|retrato|resumo)\b")
+
+
+def _is_resultado_geral(question: str) -> bool:
+    """Pergunta de resultado sem indicador ("como ficou a AeC dia 09/11?"): o retrato inclui CSAT, TMA e SLA."""
+    t = _norm_text(question)
+    return bool(_RESULTADO_GERAL_RE.search(t)) and not re.search(
+        r"\b(csat|nota\w*|avaliac\w*|tma|sla|tempo|primeira resposta|ranking|impact\w*|operador\w*|analista\w*|"
+        r"supervisor\w*|equipe|casos?|motivos?|treinamento|processo|como funciona)\b", t)
+
+
+def _post_efic_summary(say: Callable[..., Any], event: dict[str, Any], eps: str | None, question: str) -> None:
+    """Depois do CSAT de uma pergunta de resultado geral, o resumo de TMA e SLA do mesmo período."""
+    try:
+        ini_c, fim_c, label_c = _capa_period(question, event)
+        rows_c, _ = _capa_rows(ini_c, fim_c, None)
+        resumo = _capa_resumo(rows_c, eps or _eps_in_text(question), label_c) if rows_c else ""
+        _say(say, resumo or "TMA e SLA não voltaram agora; se quiser, me pede \"TMA e SLA\" daqui a pouco.", event, True)
+    except Exception:
+        logger.warning("CAPA summary after result failed", exc_info=True)
+
+
+def _post_efic_motivos(say: Callable[..., Any], event: dict[str, Any], eps: str | None, question: str) -> None:
+    """Pergunta de motivos ou treinamento sem indicador: depois do CSAT, os motivos que mais pesam no TMA e no SLA."""
+    try:
+        ini, fim, label = _capa_period(question, event)
+        fila = _fila_in_question(question, eps) or _fila_ref(question, eps, event)
+        rows, _ = _motivos_efic_rows(eps or _eps_in_text(question), ini, fim)
+        if not rows:
+            return
+        partes = [x for x in (_render_motivos_efic(rows, ind, label, fila) for ind in ("tma", "sla")) if x]
+        if partes:
+            _say(say, "\n\n".join(partes), event, True)
+    except Exception:
+        logger.warning("Motivos de TMA/SLA depois do CSAT falharam", exc_info=True)
+
+
+def _drop_false_correction(answer: str, event: dict[str, Any]) -> str:
+    """Tira "Corrigindo o que eu disse antes: ..., não X" quando a Lyra nunca disse X na thread (correção inventada)."""
+    m = re.search(r"(?i)[^\n.]*corrigindo (o que eu disse|a informa\w+|o que falei)[^\n]*?n[aã]o (\d+(?:[.,]\d+)?\s*%?)[^\n]*",
+                  answer or "")
+    if not m or not event.get("thread_ts"):
+        return answer
+    try:
+        ctx = _thread_context(event)
+    except Exception:
+        return answer
+    valor = m.group(2).strip().replace(" ", "")
+    if valor and valor not in ctx.replace(" ", ""):
+        return (answer[:m.start()] + answer[m.end():]).strip()
+    return answer
 
 
 def _capa_xlsx(rows: list[dict[str, str]], eps: str | None) -> bytes:
@@ -4958,7 +5033,8 @@ _PESSOAS_IMPACTO_RE = re.compile(r"\b(impact\w*|pesa\w*|puxa\w*|ofensor\w*|derru
 def _is_pessoas_impacto_request(question: str) -> bool:
     """"Quais operadores/supervisores mais impactam o CSAT (no consolidado)?" — TMA/SLA por analista seguem a rota deles."""
     t = _norm_text(question)
-    if not (_PESSOAS_RE.search(t) and _PESSOAS_IMPACTO_RE.search(t)):
+    abertura = bool(re.search(r"\b(abertura|tod[oa]s (os|as) (supervisor\w*|operador\w*|analista\w*|equipes))\b", t))
+    if not (_PESSOAS_RE.search(t) and (_PESSOAS_IMPACTO_RE.search(t) or abertura)):
         return False
     if re.search(r"\b(tma|sla|primeira resposta|tempo)\b", t) and not re.search(r"\bcsat\b", t):
         return False
@@ -5477,7 +5553,7 @@ def _send_tma_pessoas(event: dict[str, Any], client: Any, eps: str | None, quest
         return f"Não achei atendimento de {fila or eps or 'AeC/CSU'} em {label}. Quer outro período?"
     event["_catalog"] = f"{ind}|pessoas|impacto"
     n_an = sum(1 for r in rows if r.get("tipo", "").upper() == "OP")
-    if re.search(r"\b(excel|planilha|xlsx|arquivo)\b", t) or (completo and n_an > 15):
+    if not event.get("_no_file") and (re.search(r"\b(excel|planilha|xlsx|arquivo)\b", t) or (completo and n_an > 15)):
         try:
             (client or slack_app.client).files_upload_v2(
                 channel=event.get("channel"), thread_ts=_reply_ts(event),
@@ -5864,12 +5940,14 @@ def _efic_variacao_xlsx(calc: dict[str, Any], ind: str, alvo: str, l_cur: str, l
 
 
 def _send_efic_variacao(event: dict[str, Any], client: Any, eps: str | None, question: str,
-                        progress: Callable[[str], Any] | None = None) -> str | None:
+                        progress: Callable[[str], Any] | None = None,
+                        periodos: tuple[tuple[date, date], tuple[date, date], str, str] | None = None,
+                        fila_fixa: str | None = None) -> str | None:
     ind = _efic_indicator(question) or "tma"
     if eps is None:
         eps = _eps_in_text(question)
-    fila = _fila_in_question(question, eps) or _fila_ref(question, eps, event)
-    cur, ref, l_cur, l_ref = _variation_periods(question)
+    fila = fila_fixa or _fila_in_question(question, eps) or _fila_ref(question, eps, event)
+    cur, ref, l_cur, l_ref = periodos or _variation_periods(question)
     tpl = _query_text("eficiencia_variacao.sql")
     if not tpl:
         return "A variação de TMA e SLA não está configurada (falta queries/eficiencia_variacao.sql)."
@@ -5918,7 +5996,7 @@ def _send_efic_variacao(event: dict[str, Any], client: Any, eps: str | None, que
 
 
 _WANTS_FILE_RE = re.compile(r"\b(excel|planilha|xlsx|arquivo|base completa)\b")
-_FOLLOWUP_DADOS_RE = re.compile(r"\b(abertura|diari\w*|dia a dia|por dia|por fila|por supervisor\w*|por operador\w*|"
+_FOLLOWUP_DADOS_RE = re.compile(r"\b(abertura|base|d ?-? ?1|casos?|lista|diari\w*|dia a dia|por dia|por fila|por supervisor\w*|por operador\w*|"
                                 r"por analista\w*|apenas|so (da|de|do)|somente|excel|planilha|semana|ontem|mes|outubro|"
                                 r"novembro|dezembro|super cliente|review|suporte|madrugada|cancelamento|denuncia)\b")
 
@@ -5957,6 +6035,405 @@ def _upload_xlsx(event: dict[str, Any], client: Any, content: bytes, filename: s
     except Exception:
         logger.warning("Upload do Excel falhou (%s); mando só o texto", filename, exc_info=True)
         return False
+
+
+# --- cobrança semanal do MOP: quem atende e não está no MOP + inconsistências do próprio MOP -------------------------
+MOP_CHECK_TIME = datetime_time(9, 40)
+MOP_CHECK_MIN_TRATADOS = int(os.getenv("MOP_CHECK_MIN_TRATADOS", "10"))
+
+
+def _mop_inconsistencias(people: dict[str, dict[str, str]], eps: str) -> list[str]:
+    """Problemas no próprio MOP: líder escrito de dois jeitos, operador sem supervisor, e-mail de outra EPS."""
+    out = []
+    for campo, nome_campo in (("supervisor", "Supervisor"), ("coordenador", "Coordenador")):
+        grupos: dict[str, set[str]] = {}
+        for p in people.values():
+            v = str(p.get(campo) or "").strip()
+            if v:
+                base = _norm_text(re.sub(r"\(.*?\)", "", v)).strip()
+                grupos.setdefault(base, set()).add(v)
+        for variantes in grupos.values():
+            if len(variantes) > 1:
+                n = sum(1 for p in people.values() if str(p.get(campo) or "").strip() in variantes)
+                out.append(f"{nome_campo} escrito de {len(variantes)} jeitos ({' / '.join(sorted(variantes))}): a equipe "
+                           f"({n} pessoas) fica dividida em duas no ranking. Padronize num nome só.")
+    lideres = {_norm_text(re.sub(r"\(.*?\)", "", str(p.get(c) or ""))).strip()
+               for p in people.values() for c in ("supervisor", "coordenador")} - {""}
+    sem_sup = [e for e, p in people.items() if not str(p.get("supervisor") or "").strip()
+               and _norm_text(p.get("nome", "")).strip() not in lideres]  # líder não tem supervisor acima: tudo bem
+    if sem_sup:
+        out.append(f"{len(sem_sup)} operador(es) sem supervisor preenchido: "
+                   + ", ".join(e.split("@")[0] for e in sem_sup[:10]) + (" …" if len(sem_sup) > 10 else ""))
+    outra = [e for e in people if _compact(eps) not in e.split("@")[-1].lower()]
+    if outra:
+        out.append(f"{len(outra)} e-mail(s) que não são do domínio da {eps}: "
+                   + ", ".join(outra[:8]) + (" …" if len(outra) > 8 else ""))
+    return out
+
+
+def _mop_check_text(eps: str, today: date) -> str | None:
+    people = _mop_people(eps)
+    if not people:
+        return None
+    ini, fim = today - timedelta(days=7), today - timedelta(days=1)
+    users = "|".join(sorted({_EMAIL_SAFE_RE.sub("", e.split("@")[0].lower()) for e in people} - {""}))
+    tpl = _query_text("mop_faltantes.sql")
+    faltantes: list[dict[str, str]] = []
+    if tpl and users:
+        sql = tpl
+        for k, v in {"data_inicio": ini.isoformat(), "data_fim": fim.isoformat(), "eps_like": _compact(eps),
+                     "mop_values": f"('{users}')", "min_tratados": str(MOP_CHECK_MIN_TRATADOS)}.items():
+            sql = sql.replace("{" + k + "}", v)
+        rows, _ = _run_app_sql(_compact_sql(sql), None, f"MOP da {eps} (quem atende e não está no MOP)", acesso=True)
+        faltantes = [r for r in rows or [] if _compact(r.get("eps", "")) == _compact(eps)]
+    incons = _mop_inconsistencias(people, eps)
+    if not faltantes and not incons:
+        return None
+    chave = f"mop_check:last:{eps}"
+    antes = set(json.loads(STATE.get(chave) or "[]"))
+    STATE.set(chave, json.dumps([r.get("email", "") for r in faltantes]))
+    linhas = [f"📋 *Ajustes no MOP da {eps}* — semana {ini.strftime('%d/%m')} a {fim.strftime('%d/%m')}",
+              "O MOP é a base da visão de equipe, do ranking de supervisor e da Madrugada. O que está fora dele some "
+              "dessas análises. Pode ajustar até quarta? 🙏"]
+    if faltantes:
+        de_novo = sum(1 for r in faltantes if r.get("email") in antes)
+        linhas += ["", f"👤 *Atenderam e não estão no MOP* ({len(faltantes)}"
+                   + (f", {de_novo} já estavam na lista da semana passada" if de_novo else "") + "):"]
+        for r in faltantes[:20]:
+            linhas.append(f"• {r.get('email', '')} · {_fmt_int(_sql_num(r.get('tratados')) or 0)} atendimentos · último em "
+                          f"{str(r.get('ultimo dia', ''))[8:10]}/{str(r.get('ultimo dia', ''))[5:7]}"
+                          + (" · *de novo*" if r.get("email") in antes else ""))
+        if len(faltantes) > 20:
+            linhas.append(f"… e mais {len(faltantes) - 20}. Se quiser a lista completa, me pede em planilha.")
+        linhas.append("_Se a pessoa está no MOP com outro e-mail, corrija o e-mail; se saiu, pode ignorar._")
+    if incons:
+        linhas += ["", "🧹 *Inconsistências no MOP:*"] + [f"• {t}" for t in incons]
+    return "\n".join(linhas)
+
+
+def _mop_check_tick(now: datetime) -> None:
+    """Segunda de manhã: cobrança do MOP em cada EPS (no teste, vai para o canal de teste da EPS)."""
+    if now.weekday() != 0 or now.time() < MOP_CHECK_TIME:
+        return
+    for tenant in TENANTS:
+        if not tenant.eps:
+            continue
+        key = f"mop_check:{tenant.eps}:{now.date().isoformat()}"
+        if STATE.get(key):
+            continue
+        STATE.set(key, "1")
+
+        def run(t: Tenant = tenant) -> None:
+            try:
+                text = _mop_check_text(t.eps, now.date())
+                if text:
+                    _post_sections(t.channel, text)
+            except Exception as exc:
+                logger.exception("Cobrança do MOP falhou")
+                _alert(f"[{t.key}] Cobrança semanal do MOP falhou: {type(exc).__name__}")
+        threading.Thread(target=run, daemon=True).start()
+
+
+# --- "O que teve de anormal?": as consultas prontas levantam os fatos, a IA faz a análise ------------------------------
+_ANOMALIA_RE = re.compile(r"\b(anormal\w*|anomali\w*|fora da curva|fora do normal|fora do padrao|estranh\w*|destoou|"
+                          r"destoa\w*|chamou (a )?atencao|algo diferente|o que (aconteceu|houve|pegou|rolou)|pico\w*|"
+                          r"atipic\w*|outlier\w*)\b")
+ANOMALIA_BASE_DIAS = 14
+
+
+def _is_anomalia_request(question: str) -> bool:
+    return bool(_ANOMALIA_RE.search(_norm_text(question)))
+
+
+def _anomalia_dia(question: str, event: dict[str, Any]) -> date:
+    ini, fim, _ = _capa_period(question, event)
+    return fim if ini == fim else _as_date(_today_brazil()) - timedelta(days=1)
+
+
+def _anomalia_pack(eps: str | None, fila: str | None, dia: date, inds: set[str],
+                   progress: Callable[[str], Any] | None = None) -> str:
+    """Fatos para a análise: o dia contra a média e a variação dos dias anteriores, o que mudou por motivo (mix x
+    performance) e quem destoou. Tudo pelas consultas prontas; a interpretação fica com a IA."""
+    base_ini = dia - timedelta(days=ANOMALIA_BASE_DIAS)
+    alvo = fila or eps or "AeC/CSU"
+    res: dict[str, Any] = {}
+
+    def run(nome: str, fn: Callable[[], Any]) -> None:
+        try:
+            res[nome] = fn()
+        except Exception:
+            logger.warning("Anomalia: %s falhou", nome, exc_info=True)
+            res[nome] = None
+
+    eps_lista, _ = _csat_eps_params(eps)
+    filtro_csat = f"fila_relatorio = '{fila}'" if fila else "1 = 1"
+    tarefas = []
+    if "csat" in inds:
+        tarefas += [
+            ("csat_dia", lambda: _csat_fixed_rows("csat_diario.sql", base_ini, dia, {"eps_lista": eps_lista,
+                                                  "filtro_fila": filtro_csat}, None, f"Anomalia CSAT por dia ({alvo})")[0]),
+            ("csat_var", lambda: _csat_variacao_fixa(eps, fila, (dia, dia), (base_ini, dia - timedelta(days=1)), None)
+             if fila else None),
+            ("csat_pes", lambda: _csat_fixed_rows("csat_pessoas.sql", dia, dia, _pessoas_sql_params(
+                eps, fila, _mop_people(eps), dia, None, True), None, f"Anomalia CSAT por operador ({alvo})")[0]),
+        ]
+    if inds & {"tma", "sla"} and _capa_template()[0]:
+        ini_c = max(base_ini, dia.replace(day=1))  # a consulta diária é de um mês por vez
+        tarefas += [("efic_dia", lambda: _capa_rows(ini_c, dia, None, diaria=True, celula=fila)[0])]
+        per = ((dia, dia), (base_ini, dia - timedelta(days=1)), f"dia {dia.strftime('%d/%m')}",
+               f"{base_ini.strftime('%d/%m')} a {(dia - timedelta(days=1)).strftime('%d/%m')}")
+        tarefas += [(f"efic_var_{i}", (lambda i=i: _send_efic_variacao(
+            {"channel": "", "ts": ""}, None, eps, f"por que o {i} mudou", None, per, fila)))
+            for i in ("TMA", "SLA") if i.lower() in inds and fila]
+    ths = [threading.Thread(target=run, args=t, daemon=True) for t in tarefas]
+    for th in ths:
+        th.start()
+    for th in ths:
+        th.join(timeout=600)
+
+    partes = [f"Dia analisado: {dia.strftime('%d/%m')} ({['seg', 'ter', 'qua', 'qui', 'sex', 'sáb', 'dom'][dia.weekday()]}) · "
+              f"base de comparação: {base_ini.strftime('%d/%m')} a {(dia - timedelta(days=1)).strftime('%d/%m')} · "
+              f"recorte: {alvo}"]
+    # CSAT por dia: o dia contra média e desvio dos anteriores
+    rows = res.get("csat_dia") or []
+    if rows:
+        por_dia: dict[str, list[float]] = {}
+        for r in rows:
+            if fila and _norm_text(r.get("fila", "")) != _norm_text(fila):
+                continue
+            acc = por_dia.setdefault(str(r.get("data", ""))[:10], [0.0, 0.0])
+            acc[0] += _sql_num(r.get("avaliacoes")) or 0
+            acc[1] += _sql_num(r.get("promotoras")) or 0
+        serie = [(d, v[1] / v[0] * 100, v[0]) for d, v in sorted(por_dia.items()) if v[0]]
+        hoje = next((x for x in serie if x[0] == dia.isoformat()), None)
+        antes = [x for x in serie if x[0] < dia.isoformat()]
+        if hoje and len(antes) >= 3:
+            media = sum(x[1] for x in antes) / len(antes)
+            dp = (sum((x[1] - media) ** 2 for x in antes) / (len(antes) - 1)) ** 0.5 if len(antes) > 1 else 0
+            vol_m = sum(x[2] for x in antes) / len(antes)
+            partes.append(f"CSAT: dia {_bfmt(hoje[1])}% (n={_fmt_int(hoje[2])}) · média dos dias anteriores {_bfmt(media)}% "
+                          f"(desvio {_bfmt(dp)} p.p.; dia a {_bfmt((hoje[1] - media) / dp, 1) if dp else '—'} desvios) · "
+                          f"faixa normal {_bfmt(min(x[1] for x in antes))}% a {_bfmt(max(x[1] for x in antes))}% · "
+                          f"volume do dia {_bfmt((hoje[2] / vol_m - 1) * 100 if vol_m else 0, 0)}% vs média")
+            partes.append("CSAT dia a dia: " + "; ".join(f"{d[8:10]}/{d[5:7]} {_bfmt(c)}% (n={_fmt_int(n)})"
+                                                         for d, c, n in serie[-15:]))
+    v = res.get("csat_var")
+    if v:
+        partes.append(f"CSAT do dia x base, por motivo: efeito mix {_bfmt(v['mix_pp'], 2)} p.p. · efeito performance "
+                      f"{_bfmt(v['performance_pp'], 2)} p.p. · maiores efeitos: "
+                      + "; ".join(f"{_motivo_label(i['motivo'])} (mix {_bfmt(i['efeito_pp'], 2)} p.p., participação "
+                                  f"{_bfmt(i['share_ref'])}% → {_bfmt(i['share_atual'])}%)" for i in v.get("top_mix", []))
+                      + " | " + "; ".join(f"{_motivo_label(i['motivo'])} (performance {_bfmt(i['efeito_pp'], 2)} p.p., "
+                                          f"CSAT {_bfmt(i['csat_ref'])}% → {_bfmt(i['csat_atual'])}%)"
+                                          for i in v.get("top_performance", [])))
+    pes = res.get("csat_pes") or []
+    if pes:
+        for eps_nome in ([eps] if eps else ["AeC", "CSU"]):
+            calc = _pessoas_from_rows(pes, eps_nome, _mop_people(eps))
+            if calc:
+                ops = sorted([o for o in calc["ops"] if o["imp"] is not None and o["aval"] >= 3], key=lambda o: o["imp"])[:5]
+                if ops:
+                    partes.append(f"Operadores que mais puxaram o CSAT do dia ({eps_nome}): " + "; ".join(
+                        f"{o['email'].split('@')[0]} · {o['fila']} · CSAT {_bfmt(o['csat'])}% (meta {_bfmt(o['meta'])}%) · "
+                        f"n={_fmt_int(o['aval'])} · {_bfmt(o['imp'], 2)} p.p." for o in ops))
+    erows = res.get("efic_dia") or []
+    if erows:
+        por: dict[str, list[float]] = {}
+        for r in erows:
+            if eps and _norm_text(r.get("eps", "")) != _compact(eps):
+                continue
+            acc = por.setdefault(str(r.get("data", ""))[:10], [0.0, 0.0, 0.0, 0.0])
+            acc[0] += _cv(r, "soma tempo atribuicao") or 0
+            acc[1] += _cv(r, "ticket unico real") or 0
+            acc[2] += _cv(r, "sla base") or 0
+            acc[3] += _cv(r, "sla dentro") or 0
+        serie = [(d, a[0] / a[1] if a[1] else None, a[3] / a[2] * 100 if a[2] else None, a[1]) for d, a in sorted(por.items())]
+        hoje = next((x for x in serie if x[0] == dia.isoformat()), None)
+        antes = [x for x in serie if x[0] < dia.isoformat() and x[1] is not None]
+        if hoje and antes:
+            t_m = sum(x[1] for x in antes) / len(antes)
+            s_m = sum(x[2] for x in antes if x[2] is not None) / max(1, sum(1 for x in antes if x[2] is not None))
+            v_m = sum(x[3] for x in antes) / len(antes)
+            partes.append(f"TMA (ticket): dia {_fmt_int(hoje[1] or 0)} s · média dos dias anteriores {_fmt_int(t_m)} s · "
+                          f"SLA de 1ª resposta: dia {_bfmt(hoje[2] or 0)}% · média {_bfmt(s_m)}% · tickets do dia "
+                          f"{_fmt_int(hoje[3])} ({_bfmt((hoje[3] / v_m - 1) * 100 if v_m else 0, 0)}% vs média)")
+            partes.append("TMA/SLA dia a dia: " + "; ".join(
+                f"{d[8:10]}/{d[5:7]} {_fmt_int(t or 0)} s · SLA {_bfmt(sl or 0)}% · {_fmt_int(n)} tickets"
+                for d, t, sl, n in serie[-15:]))
+    for i in ("TMA", "SLA"):
+        txt = res.get(f"efic_var_{i}")
+        if txt and txt.startswith(("⏱️", "⏰")):
+            partes.append(f"{i} do dia x base, por motivo (mix x performance):\n" + re.sub(r"[*_`]", "", txt))
+    return "\n".join(partes) if len(partes) > 1 else ""
+
+
+ANOMALIA_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA — ANÁLISE DE ANORMALIDADE: os DADOS abaixo já foram levantados pelo app com as "
+    "consultas oficiais (CSAT, TMA e SLA na regra da EPS). NÃO chame subagentes e NÃO consulte de novo: analise como "
+    "uma analista de operação. (1) Diga o que fugiu do normal no dia, comparando com a média e a faixa normal dos dias "
+    "anteriores (algo a menos de 1 desvio da média NÃO é anormal; diga isso com naturalidade). (2) Explique o porquê com "
+    "os dados: volume, mix de motivos x performance, pessoas fora da curva. (3) Separe o que parece pontual do que é "
+    "tendência. (4) Feche com o que vale cobrar ou investigar, em 1 ou 2 frases. Primeira linha = resposta direta. Curto, "
+    "em texto corrido, no tom da Lyra. Se faltar um indicador nos dados, diga que não conseguiu olhar aquele, sem "
+    "inventar.\n\n")
+
+
+# ---------------------------------------------------------------------------
+# Intérprete (passo 1 da virada "IA no comando"): a IA lê a mensagem e a conversa e devolve o que a pessoa quer, num
+# JSON estruturado. Por enquanto roda em paralelo (shadow): não muda a resposta, só registra o que teria escolhido,
+# para comparar com a rota atual. "@Lyra interpreta: <pergunta>" mostra a leitura na hora.
+# ---------------------------------------------------------------------------
+TOQAN_INTERPRETE_KEY = os.getenv("TOQAN_INTERPRETE_KEY", "").strip() or None
+INTERPRETE_MODE = os.getenv("INTERPRETE_MODE", "shadow").strip().lower()  # off | shadow | on (on = passo 2)
+INTERPRETE_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "lyra_interprete_v1.md")
+INTERPRETE_LOG_KEY = "interprete:log"
+INTERPRETE_LOG_MAX = 300
+_INTERPRETE_CMD_RE = re.compile(r"^\s*interpreta\w*\s*[:\-]\s*(.+)$", re.I | re.S)
+_INTERPRETACOES_CMD_RE = re.compile(r"^\s*interpreta(c|ç)(o|õ)es\b", re.I)
+_VISOES = {"resultado", "dia_a_dia", "motivos", "pessoas", "equipe", "casos", "variacao", "anomalia", "treinamento", "outro"}
+_INTENCOES = {"dados", "analise", "processo", "acao", "conversa"}
+
+
+def _lideres_mop(eps: str | None) -> list[str]:
+    try:
+        people = _mop_people(eps)
+    except Exception:
+        return []
+    nomes = {str(p.get(c) or "").strip() for p in people.values() for c in ("supervisor", "coordenador")} - {""}
+    return sorted(nomes)[:80]
+
+
+def _interprete_msg(question: str, eps: str | None, contexto: str, quem: str) -> str:
+    hoje = _as_date(_today_brazil())
+    dsem = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"][hoje.weekday()]
+    filas = EPS_CELULAS.get(eps or "", []) if eps else [f for cel in EPS_CELULAS.values() for f in cel]
+    return (f"HOJE: {hoje.isoformat()} ({dsem})\n"
+            f"EPS DO CANAL: {eps or 'iFood (todas)'}\n"
+            f"FILAS DA EPS: {', '.join(filas)}\n"
+            f"LÍDERES DO MOP: {', '.join(_lideres_mop(eps)) or '(MOP indisponível)'}\n"
+            f"QUEM FALA: {quem or '(não identificado)'}\n"
+            f"CONVERSA ATÉ AGORA: {contexto.strip()[-2500:] if contexto else '(mensagem nova, sem conversa antes)'}\n"
+            f"MENSAGEM: {question.strip()}")
+
+
+def _parse_interpretacao(texto: str) -> dict[str, Any] | None:
+    m = re.search(r"\{.*\}", texto or "", re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except ValueError:
+        try:
+            data = json.loads(re.sub(r",\s*([}\]])", r"\1", m.group(0)))
+        except ValueError:
+            return None
+    if not isinstance(data, dict) or data.get("intencao") not in _INTENCOES:
+        return None
+    if data.get("visao") not in _VISOES:
+        data["visao"] = None
+    data["indicadores"] = [i for i in (data.get("indicadores") or []) if i in {"csat", "tma", "sla"}]
+    if data["intencao"] in {"dados", "analise"} and not data["indicadores"]:
+        data["indicadores"] = ["csat", "tma", "sla"]  # sem indicador = todos, na regra da EPS
+    per = data.get("periodo")
+    if isinstance(per, dict):
+        try:
+            ini, fim = date.fromisoformat(str(per.get("inicio"))), date.fromisoformat(str(per.get("fim")))
+            d1 = _as_date(_today_brazil()) - timedelta(days=1)
+            if fim > d1:  # nunca no futuro
+                fim = d1
+            per.update(inicio=min(ini, fim).isoformat(), fim=fim.isoformat())
+        except ValueError:
+            data["periodo"] = None
+    return data
+
+
+def _interpretar(question: str, eps: str | None, contexto: str = "", quem: str = "") -> tuple[dict[str, Any] | None, str]:
+    """(interpretação, texto cru). Usa o agente Lyra Intérprete (rápido, sem ferramentas); sem a chave, a Lyra principal
+    com o prompt do intérprete junto."""
+    msg = _interprete_msg(question, eps, contexto, quem)
+    try:
+        if TOQAN_INTERPRETE_KEY:
+            conv, req = create_conversation(msg, TOQAN_INTERPRETE_KEY)
+            raw = get_answer(conv, req, api_key=TOQAN_INTERPRETE_KEY, max_attempts=INTERACTIVE_MAX_POLLS)
+        else:
+            try:
+                with open(INTERPRETE_PROMPT_PATH, encoding="utf-8") as fh:
+                    regras = fh.read()
+            except OSError:
+                return None, "prompt do intérprete não encontrado"
+            raw = ask_toqan("TAREFA INTERNA DO APP — NÃO responda a pessoa e NÃO chame subagentes. Siga as regras abaixo e "
+                            "devolva só o JSON.\n\n" + regras + "\n\n---\n\n" + msg, max_attempts=INTERACTIVE_MAX_POLLS)
+    except Exception as exc:
+        return None, f"falhou: {exc}"
+    return _parse_interpretacao(raw), raw
+
+
+def _interpretacao_txt(it: dict[str, Any]) -> str:
+    per = it.get("periodo") or {}
+    partes = [f"*Intenção:* {it.get('intencao')}" + (f" · *visão:* {it.get('visao')}" if it.get("visao") else "")]
+    if it.get("indicadores"):
+        partes.append(f"*Indicadores:* {', '.join(i.upper() for i in it['indicadores'])}")
+    rec = [x for x in (it.get("eps"), it.get("fila"), (f"equipe de {it['lider']}" if it.get("lider") else ""),
+                       ("minha equipe" if it.get("minha_equipe") else ""), it.get("pessoa")) if x]
+    if rec:
+        partes.append(f"*Recorte:* {' · '.join(rec)}")
+    if per:
+        partes.append(f"*Período:* {per.get('rotulo') or ''} ({per.get('inicio')} a {per.get('fim')})")
+    if it.get("comparar_com"):
+        c = it["comparar_com"]
+        partes.append(f"*Comparar com:* {c.get('rotulo') or ''} ({c.get('inicio')} a {c.get('fim')})")
+    extras = [x for x in (("lista completa" if it.get("todos") else ""), ("planilha" if it.get("formato") == "planilha" else ""))
+              if x]
+    if extras:
+        partes.append(f"*Formato:* {' · '.join(extras)}")
+    if it.get("herdado"):
+        partes.append(f"*Tirou da conversa:* {it['herdado']}")
+    if it.get("duvida"):
+        partes.append(f"*Perguntaria:* {it['duvida']}")
+    partes.append(f"*Confiança:* {_bfmt((it.get('confianca') or 0) * 100, 0)}%")
+    return "\n".join(partes)
+
+
+def _interprete_shadow(event: dict[str, Any], question: str, eps: str | None, contexto: str, quem: str) -> None:
+    """Roda o intérprete sem mexer na resposta e registra: pergunta, rota que o app usou e o que a IA leu."""
+    try:
+        it, raw = _interpretar(question, eps, contexto, quem)
+        for _ in range(360):  # espera a resposta do app terminar (a rota só é conhecida no fim)
+            if event.get("_done"):
+                break
+            time.sleep(5)
+        entry = {"t": _now_brazil().strftime("%d/%m %H:%M"), "c": str(event.get("channel") or ""),
+                 "q": _mask_pii(question)[:200], "rota": str(event.get("_route") or "livre"),
+                 "it": it, "erro": None if it else str(raw)[:200]}
+        with _INTERPRETE_LOCK:
+            try:
+                log = json.loads(STATE.get(INTERPRETE_LOG_KEY) or "[]")
+            except ValueError:
+                log = []
+            log.append(entry)
+            STATE.set(INTERPRETE_LOG_KEY, json.dumps(log[-INTERPRETE_LOG_MAX:], ensure_ascii=False))
+    except Exception:
+        logger.warning("Intérprete (shadow) falhou", exc_info=True)
+
+
+_INTERPRETE_LOCK = threading.Lock()
+
+
+def _interpretacoes_txt(n: int = 10) -> str:
+    try:
+        log = json.loads(STATE.get(INTERPRETE_LOG_KEY) or "[]")
+    except ValueError:
+        log = []
+    if not log:
+        return "Ainda não tenho interpretações registradas. Elas aparecem conforme as pessoas falam comigo."
+    linhas = [f"🧠 *Últimas {min(n, len(log))} leituras do intérprete* (rota do app x o que a IA entendeu)"]
+    for e in log[-n:][::-1]:
+        it = e.get("it") or {}
+        leitura = (f"{it.get('intencao')}/{it.get('visao') or '—'} · {','.join(it.get('indicadores') or []) or '—'} · "
+                   f"{it.get('fila') or it.get('eps') or '—'} · {(it.get('periodo') or {}).get('rotulo') or '—'}"
+                   if it else f"⚠️ {e.get('erro')}")
+        linhas.append(f"• {e.get('t')} · _{e.get('q')}_\n   app: `{e.get('rota')}` · IA: {leitura}")
+    return "\n".join(linhas)
 
 
 # --- variação e motivos de CSAT por SQL fixo -----------------------------------
@@ -6438,10 +6915,96 @@ def _fmt_tempo(seconds: float) -> str:
     return f"{_fmt_int(seconds)} s"
 
 
+REPORT_EFIC_FROM_CAPA = os.getenv("REPORT_EFIC_FROM_CAPA", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+_REPORT_CAPA: dict[str, Any] = {"day": None, "d1": {}, "mes": {}}
+
+
+_REPORT_CAPA_LOCK = threading.Lock()
+
+
+def _load_report_capa(d1: date) -> None:
+    """TMA e SLA do report pela régua oficial (o SQL da CAPA, o mesmo do "TMA e SLA"): D-1 e mês até D-1, por célula.
+    Uma carga por dia serve as duas EPSs (o SQL traz todas as células)."""
+    with _REPORT_CAPA_LOCK:
+        if _REPORT_CAPA.get("day") == d1 and _REPORT_CAPA.get("mes"):
+            return
+        _load_report_capa_inner(d1)
+
+
+def _load_report_capa_inner(d1: date) -> None:
+    out: dict[str, Any] = {"day": d1, "d1": {}, "mes": {}}
+    for chave, ini in (("d1", d1), ("mes", d1.replace(day=1))):
+        try:
+            rows, _ = _capa_rows(ini, d1, None)
+        except Exception:
+            logger.warning("Report: CAPA (%s) falhou", chave, exc_info=True)
+            rows = None
+        for r in rows or []:
+            out[chave][_norm_text(r.get("celula", ""))] = r
+    _REPORT_CAPA.update(out)
+
+
+def _d1_base_completa(celula_norm: str, tk_d1: float, day: date) -> bool:
+    """O D-1 já está inteiro na base de filas? Compara o volume do D-1 com a média diária dos dias anteriores do mês
+    (abaixo de 60% da média = o dia ainda está carregando). No dia 1, só exige volume mínimo."""
+    if tk_d1 < CAPA_MIN_TICKETS:
+        return False
+    r_mes = _REPORT_CAPA.get("mes", {}).get(celula_norm)
+    if not r_mes or day.day <= 1:
+        return True
+    tk_mes = _cv(r_mes, "ticket unico real") or 0
+    media = (tk_mes - tk_d1) / (day.day - 1)
+    return media <= 0 or tk_d1 >= D1_BASE_MIN_RATIO * media
+
+
+D1_BASE_MIN_RATIO = float(os.getenv("D1_BASE_MIN_RATIO", "0.6"))
+
+
+def _capa_into_block(fila: str, data: dict[str, Any], day: date) -> None:
+    """Põe no bloco do report o TMA (ticket) e o SLA de 1ª resposta oficiais do D-1 e do mês, com plan e meta."""
+    if _REPORT_CAPA.get("day") != day:
+        return
+    k = _norm_text(fila)
+    for chave in ("d1", "mes"):
+        r = _REPORT_CAPA[chave].get(k)
+        if not r:
+            continue
+        tk = _cv(r, "ticket unico real") or 0
+        fechado = chave == "mes" or _d1_base_completa(k, tk, day)
+        if not fechado:
+            data["capa_d1_aberto"] = True
+            continue
+        tma, plan = _cv(r, "tempo atribuicao (ticket)"), _cv(r, "tempo atendimento plan (ticket)")
+        if tma is not None:
+            data[f"capa_tma_{chave}"] = tma
+            data[f"capa_plan_{chave}"] = plan
+            data[f"capa_int_{chave}"] = _cv(r, "media interacoes real")
+            data[f"capa_int_plan_{chave}"] = _cv(r, "media interacoes plan")
+            data[f"capa_inter_{chave}"] = _cv(r, "interacoes real")
+        sla = _cv(r, "sla")
+        if sla is not None:
+            data[f"sla_{chave}"] = sla * 100 if sla <= 1.5 else sla
+            data["sla_meta"] = _capa_sla_meta(fila)
+            data["sla_corte"] = r.get("corte sla", "")
+
+
 def _tma_data(fila: str, data: dict[str, Any]) -> dict[str, Any] | None:
-    """TMA = tempo por interação × interações por ticket, no D-1 e no mês, contra o plan da célula."""
+    """TMA do report. Fonte oficial: CAPA (TEMPO ATRIBUIÇÃO (TICKET) contra o plan do período), quando carregada;
+    senão, a régua antiga (tempo por interação × interações por ticket, da Lyra Indicadores)."""
     if not TMA_IN_REPORT or any(_norm_text(fila) == _norm_text(f) for f in NO_TMA_FILAS):
         return None
+    if data.get("capa_tma_mes") is not None or data.get("capa_tma_d1") is not None:
+        d1_v, mes_v = data.get("capa_tma_d1"), data.get("capa_tma_mes")
+        plan = data.get("capa_plan_d1") or data.get("capa_plan_mes")
+        int_d1, int_plan = data.get("capa_int_d1"), data.get("capa_int_plan_d1") or data.get("capa_int_plan_mes")
+        out = {"d1": d1_v, "mes": mes_v, "plan": plan, "plan_mes": data.get("capa_plan_mes") or plan,
+               "tratados": data.get("capa_inter_d1"), "int_d1": int_d1, "int_plan": int_plan, "fonte": "capa",
+               "d1_aberto": bool(data.get("capa_d1_aberto"))}
+        if d1_v is not None and int_d1:
+            out["tpi_d1"] = d1_v / int_d1
+        if plan and int_plan:
+            out["tpi_plan"] = plan / int_plan
+        return out
     tpi_d1, int_d1 = _num(data.get("tma_tpi_d1")), _num(data.get("tma_int_d1"))
     if tpi_d1 is None or int_d1 is None:
         return None
@@ -6465,7 +7028,9 @@ def _tma_status(tma: dict[str, Any] | None) -> str:
         return "sem_dado"
     if tma.get("plan") is None:
         return "sem_plan"
-    return "acima" if tma["d1"] > tma["plan"] else "ok"
+    if tma.get("d1") is None:
+        return "sem_dado"
+    return "acima" if tma["d1"] > tma["plan"] + 0.5 else "ok"
 
 
 def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str] | None:
@@ -6478,13 +7043,25 @@ def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str]
     d1, meta, mes = data["d1"], data.get("meta"), data.get("mes")
     tma = _tma_data(fila, data)
     tstatus = _tma_status(tma)
-    off = status == "abaixo" or tstatus == "acima"
-    has_target = meta is not None or tstatus in {"ok", "acima"}
+    sla_d1, sla_mes, sla_meta = data.get("sla_d1"), data.get("sla_mes"), data.get("sla_meta")
+    sla_off = sla_d1 is not None and sla_meta is not None and sla_d1 < sla_meta - 0.05
+    off = status == "abaixo" or tstatus == "acima" or sla_off
+    has_target = meta is not None or tstatus in {"ok", "acima"} or (sla_d1 is not None and sla_meta is not None)
     emoji = "🔴" if off else ("🟢" if has_target else "⚪")
     title = f"{emoji} *Governança ·* `{fila}` *— D-1 {dd}* · CSAT D-1 {_bfmt(d1)}%" + (
         f" (meta {_fmt_meta(meta)}%)" if meta is not None else "")
-    if tma:
+    if tma and tma.get("d1") is not None:
         title += f" · TMA {_fmt_tempo(tma['d1'])}" + (f" (plan {_fmt_tempo(tma['plan'])})" if tma.get("plan") else "")
+    if sla_d1 is not None:
+        title += f" · SLA {_bfmt(sla_d1)}%" + (f" (meta {_fmt_meta(sla_meta)}%)" if sla_meta is not None else "")
+
+    def sla_vs_meta(value: float) -> str:
+        if sla_meta is None:
+            return "⚪ sem meta"
+        if value < sla_meta - 0.05:
+            return f"🔴 {_bfmt(sla_meta - value)} p.p. abaixo da meta {_fmt_meta(sla_meta)}%"
+        return (f"🟢 {_bfmt(value - sla_meta)} p.p. acima da meta {_fmt_meta(sla_meta)}%" if value > sla_meta + 0.05
+                else "🟢 na meta")
 
     def csat_vs_meta(value: float) -> str:
         if meta is None:
@@ -6493,13 +7070,14 @@ def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str]
             return f"🔴 {_bfmt(meta - value)} p.p. abaixo da meta {_fmt_meta(meta)}%"
         return "🟢 na meta" if value == meta else f"🟢 {_bfmt(value - meta)} p.p. acima da meta {_fmt_meta(meta)}%"
 
-    def tma_vs_plan(value: float) -> str:
-        if not tma or tma.get("plan") is None:
+    def tma_vs_plan(value: float, plan_v: float | None = None) -> str:
+        plan_v = plan_v if plan_v is not None else (tma.get("plan") if tma else None)
+        if not tma or plan_v is None:
             return "⚪ plan a definir"
-        diff = value - tma["plan"]
-        if diff > 0:
-            return f"🔴 {_fmt_tempo(diff)} acima do plan {_fmt_tempo(tma['plan'])}"
-        return f"🟢 {_fmt_tempo(-diff)} abaixo do plan {_fmt_tempo(tma['plan'])}" if diff < -0.5 else "🟢 no plan"
+        diff = value - plan_v
+        if diff > 0.5:
+            return f"🔴 {_fmt_tempo(diff)} acima do plan {_fmt_tempo(plan_v)}"
+        return f"🟢 {_fmt_tempo(-diff)} abaixo do plan {_fmt_tempo(plan_v)}" if diff < -0.5 else "🟢 no plan"
 
     def problema(name_key: str, pp_key: str) -> str:
         text = str(data.get(name_key) or "").strip()
@@ -6524,9 +7102,17 @@ def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str]
     if data.get("var") is not None:
         extra.append(f"{'▼' if data['var'] < 0 else '▲'} {_bfmt(abs(data['var']))} p.p. vs dia anterior")
     lines.append(f"• CSAT do D-1 *{_bfmt(d1)}%* → {csat_vs_meta(d1)}" + (f" ({' · '.join(extra)})" if extra else ""))
-    if tma:
+    if tma and tma.get("d1") is not None:
         lines.append(f"• TMA do D-1 *{_fmt_tempo(tma['d1'])}* → {tma_vs_plan(tma['d1'])}"
-                     + (f" ({_fmt_int(tma['tratados'])} tratados)" if tma.get("tratados") is not None else ""))
+                     + (f" ({_fmt_int(tma['tratados'])} {'interações' if tma.get('fonte') == 'capa' else 'tratados'})"
+                        if tma.get("tratados") is not None else ""))
+    if sla_d1 is not None:
+        corte = str(data.get("sla_corte") or "").strip()
+        lines.append(f"• SLA de 1ª resposta do D-1{(' (' + corte + ')') if corte else ''} *{_bfmt(sla_d1)}%* → "
+                     f"{sla_vs_meta(sla_d1)}")
+    if (tma and tma.get("d1_aberto") and tma.get("d1") is None) or (data.get("capa_d1_aberto") and sla_d1 is None):
+        lines.append("• TMA e SLA do D-1: o volume do dia na base de filas ainda está bem abaixo da média dos dias "
+                     "anteriores (o dia não terminou de carregar); o mês vem abaixo")
     p_d1 = problema("ofensor", "ofensor_pp")
     if p_d1:
         lines.append(f"• Problema do D-1: {p_d1}")
@@ -6540,7 +7126,9 @@ def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str]
     if mes is not None:
         month_lines.append(f"• CSAT do mês *{_bfmt(mes)}%* → {csat_vs_meta(mes)}")
     if tma and tma.get("mes") is not None:
-        month_lines.append(f"• TMA do mês *{_fmt_tempo(tma['mes'])}* → {tma_vs_plan(tma['mes'])}")
+        month_lines.append(f"• TMA do mês *{_fmt_tempo(tma['mes'])}* → {tma_vs_plan(tma['mes'], tma.get('plan_mes'))}")
+    if sla_mes is not None:
+        month_lines.append(f"• SLA de 1ª resposta do mês *{_bfmt(sla_mes)}%* → {sla_vs_meta(sla_mes)}")
     p_mes = problema("ofensor_mes", "ofensor_mes_pp")
     if p_mes:
         month_lines.append(f"• Problema do mês: {p_mes}")
@@ -6566,7 +7154,9 @@ def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str]
         reinc_txt = f" {n_re} reincidente{'s' if n_re != 1 else ''} no Q4."
     if disp:
         trend, idx_mes, idx_d1 = disp
-        change = f"{_bfmt(idx_mes, 2)} no mês → {_bfmt(idx_d1, 2)} no D-1"
+        mov = "caiu" if idx_d1 < idx_mes else "subiu" if idx_d1 > idx_mes else "ficou"
+        change = (f"índice {mov} de {_bfmt(idx_mes, 2)} no mês para {_bfmt(idx_d1, 2)} no D-1" if mov != "ficou"
+                  else f"índice em {_bfmt(idx_d1, 2)}")
         leitura.append({"aumentou": f"📈 Dispersão aumentou ({change}): piora no comportamento operacional.",
                         "diminuiu": f"📉 Dispersão diminuiu ({change}): operação mais homogênea.",
                         "estável": f"Dispersão estável ({change})."}[trend] + reinc_txt)
@@ -6614,6 +7204,8 @@ def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str]
                 gaps.append(f"CSAT {_bfmt(meta - d1)} p.p. abaixo da meta")
             if tstatus == "acima":
                 gaps.append(f"TMA {_fmt_tempo(tma['d1'] - tma['plan'])} acima do plan")
+            if sla_off:
+                gaps.append(f"SLA de 1ª resposta {_bfmt(sla_meta - sla_d1)} p.p. abaixo da meta")
             cobranca = (f"{' e '.join(gaps)} no D-1 — a ação em andamento está segurando o problema?" if cobre
                         else f"{' e '.join(gaps)} no D-1 — o que está sendo feito pra corrigir?")
         if not cobranca.endswith("?"):
@@ -6627,8 +7219,9 @@ def _render_block(fila: str, data: dict[str, Any], day: date) -> tuple[str, str]
             suffix = "Plano aqui na thread até 14h: *ação · responsável · prazo*."
         lines.append(f"👉 *Cobrança:* {cobranca} {suffix}")
     elif has_target:
-        elogio = str(data.get("elogio") or "").strip() or ("CSAT e TMA dentro do esperado, bom trabalho, time."
-                                                             if tma else "CSAT dentro do esperado, bom trabalho, time.")
+        elogio = str(data.get("elogio") or "").strip() or (
+            "CSAT, TMA e SLA dentro do esperado, bom trabalho, time." if tma and sla_d1 is not None else
+            "CSAT e TMA dentro do esperado, bom trabalho, time." if tma else "CSAT dentro do esperado, bom trabalho, time.")
         if not tma:
             elogio = re.sub(r"\s*(e|,)?\s*TMA[^.,;]*", "", elogio).strip() or "CSAT dentro do esperado, bom trabalho, time."
         lines.append(f"✅ *Destaque:* {elogio}")
@@ -6648,6 +7241,8 @@ def _prepare_blocks(blocks: list[tuple[str, str]], day: date) -> list[tuple[str,
         meta_mes = _meta_fila(fila, day)
         if meta_mes is not None and REPORT_METAS_FROM_APP:
             data["meta"] = meta_mes  # meta combinada do mês (a mesma de toda a Lyra)
+        if REPORT_EFIC_FROM_CAPA:
+            _capa_into_block(fila, data, day)
         status = _block_status(data)
         if status == "sem_volume":
             continue
@@ -6660,7 +7255,9 @@ def _prepare_blocks(blocks: list[tuple[str, str]], day: date) -> list[tuple[str,
         tstatus = _tma_status(tma)
         csat_gap = (data["meta"] - data["d1"]) if status == "abaixo" else 0.0
         tma_excess = (tma["d1"] / tma["plan"] - 1) if tstatus == "acima" else 0.0
-        off = status == "abaixo" or tstatus == "acima"
+        sla_off = (data.get("sla_d1") is not None and data.get("sla_meta") is not None
+                   and data["sla_d1"] < data["sla_meta"] - 0.05)
+        off = status == "abaixo" or tstatus == "acima" or sla_off
         order = 0 if off else (1 if (data.get("meta") is not None or tstatus == "ok") else 2)
         prepared.append((order, -csat_gap, -tma_excess, fila, title, body))
     prepared.sort(key=lambda item: item[:3])
@@ -7376,7 +7973,7 @@ MOTIVOS_INSTRUCTION = (
     "negativo (seção 6 dela): participação nas avaliações, CSAT do motivo (n) e impacto em p.p. no CSAT da fila. "
     "Responda um bloco curto por fila (nome da fila em código), da fila mais longe da meta para a mais perto, e feche "
     "com 1 linha: o motivo que aparece em mais filas. NÃO faça análise de variação nem esteira.\n\n")
-_D1_RE = re.compile(r"\b(ontem|d ?- ?1|d1|dia anterior)\b")
+_D1_RE = re.compile(r"\b(ontem|d ?-? ?1|dia anterior)\b")
 
 
 def _d1_context(question: str, event: dict[str, Any]) -> bool:
@@ -7535,7 +8132,7 @@ def _post_esteira_on_demand(event: dict[str, Any], eps: str | None, question: st
     if not fila:
         return False
     text_q = _norm_text(question)
-    d1_only = bool(re.search(r"\b(ontem|d-1|d1|dia anterior)\b", text_q)) and "mes" not in text_q
+    d1_only = bool(re.search(r"\b(ontem|d ?-? ?1|dia anterior)\b", text_q)) and "mes" not in text_q
     day = _today_brazil().date() - timedelta(days=1)
     try:
         answer = ask_toqan(_esteira_on_demand_prompt(eps, fila, day, d1_only), max_attempts=ESTEIRA_MAX_POLLS)
@@ -7559,7 +8156,7 @@ def _variation_periods(question: str) -> tuple[tuple[date, date], tuple[date, da
     d1 = _today_brazil().date() - timedelta(days=1)
     text = _norm_text(question)
     fmt = lambda a, b: f"{a.strftime('%d/%m')}–{b.strftime('%d/%m')}" if a != b else a.strftime("%d/%m")
-    if re.search(r"\b(ontem|d-1|d1|dia anterior)\b", text):
+    if re.search(r"\b(ontem|d ?-? ?1|dia anterior)\b", text):
         ref = (d1.replace(day=1), d1 - timedelta(days=1)) if d1.day > 1 else (d1 - timedelta(days=7), d1 - timedelta(days=1))
         return (d1, d1), ref, f"D-1 ({fmt(d1, d1)})", f"mês até D-2 ({fmt(*ref)})"
     if re.search(r"\bsemana\b", text):
@@ -7855,6 +8452,9 @@ def _run_daily_report_inner(now: datetime | None = None, tenant: Tenant | None =
 
     crisis_thread = threading.Thread(target=check_crisis, daemon=True)
     crisis_thread.start()
+    capa_thread = threading.Thread(target=_load_report_capa, args=(d1,), daemon=True)  # TMA e SLA oficiais (CAPA)
+    if REPORT_EFIC_FROM_CAPA:
+        capa_thread.start()
     answer = ask_toqan(_report_prompt(tenant, compromissos_text))
     if _is_error_answer(answer) and "tma" in _norm_text(answer):
         # o TMA não pode derrubar o report: tenta de novo sem TMA
@@ -7863,6 +8463,8 @@ def _run_daily_report_inner(now: datetime | None = None, tenant: Tenant | None =
     if _is_error_answer(answer):
         raise ReportGenerationError(answer.strip()[:300] or "resposta vazia")
 
+    if capa_thread.is_alive():
+        capa_thread.join(timeout=600)
     blocks = _prepare_blocks(_split_blocks(answer, use_headers=True), now.date() - timedelta(days=1))
     crisis_thread.join(timeout=300)
     if crisis.get("c"):
@@ -8356,6 +8958,10 @@ def _scheduler_tick(now: datetime | None = None) -> None:
         _catalog_weekly_tick(now)
     except Exception:
         logger.exception("Catalog weekly tick failed")
+    try:
+        _mop_check_tick(now)
+    except Exception:
+        logger.exception("MOP check tick failed")
     try:
         _agent_health_tick(now)
     except Exception:
@@ -9959,12 +10565,23 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
 
     failed = {"v": False}
     _TOQAN_TL.interactive = True  # conversa com gente: prioridade no Toqan
+    q_shadow = _strip_mentions(str(event.get("text") or ""))
+    if INTERPRETE_MODE == "shadow" and TOQAN_INTERPRETE_KEY and q_shadow.strip() and not _INTERPRETE_CMD_RE.match(q_shadow) \
+            and not _INTERPRETACOES_CMD_RE.match(q_shadow):
+        try:  # a conversa é lida agora, antes da resposta do app entrar na thread
+            ctx_s = _thread_context(event) if event.get("thread_ts") else ""
+            _, eps_s = _event_scope(event)
+            threading.Thread(target=_interprete_shadow, args=(event, q_shadow, eps_s, ctx_s, _speaker_line(event)),
+                             daemon=True).start()
+        except Exception:
+            logger.warning("Intérprete (shadow) não iniciou", exc_info=True)
     try:
         _process_event_inner(event, say, in_thread, client, failed)
         if FEEDBACK_REACTIONS and said_ts and not failed["v"] and \
                 str(event.get("_route") or "livre") not in {"lembrete", "aprendizado", "report_manual", "mop_upload"}:
             _add_feedback_reactions(str(event.get("channel") or ""), said_ts[-1])
     finally:
+        event["_done"] = True
         _TOQAN_TL.interactive = False
         if not event.get("_skip_log"):
             try:
@@ -10057,6 +10674,18 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             for w in workers:
                 w.join()
             return
+        m_int = _INTERPRETE_CMD_RE.match(question)
+        if m_int:  # "@Lyra interpreta: <pergunta>": mostra como a IA leu, sem responder a pergunta
+            event["_route"] = "interprete_teste"
+            ctx_i = _thread_context(event) if event.get("thread_ts") else ""
+            it, raw = _interpretar(m_int.group(1), eps, ctx_i, _speaker_line(event))
+            _say(say, ("🧠 *Como eu li:* _" + m_int.group(1).strip()[:200] + "_\n" + _interpretacao_txt(it)) if it else
+                 f"🧠 Não consegui interpretar agora ({str(raw)[:200]}).", event, True)
+            return
+        if eps is None and _INTERPRETACOES_CMD_RE.match(question):
+            event["_route"] = "interprete_log"
+            _say(say, _interpretacoes_txt(), event, True)
+            return
         if eps is None and _DIAG_RE.search(_norm_text(question)):
             event["_route"] = "diagnostico"
             _say_sections(say, _diagnostics_text(), event, in_thread)
@@ -10128,14 +10757,7 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                                       _norm_text(question)) and bool(_capa_template()[0])
                 _say_sections(say, table + ("\n\n_TMA e SLA vêm logo abaixo, só um minutinho._ ⏳" if geral else ""), event)
                 if geral:  # "como tá a AeC?": o retrato inclui eficiência, não só CSAT
-                    try:
-                        ini_c, fim_c, label_c = _capa_period("", event)
-                        rows_c, _ = _capa_rows(ini_c, fim_c, None)
-                        resumo = _capa_resumo(rows_c, eps or _eps_in_text(question), label_c) if rows_c else ""
-                        _say(say, resumo or "TMA e SLA não voltaram agora; se quiser, me pede \"TMA e SLA\" daqui a pouco.",
-                             event, True)
-                    except Exception:
-                        logger.warning("CAPA summary after table failed", exc_info=True)
+                    _post_efic_summary(say, event, eps, question)
                 if not (_CAUSE_FOLLOW_RE.search(_norm_text(question)) and focus.get("fila")):
                     return
                 # pergunta dupla ("qual fila mais impacta e quais as causas?"): emenda a análise de causa da fila
@@ -10151,7 +10773,10 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
         if (event.get("thread_ts") and not re.search(r"\b(csat|tma|sla|nota\w*|primeira resposta|avaliac\w*)\b", tq0)
                 and _FOLLOWUP_DADOS_RE.search(tq0)):
             ctx0 = _thread_context(event)[-4000:]
-            herdado = ("TMA e SLA" if re.search(r"TMA e SLA|Quem mais pesa no (TMA|SLA)|Motivos que mais pesam no (TMA|SLA)",
+            casos_m = re.findall(r"📋 \*(CSAT|SLA 1ª resposta|TMA)\*", ctx0)
+            herdado = (f"casos de {casos_m[-1].split()[0]}" if casos_m and re.search(r"\b(base|casos?|lista|planilha|excel|"
+                                                                                       r"d ?-? ?1|ontem|semana)\b", tq0) else
+                       "TMA e SLA" if re.search(r"TMA e SLA|Quem mais pesa no (TMA|SLA)|Motivos que mais pesam no (TMA|SLA)",
                                                  ctx0) else
                        "CSAT" if re.search(r"Resultado por fila|Quem mais pesa no CSAT|CSAT \*?\d", ctx0) else "")
             if herdado:
@@ -10199,6 +10824,9 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             if resp_v:
                 _say_sections(say, resp_v, event) if resp_v.startswith(("⏱️", "⏰")) else _say(say, resp_v, event, in_thread=True)
             return
+        if (not efic_extra and _DIARIO_RE.search(_norm_text(question)) and not _inds_citados(question)
+                and not re.search(r"\b(operador\w*|analista\w*|supervisor\w*|equipe|casos?|motivos?)\b", _norm_text(question))):
+            question = f"{question} (CSAT, TMA e SLA)"  # dia a dia sem indicador = todos
         if not efic_extra and _is_csat_diario_request(question):
             event["_route"] = "csat_diario"
             _say(say, "Já puxo o CSAT dia a dia pra você ⏳", event, in_thread=True)
@@ -10219,12 +10847,21 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             return
         if _is_case_list_request(question):
             event["_route"] = "avaliacoes"
-            _say(say, f"Vou montar a base caso a caso de {({'csat': 'CSAT', 'sla': 'SLA de 1ª resposta', 'tma': 'TMA'})[_case_indicator(question)]} "
-                      "e a abertura por operador. Leva alguns minutos ⏳", event, in_thread=True)
-            problem = _send_case_list(event, client, eps, question)
-            progress.done()
-            if problem:
-                _say(say, problem, event, in_thread=True)
+            todos_ind = not _inds_citados(question)
+            nomes_ind = {'csat': 'CSAT', 'sla': 'SLA de 1ª resposta', 'tma': 'TMA'}
+            _say(say, ("Vou montar a base caso a caso de CSAT, SLA de 1ª resposta e TMA (uma planilha de cada) e a abertura "
+                       "por operador. Leva alguns minutos ⏳" if todos_ind else
+                       f"Vou montar a base caso a caso de {nomes_ind[_case_indicator(question)]} e a abertura por operador. "
+                       "Leva alguns minutos ⏳"), event, in_thread=True)
+            try:
+                for q_ind in ([f"{question} (csat)", f"{question} (sla)", f"{question} (tma)"] if todos_ind else [question]):
+                    problem = _send_case_list(event, client, eps, q_ind)
+                    if problem:
+                        _say(say, problem, event, in_thread=True)
+                        if "De qual fila ou equipe" in problem:
+                            break
+            finally:
+                progress.done()
             return
         tq = _norm_text(question)
         if (not efic_extra and event.get("thread_ts") and _PESSOAS_RE.search(tq) and _ABERTURA_RE.search(tq)
@@ -10247,13 +10884,22 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             return
         if not efic_extra and _is_pessoas_impacto_request(question) and (asks or not in_report_thread):
             event["_route"] = "pessoas_impacto"
-            progress("Vou ver quem mais pesa no CSAT (operadores e supervisores), já te mando. ⏳")
+            todos_ind = not _inds_citados(question)
+            progress("Vou ver quem mais pesa " + ("no CSAT, no TMA e no SLA" if todos_ind else "no CSAT")
+                     + " (operadores e supervisores), já te mando. ⏳")
             try:
                 problem = _send_pessoas_impacto(event, client, eps, question, say, progress)
+                if problem:
+                    _say(say, problem, event, in_thread)
+                if todos_ind and _capa_template()[0]:  # sem indicador = todos: TMA e SLA na mesma régua da EPS
+                    for ind_x in ("tma", "sla"):
+                        event["_no_file"] = ind_x == "sla"  # a planilha de TMA já leva o SLA de cada pessoa
+                        prob_x = _send_tma_pessoas(event, client, eps, question, say, progress, ind=ind_x)
+                        if prob_x:
+                            _say(say, prob_x, event, in_thread)
+                            break
             finally:
                 progress.done()
-            if problem:
-                _say(say, problem, event, in_thread)
             return
         count_ref = bool(event.get("thread_ts")) and bool(re.search(
             r"\bquant[oa]s\b.*\b(desses|dessas|destes|destas|deles|delas|casos?|tickets?|pendent\w*)\b", _norm_text(question)))
@@ -10433,6 +11079,12 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                     rose = (_num(var_data.get("csat_atual")) or 0) >= (_num(var_data.get("csat_ref")) or 0)
                     if not mix_only and not _mix_dominant(var_data) and not rose:
                         threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
+                    if not _inds_citados(question) and _query_text("eficiencia_variacao.sql"):
+                        # "por que a fila piorou?" sem indicador = todos: a mesma leitura para TMA e SLA
+                        for ind_x in ("TMA", "SLA"):
+                            resp_x = _send_efic_variacao(event, client, eps, f"{question} ({ind_x}) {fila_v}", None)
+                            if resp_x and resp_x.startswith(("⏱️", "⏰")):
+                                _say_sections(say, resp_x, event)
                     return
                 if not mix_only:
                     threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
@@ -10454,9 +11106,22 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 _norm_text(question)) and not re.search(r"\bcsat\b", _norm_text(question)):
             extra = EFICIENCIA_INSTRUCTION
             event["_route"] = "eficiencia"
+        elif not extra and _is_anomalia_request(question):
+            event["_route"] = "anomalia"
+            dia_a = _anomalia_dia(question, event)
+            fila_a = _fila_in_question(question, eps) or _fila_ref(question, eps, event)
+            if not fila_a and re.search(r"\bsuper\b", _norm_text(question)) and eps:
+                fila_a = f"CX Super Cliente - {eps}" if _compact(eps) in {"aec", "csu"} else None
+            send_progress(f"Vou levantar o que fugiu do normal em {dia_a.strftime('%d/%m')}"
+                          + (f" na `{fila_a}`" if fila_a else "") + " (CSAT, TMA e SLA contra os dias anteriores). ⏳")
+            pack = _anomalia_pack(eps, fila_a, dia_a, _inds_citados(question) or {"csat", "tma", "sla"})
+            if pack:
+                extra = ANOMALIA_INSTRUCTION + "DADOS:\n" + pack + "\n\n"
         elif not extra and _MOTIVOS_RE.search(_norm_text(question)):
             extra = MOTIVOS_INSTRUCTION
             event["_route"] = "motivos"
+            if not _inds_citados(question):
+                event["_pos_efic"] = True  # sem indicador = todos: os motivos de TMA e SLA vêm logo depois
             if CSAT_SQL_FIXO == "on" and not _efic_indicator(question):
                 ini_m, fim_m, label_m = _capa_period(question, event)
                 dados_m = _csat_motivos_texto(eps, _fila_ref(question, eps, event), ini_m, fim_m, label_m, send_progress)
@@ -10477,6 +11142,8 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             extra = ANALYST_TMA_INSTRUCTION
         elif not extra and event.get("_training"):
             extra = TRAINING_INSTRUCTION.format(fila=event["_training"])
+            if not _inds_citados(question):
+                event["_pos_efic"] = True
         elif not extra and event.get("_training_theme"):
             extra = TRAINING_THEME_INSTRUCTION.format(tema=event["_training_theme"])
         elif not extra and _is_small_talk(question):
@@ -10547,12 +11214,21 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             if detail:
                 _say(say, detail, event, in_thread=True)
             return
-        if free_note and answer and not esc_q and not _is_error_answer(answer) and re.search(r"\d", answer):
+        answer = _drop_false_correction(answer, event)
+        geral_r = (not extra and _is_resultado_geral(question) and bool(_capa_template()[0]) and answer
+                   and not _is_error_answer(answer) and re.search(r"\d", answer))
+        if free_note and answer and not esc_q and not _is_error_answer(answer) and re.search(r"\d", answer) and not geral_r:
             answer = answer.rstrip() + "\n\n" + FREE_ANALYSIS_NOTE
+        if geral_r:
+            answer = answer.rstrip() + "\n\n_TMA e SLA vêm logo abaixo, só um minutinho._ ⏳"
         if _looks_sectioned(answer):
             _say_sections(say, answer, event, in_thread)
         else:
             _say(say, answer or EMPTY_ANSWER_MESSAGE, event, in_thread)
+        if geral_r:  # "como ficou a AeC dia 09/11?": o retrato inclui TMA e SLA do mesmo período
+            _post_efic_summary(say, event, eps, question)
+        if event.get("_pos_efic") and answer and not _is_error_answer(answer):
+            _post_efic_motivos(say, event, eps, question)
         if esc_q:
             ch_q = str(event.get("channel") or "")
             dono = "o Gustavo" if esc_q[0] == "experiencia" else "o Michael"
@@ -11394,7 +12070,7 @@ def _tag(uid: str, eps: str) -> str:
     """No teste não marca ninguém (a mensagem vai para o canal de teste)."""
     if not uid:
         return ""
-    return f"<@{uid}>" if not _status_shadow(eps) else (f"*{_first_name(uid)}*" if _first_name(uid) else "")
+    return f"<@{uid}>"  # marca o responsável pelo ID, também no teste (nada de "a pessoa")
 
 
 def _cread_check_once() -> None:
