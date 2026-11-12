@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.35.1"
+APP_VERSION = "5.35.2"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -2867,7 +2867,7 @@ _CASE_FIELDS_RE = re.compile(r"\b(numero do caso|numeros dos casos|n do caso|cas
                              r"avaliacao por avaliacao|lista de avaliacoes|abertura das avaliacoes|casos?|tickets?|"
                              r"base de (csat|sla|tma|avaliac\w*)|fora do sla|estour\w*)\b")
 _CASE_IND_RE = re.compile(r"\b(csat|avaliac\w*|nota\w*|entrega\w*|detrator\w*|sla|primeira resposta|1a resposta|"
-                          r"tma|tempo de atendimento|tempo de atribuicao)\b")
+                          r"tma|tempo de atendimento|tempo de atribuicao|estour\w*)\b")
 CASE_LIST_MAX = int(os.getenv("CASE_LIST_MAX", "400"))
 SLA_LIMITE_S = {"super cliente": 120}  # 1ª resposta (regra da CAPA): 2 min na CX Super Cliente AeC/CSU; 5 min nas demais
 SLA_LIMITE_PADRAO_S = 300
@@ -2879,12 +2879,13 @@ def _is_case_list_request(question: str) -> bool:
         return False
     # "casos" sozinho só vale com pedido de lista/base/número (evita "quantos casos..." e perguntas de causa)
     return bool(re.search(r"\b(numero|numeros|lista|base|abertura|planilha|excel|traz|traga|manda|mande|envia|envie|"
-                          r"me passa|quais (os )?casos|caso a caso|comentario\w*|hora da avaliacao|nota atribuida)\b", t))
+                          r"me passa|quais (foram )?(os |as )?(casos|tickets|interacoes)|caso a caso|comentario\w*|"
+                          r"hora da avaliacao|nota atribuida)\b", t))
 
 
 def _case_indicator(question: str) -> str:
     t = _norm_text(question)
-    if re.search(r"\b(sla|primeira resposta|1a resposta|fora do sla)\b", t):
+    if re.search(r"\b(sla|primeira resposta|1a resposta|fora do sla|estour\w*)\b", t):
         return "sla"
     if re.search(r"\b(tma|tempo de atendimento|tempo de atribuicao)\b", t):
         return "tma"
@@ -3069,8 +3070,49 @@ def _send_case_list(event: dict[str, Any], client: Any, eps: str | None, questio
         filename=re.sub(r"[^\w\-]+", "_", f"{nome_ind}_casos_{fila or leader or ''}_{_now_brazil().strftime('%d-%m')}")[:60] + ".xlsx",
         title=f"{nome_ind} · casos · {fila or leader} · {spec['short']}",
         initial_comment=(f"📋 *{nome_ind}* · {alvo} · {spec['short']} · {escopo}: {n_casos} caso(s) na aba *{aba}* e "
-                         f"{len(op_rows)} operador(es) na aba *Por operador*.{corte}{extra}"))
+                         f"{len(op_rows)} operador(es) na aba *Por operador*.{corte}{extra}"
+                         + (_sla_casos_resumo(casos[0], casos[1]) if ind == "sla" and casos else "")))
     return None
+
+
+def _sla_casos_resumo(header: list[str], rows: list[list[str]]) -> str:
+    """Resumo dos estouros de SLA: em que faixa de tempo, em que horário e se o atraso foi de fila ou do operador."""
+    h = [_norm_text(x) for x in header]
+    idx = lambda *names: next((h.index(n) for n in names if n in h), None)
+    i_pr, i_dt = idx("primeira_resposta_s", "primeira resposta s"), idx("data_hora_entrada", "data hora entrada")
+    i_fila, i_op = idx("espera_fila_s", "espera fila s"), idx("resposta_apos_atribuicao_s", "resposta apos atribuicao s")
+    if i_pr is None or not rows:
+        return ""
+    faixas = [("2–3 min", 120, 180), ("3–5 min", 180, 300), ("5–10 min", 300, 600), ("10–30 min", 600, 1800),
+              ("mais de 30 min", 1800, 10 ** 9)]
+    cont = {f[0]: 0 for f in faixas}
+    horas: dict[str, int] = {}
+    de_fila = do_op = 0
+    for r in rows:
+        v = _sql_num(r[i_pr]) if i_pr < len(r) else None
+        if v is None:
+            continue
+        for nome, a, b in faixas:
+            if a < v <= b or (nome == "2–3 min" and v <= b):
+                cont[nome] += 1
+                break
+        if i_dt is not None and i_dt < len(r):
+            m = re.search(r"(\d{2}):\d{2}", str(r[i_dt]))
+            if m:
+                horas[m.group(1)] = horas.get(m.group(1), 0) + 1
+        ef = _sql_num(r[i_fila]) if i_fila is not None and i_fila < len(r) else None
+        eo = _sql_num(r[i_op]) if i_op is not None and i_op < len(r) else None
+        if ef is not None and eo is not None:
+            de_fila += ef >= eo
+            do_op += eo > ef
+    linhas = ["", "⏱️ *Por faixa de 1ª resposta:* " + " · ".join(f"{k}: {v}" for k, v in cont.items() if v)]
+    if horas:
+        top = sorted(horas.items(), key=lambda x: -x[1])[:3]
+        linhas.append("🕐 *Horários com mais estouro:* " + " · ".join(f"{h_}h ({n})" for h_, n in top))
+    if de_fila + do_op:
+        linhas.append(f"🔎 *Onde atrasou:* {de_fila} na espera da fila (antes de atribuir) · {do_op} depois de atribuir "
+                      "ao operador")
+    return "\n".join(linhas)
 
 
 _PII_RES = [
@@ -5876,6 +5918,9 @@ def _send_efic_variacao(event: dict[str, Any], client: Any, eps: str | None, que
 
 
 _WANTS_FILE_RE = re.compile(r"\b(excel|planilha|xlsx|arquivo|base completa)\b")
+_FOLLOWUP_DADOS_RE = re.compile(r"\b(abertura|diari\w*|dia a dia|por dia|por fila|por supervisor\w*|por operador\w*|"
+                                r"por analista\w*|apenas|so (da|de|do)|somente|excel|planilha|semana|ontem|mes|outubro|"
+                                r"novembro|dezembro|super cliente|review|suporte|madrugada|cancelamento|denuncia)\b")
 
 
 def _rows_xlsx(sheets: list[tuple[str, list[dict[str, str]], dict[str, str]]]) -> bytes:
@@ -8430,7 +8475,21 @@ def _post_sections(channel: str, text: str, thread_ts: str | None = None) -> Any
     return slack_app.client.chat_postMessage(**kwargs)
 
 
+def _slack_md(text: str) -> str:
+    """Markdown comum → Slack: **negrito** vira *negrito*, ### título vira *título* (o Slack mostra os asteriscos crus)."""
+    if not text or ("**" not in text and "#" not in text and "__" not in text):
+        return text
+    partes = re.split(r"(```.*?```)", text, flags=re.S)
+    for i in range(0, len(partes), 2):
+        t = re.sub(r"\*\*(.+?)\*\*", r"*\1*", partes[i], flags=re.S)
+        t = re.sub(r"(?<![\w])__(.+?)__(?![\w])", r"_\1_", t)
+        t = re.sub(r"(?m)^#{1,6}[ \t]+(.+?)[ \t]*$", r"*\1*", t)
+        partes[i] = t
+    return "".join(partes)
+
+
 def _say_sections(say: Callable[..., Any], answer: str, event: dict[str, Any], in_thread: bool = True) -> None:
+    answer = _slack_md(answer)
     kwargs: dict[str, Any] = {"text": answer}
     ts = _reply_ts(event) if (in_thread or event.get("channel_type") == "im") else None
     if ts:
@@ -8451,6 +8510,7 @@ def _reply_ts(event: dict[str, Any]) -> str | None:
 
 
 def _say(say: Callable[..., Any], answer: str, event: dict[str, Any], in_thread: bool) -> None:
+    answer = _slack_md(answer)
     ts = _reply_ts(event) if (in_thread or event.get("channel_type") == "im") else None
     if ts:
         say(text=answer, thread_ts=ts)
@@ -10086,6 +10146,21 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
         analytical = _is_analytical(question)  # "por que", "quem piorou", "quanto contribuiu": análise livre
         progress = _Progress(event)
         efic_extra = ""
+        # continuação na thread sem dizer o indicador ("quero a abertura diária só da Super Cliente"): herda o da conversa
+        tq0 = _norm_text(question)
+        if (event.get("thread_ts") and not re.search(r"\b(csat|tma|sla|nota\w*|primeira resposta|avaliac\w*)\b", tq0)
+                and _FOLLOWUP_DADOS_RE.search(tq0)):
+            ctx0 = _thread_context(event)[-4000:]
+            herdado = ("TMA e SLA" if re.search(r"TMA e SLA|Quem mais pesa no (TMA|SLA)|Motivos que mais pesam no (TMA|SLA)",
+                                                 ctx0) else
+                       "CSAT" if re.search(r"Resultado por fila|Quem mais pesa no CSAT|CSAT \*?\d", ctx0) else "")
+            if herdado:
+                question = f"{question} ({herdado})"
+                event["_herdado"] = herdado
+            if eps is None:
+                eps_ctx = {e for e in ("AeC", "CSU") if f"`{e}`" in ctx0 or f"- {e}`" in ctx0}
+                if len(eps_ctx) == 1:
+                    eps = eps_ctx.pop()
         ind_e = _efic_indicator(question)
         if ind_e and re.search(r"\b(motivo\w*|ofensor\w*|trein\w*|reciclag\w*|capacit\w*|por que|porque|pq|"
                                r"o que (puxa|explica|pesa|impacta))\b", _norm_text(question)) and not re.search(
