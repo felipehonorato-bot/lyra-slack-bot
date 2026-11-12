@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.39.2"
+APP_VERSION = "5.39.3"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -6438,6 +6438,8 @@ def _interprete_shadow(event: dict[str, Any], question: str, eps: str | None, co
             if event.get("_done"):
                 break
             time.sleep(5)
+        if str(event.get("_route") or "") in {"diagnostico", "interprete_log", "interprete_teste", "status_agentes"}:
+            return  # comando para a Lyra, não é pergunta de gente
         entry = {"t": _now_brazil().strftime("%d/%m %H:%M"), "c": str(event.get("channel") or ""),
                  "q": _mask_pii(question)[:200], "rota": str(event.get("_route") or "livre"),
                  "it": it, "erro": None if it else str(raw)[:200]}
@@ -6468,6 +6470,10 @@ def _interpretacoes_txt(n: int = 10) -> str:
         leitura = (f"{it.get('intencao')}/{it.get('visao') or '—'} · {','.join(it.get('indicadores') or []) or '—'} · "
                    f"{it.get('fila') or it.get('eps') or '—'} · {(it.get('periodo') or {}).get('rotulo') or '—'}"
                    if it else f"⚠️ {e.get('erro')}")
+        if it and it.get("duvida"):
+            leitura += f" · ❓ perguntaria: {it['duvida']}"
+        if it and it.get("herdado"):
+            leitura += f" · 🔗 {it['herdado']}"
         linhas.append(f"• {e.get('t')} · _{e.get('q')}_\n   app: `{e.get('rota')}` · IA: {leitura}")
     return "\n".join(linhas)
 
@@ -10606,8 +10612,9 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
     failed = {"v": False}
     _TOQAN_TL.interactive = True  # conversa com gente: prioridade no Toqan
     q_shadow = _strip_mentions(str(event.get("text") or ""))
-    if INTERPRETE_MODE == "shadow" and TOQAN_INTERPRETE_KEY and q_shadow.strip() and not _INTERPRETE_CMD_RE.match(q_shadow) \
-            and not _INTERPRETACOES_CMD_RE.match(q_shadow):
+    q_cmd = re.sub(r"^\s*@?lyra\b[\s,:]*", "", q_shadow, flags=re.I)
+    if INTERPRETE_MODE == "shadow" and TOQAN_INTERPRETE_KEY and q_shadow.strip() and not _INTERPRETE_CMD_RE.match(q_cmd) \
+            and not _INTERPRETACOES_CMD_RE.match(q_cmd) and not _DIAG_RE.search(_norm_text(q_cmd)):
         try:  # a conversa é lida agora, antes da resposta do app entrar na thread
             ctx_s = _thread_context(event) if event.get("thread_ts") else ""
             _, eps_s = _event_scope(event)
@@ -10714,7 +10721,7 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             for w in workers:
                 w.join()
             return
-        m_int = _INTERPRETE_CMD_RE.match(question)
+        m_int = _INTERPRETE_CMD_RE.match(re.sub(r"^\s*@?lyra\b[\s,:]*", "", question, flags=re.I))
         if m_int:  # "@Lyra interpreta: <pergunta>": mostra como a IA leu, sem responder a pergunta
             event["_route"] = "interprete_teste"
             ctx_i = _thread_context(event) if event.get("thread_ts") else ""
@@ -10722,7 +10729,7 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             _say(say, ("🧠 *Como eu li:* _" + m_int.group(1).strip()[:200] + "_\n" + _interpretacao_txt(it)) if it else
                  f"🧠 Não consegui interpretar agora ({str(raw)[:200]}).", event, True)
             return
-        if eps is None and _INTERPRETACOES_CMD_RE.match(question):
+        if _INTERPRETACOES_CMD_RE.match(re.sub(r"^\s*@?lyra\b[\s,:]*", "", question, flags=re.I)):
             event["_route"] = "interprete_log"
             _say(say, _interpretacoes_txt(), event, True)
             return
