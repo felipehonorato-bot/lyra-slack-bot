@@ -250,6 +250,7 @@ DM_ALLOWED_USERS = _parse_id_list(os.getenv("DM_ALLOWED_USERS", "")) or (
     {t for t in _parse_id_list(ALERT_CHANNEL) if t.startswith("U")}
 )
 # DM liberada para e-mails desses domínios (visão completa). E-mail de EPS (aec/csu) vê só a própria EPS. Vazio = só a lista.
+ADMIN_USERS = _parse_id_list(os.getenv("ADMIN_USERS", "")) or {t for t in _parse_id_list(ALERT_CHANNEL) if t.startswith("U")}
 DM_ALLOWED_DOMAINS = {d.strip().lower().lstrip("@") for d in os.getenv("DM_ALLOWED_DOMAINS", "ifood.com.br").split(",")
                       if d.strip()}
 CONSOLIDATED = "Consolidado"
@@ -541,7 +542,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.39.4"
+APP_VERSION = "5.40.1"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -6287,6 +6288,7 @@ TOQAN_INTERPRETE_KEY = os.getenv("TOQAN_INTERPRETE_KEY", "").strip() or None
 INTERPRETE_MODE = os.getenv("INTERPRETE_MODE", "shadow").strip().lower()  # off | shadow | on (on = passo 2)
 INTERPRETE_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "lyra_interprete_v1.md")
 INTERPRETE_LOG_KEY = "interprete:log"
+INTERPRETE_MAX_POLLS = int(os.getenv("INTERPRETE_MAX_POLLS", "10"))  # ~1 min: passou disso, segue pelas regras
 INTERPRETE_LOG_MAX = 300
 _INTERPRETE_CMD_RE = re.compile(r"^\s*interpreta\w*\s*[:\-]\s*(.+)$", re.I | re.S)
 _INTERPRETACOES_CMD_RE = re.compile(r"^\s*interpreta(c|ç)(o|õ)es\b", re.I)
@@ -6398,8 +6400,8 @@ def _interpretar(question: str, eps: str | None, contexto: str = "", quem: str =
     def chamar(texto: str) -> str:
         if TOQAN_INTERPRETE_KEY:
             conv, req = create_conversation(texto, TOQAN_INTERPRETE_KEY)
-            return get_answer(conv, req, api_key=TOQAN_INTERPRETE_KEY, max_attempts=INTERACTIVE_MAX_POLLS)
-        return ask_toqan(texto + "\n\nNÃO chame subagentes.", max_attempts=INTERACTIVE_MAX_POLLS)
+            return get_answer(conv, req, api_key=TOQAN_INTERPRETE_KEY, max_attempts=INTERPRETE_MAX_POLLS)
+        return ask_toqan(texto + "\n\nNÃO chame subagentes.", max_attempts=INTERPRETE_MAX_POLLS)
 
     try:
         raw = chamar(corpo)
@@ -6479,12 +6481,161 @@ def _interpretacoes_txt(n: int = 10) -> str:
         leitura = (f"{it.get('intencao')}/{it.get('visao') or '—'} · {','.join(it.get('indicadores') or []) or '—'} · "
                    f"{it.get('fila') or it.get('eps') or '—'} · {(it.get('periodo') or {}).get('rotulo') or '—'}"
                    if it else f"⚠️ {e.get('erro')}")
+        if e.get("canon"):
+            leitura += f" · ➡️ virou: _{e['canon']}_"
         if it and it.get("duvida"):
             leitura += f" · ❓ perguntaria: {it['duvida']}"
         if it and it.get("herdado"):
             leitura += f" · 🔗 {it['herdado']}"
         linhas.append(f"• {e.get('t')} · _{e.get('q')}_\n   app: `{e.get('rota')}` · IA: {leitura}")
     return "\n".join(linhas)
+
+
+# --- Passo 2: o intérprete decide (INTERPRETE_MODE=on). A leitura vira uma pergunta canônica, escrita do jeito que as
+# consultas prontas entendem sem ambiguidade; dúvida vira pergunta da Lyra; leitura fraca cai nas regras de antes. ----
+INTERPRETE_MIN_CONF = float(os.getenv("INTERPRETE_MIN_CONF", "0.6"))
+INTERPRETE_DUVIDA_CONF = float(os.getenv("INTERPRETE_DUVIDA_CONF", "0.8"))  # acima disso, não pergunta: segue
+
+
+def _periodo_canonico(per: dict[str, Any] | None) -> str:
+    if not per:
+        return ""
+    try:
+        ini, fim = date.fromisoformat(str(per["inicio"])), date.fromisoformat(str(per["fim"]))
+    except (KeyError, ValueError):
+        return ""
+    hoje = _as_date(_today_brazil())
+    d1 = hoje - timedelta(days=1)
+    if ini == fim:
+        return "ontem" if fim == d1 else f"dia {fim.strftime('%d/%m')}"
+    prox = date(ini.year + (ini.month == 12), ini.month % 12 + 1, 1)
+    fim_mes = prox - timedelta(days=1)
+    if ini.day == 1 and fim == d1 and ini.month == d1.month and ini.year == d1.year:
+        return ""  # mês atual até ontem: é o padrão de todas as rotas
+    if ini.day == 1 and fim == fim_mes:
+        return _MESES[ini.month - 1]
+    if fim == d1 and (fim - ini).days == 6:
+        return "semana"
+    return f"{ini.strftime('%d/%m')} a {fim.strftime('%d/%m')}"
+
+
+def _pergunta_canonica(it: dict[str, Any], original: str) -> str | None:
+    """A leitura do intérprete escrita do jeito que as rotas prontas entendem. None = deixa a pergunta original."""
+    visao = it.get("visao")
+    inds = [i for i in ("csat", "tma", "sla") if i in (it.get("indicadores") or [])]
+    todos_ind = set(inds) == {"csat", "tma", "sla"}
+    ind_txt = "" if todos_ind else " e ".join(i.upper() for i in inds)
+    if it.get("lider"):
+        rec = f"da equipe de {it['lider']}"
+    elif it.get("minha_equipe"):
+        rec = "da minha equipe"
+    elif it.get("fila"):
+        rec = f"da {it['fila']}"
+    elif it.get("eps"):
+        rec = f"da {it['eps']}"
+    else:
+        rec = ""
+    per = _periodo_canonico(it.get("periodo"))
+    arq = " em planilha excel" if it.get("formato") == "planilha" else ""
+    todos = " abertura de todos" if it.get("todos") else ""
+    t = _norm_text(original)
+    quem = ("supervisores" if re.search(r"\b(supervisor\w*|equipes)\b", t) and not re.search(r"\b(operador\w*|analista\w*)\b", t)
+            else "operadores" if re.search(r"\b(operador\w*|analista\w*|atendente\w*)\b", t)
+            and not re.search(r"\bsupervisor\w*\b", t) else "operadores e supervisores")
+    j = lambda *xs: re.sub(r"\s+", " ", " ".join(x for x in xs if x)).strip()
+    if visao == "resultado":
+        if todos_ind:
+            return j("como ficou o resultado", rec, per)
+        if set(inds) <= {"tma", "sla"}:
+            return j("TMA e SLA", rec, per, arq)
+        return j("qual o", ind_txt, rec, per, arq)
+    if visao == "dia_a_dia":
+        return j(ind_txt, "dia a dia", rec, per, arq)
+    if visao == "motivos":
+        return j("quais motivos mais impactam", f"o {ind_txt}" if ind_txt else "", rec, per, arq)
+    if visao == "pessoas":
+        return j(f"quais {quem} mais impactam", f"o {ind_txt}" if ind_txt else "", rec, per, todos, arq)
+    if visao == "equipe":
+        return j("resultado", ind_txt, rec if rec.startswith("da equipe") or rec == "da minha equipe" else "da minha equipe",
+                 per, arq)
+    if visao == "casos":  # a lista de casos já vai em planilha
+        nome = {"csat": "os casos de CSAT", "sla": "os casos fora do SLA", "tma": "os casos de TMA"}
+        alvo = " e ".join(nome[i] for i in inds) if not todos_ind else "os casos"
+        return j("me manda", alvo, rec, per or "do mês")
+    if visao == "variacao":
+        per_v = "essa semana" if per == "semana" else per
+        if set(inds) <= {"tma", "sla"}:  # sem "por que": é a rota de mix x performance de eficiência
+            return j("variação do", ind_txt, rec, per_v, "o que mudou", arq)
+        if inds == ["csat"]:
+            return j("por que o CSAT", rec, "mudou", per_v, arq)
+        return j("por que", rec, "caiu", per_v, arq)  # sem indicador = CSAT, TMA e SLA
+    if visao == "anomalia":
+        return j("o que teve de anormal", f"no {ind_txt}" if ind_txt else "", rec, per)
+    if visao == "treinamento":
+        return j("quais motivos devo treinar", rec, f"pra melhorar o {ind_txt}" if ind_txt else "")
+    return None
+
+
+def _it_periodos(event: dict[str, Any]) -> tuple[tuple[date, date], tuple[date, date], str, str] | None:
+    """Períodos da variação lidos pelo intérprete: o período pedido x o "comparar com" (ou, se não disse, o período
+    imediatamente anterior de mesmo tamanho; mês fechado x mês anterior fechado)."""
+    it = event.get("_it") or {}
+    per, cmp_ = it.get("periodo"), it.get("comparar_com")
+    if not per:
+        return None
+    try:
+        ini, fim = date.fromisoformat(per["inicio"]), date.fromisoformat(per["fim"])
+        if cmp_:
+            r_ini, r_fim = date.fromisoformat(cmp_["inicio"]), date.fromisoformat(cmp_["fim"])
+        elif ini.day == 1 and (fim + timedelta(days=1)).day == 1:  # mês fechado
+            r_fim = ini - timedelta(days=1)
+            r_ini = r_fim.replace(day=1)
+        else:
+            dias = (fim - ini).days + 1
+            r_fim = ini - timedelta(days=1)
+            r_ini = r_fim - timedelta(days=dias - 1)
+    except (KeyError, ValueError, TypeError):
+        return None
+    fmt = lambda a, b: a.strftime("%d/%m") if a == b else f"{a.strftime('%d/%m')}–{b.strftime('%d/%m')}"
+    return (ini, fim), (r_ini, r_fim), (per.get("rotulo") or fmt(ini, fim)), ((cmp_ or {}).get("rotulo") or fmt(r_ini, r_fim))
+
+
+def _aplicar_interpretacao(question: str, event: dict[str, Any], eps: str | None, say: Callable[..., Any],
+                           in_thread: bool) -> tuple[str, bool]:
+    """(pergunta a seguir, já respondeu?). Só age com leitura confiante de pedido de dados/análise; o resto segue as
+    regras de antes (processo, ação, conversa, leitura fraca ou falha do intérprete)."""
+    if INTERPRETE_MODE != "on" or not question.strip():
+        return question, False
+    t0 = time.time()
+    ctx = _conversa_ctx(event)
+    it, raw = _interpretar(question, eps, ctx, _speaker_line(event))
+    entry = {"t": _now_brazil().strftime("%d/%m %H:%M"), "c": str(event.get("channel") or ""), "q": _mask_pii(question)[:200],
+             "it": it, "erro": None if it else str(raw)[:200], "s": round(time.time() - t0, 1)}
+    resultado = (question, False)
+    if it:
+        conf = float(it.get("confianca") or 0)
+        event["_it"] = it
+        if it.get("duvida") and conf < INTERPRETE_DUVIDA_CONF:
+            event["_route"] = "interprete_duvida"
+            _say(say, str(it["duvida"]), event, True)
+            entry["rota"] = "pergunta da Lyra"
+            resultado = (question, True)
+        elif it.get("intencao") in {"dados", "analise"} and conf >= INTERPRETE_MIN_CONF:
+            canon = _pergunta_canonica(it, question)
+            if canon:
+                event["_orig_q"] = question
+                event["_canon"] = canon
+                entry["canon"] = canon
+                resultado = (canon, False)
+    entry.setdefault("rota", "regras" if resultado[0] == question else "intérprete")
+    try:
+        with _INTERPRETE_LOCK:
+            log = json.loads(STATE.get(INTERPRETE_LOG_KEY) or "[]")
+            log.append(entry)
+            STATE.set(INTERPRETE_LOG_KEY, json.dumps(log[-INTERPRETE_LOG_MAX:], ensure_ascii=False))
+    except Exception:
+        logger.warning("Log do intérprete falhou", exc_info=True)
+    return resultado
 
 
 # --- variação e motivos de CSAT por SQL fixo -----------------------------------
@@ -10015,7 +10166,7 @@ def _scope_rows(rows: list[dict[str, Any]], eps: str | None) -> list[dict[str, A
 _TABLE_BLOCK_RE = re.compile(r"\b(motivo|motivos|operador\w*|analista\w*|atendente\w*|quem|nomes?|nominal|supervisor\w*|coordenador\w*|"
                              r"equipe|por que|porque|pq|semana|semanal|tma|sla|nps|reabertura|volume|grafico|excel|"
                              r"planilha|quadrante|q4|reincid\w*|ofensor\w*|dispersao|compar\w*|evolucao|tendencia|turno\w*|horari\w*|"
-                             r"por hora|faixa\w*|regia\w*|cidade\w*|produto\w*|diari\w*|dia a dia|por dia|cada dia|"
+                             r"por hora|faixa\w*|regia\w*|cidade\w*|produto\w*|diari\w*|dia a dia|por dia|cada dia|casos?|tickets?|"
                              r"\d{1,2}/\d{1,2}|bu|food|multi)\b")
 _TABLE_RESULT_RE = re.compile(r"\b(resultado|csat|como (esta|estao|ta|tao|foi|foram|anda|andam))\b")
 _TABLE_IMPACT_RE = re.compile(r"\b(mais impacta\w*|maior impacto|mais impacto|impacta mais|pior|piores|"
@@ -10750,7 +10901,8 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             event["_route"] = "interprete_log"
             _say(say, _interpretacoes_txt(), event, True)
             return
-        if eps is None and _DIAG_RE.search(_norm_text(question)):
+        admin = str(event.get("user") or "") in ADMIN_USERS
+        if (eps is None or admin) and _DIAG_RE.search(_norm_text(question)):
             event["_route"] = "diagnostico"
             _say_sections(say, _diagnostics_text(), event, in_thread)
             return
@@ -10770,6 +10922,12 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 return
         except Exception:
             logger.warning("Learning handling failed", exc_info=True)
+        try:  # passo 2: com INTERPRETE_MODE=on, a IA lê o pedido e escreve a pergunta do jeito que as consultas entendem
+            question, ja_respondeu = _aplicar_interpretacao(question, event, eps, say, in_thread)
+            if ja_respondeu:
+                return
+        except Exception:
+            logger.warning("Intérprete (on) falhou; seguindo pelas regras", exc_info=True)
         if _TRAINING_RE.search(_norm_text(question)):
             thread_txt = _thread_context(event) if event.get("thread_ts") else ""
             fila_t = (_fila_in_question(question, eps) or (_status_fila(question, eps) if eps else None)
@@ -10834,7 +10992,7 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
         efic_extra = ""
         # continuação na thread sem dizer o indicador ("quero a abertura diária só da Super Cliente"): herda o da conversa
         tq0 = _norm_text(question)
-        if ((event.get("thread_ts") or event.get("channel_type") == "im")
+        if (not event.get("_canon") and (event.get("thread_ts") or event.get("channel_type") == "im")
                 and not re.search(r"\b(csat|tma|sla|nota\w*|primeira resposta|avaliac\w*)\b", tq0)
                 and _FOLLOWUP_DADOS_RE.search(tq0)):
             ctx0 = _conversa_ctx(event)[-4000:]
@@ -10881,13 +11039,19 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 return
         if not efic_extra and _is_efic_variacao_request(question) and (asks or not in_report_thread):
             event["_route"] = "efic_variacao"
-            ind_v = _efic_indicator(question) or "tma"
-            _say(say, f"Vou separar o que mudou no {ind_v.upper()} entre mix (o que chegou) e performance (o atendimento). "
-                      "Já te trago ⏳", event, in_thread=True)
-            resp_v = _send_efic_variacao(event, client, eps, question, progress)
-            progress.done()
-            if resp_v:
-                _say_sections(say, resp_v, event) if resp_v.startswith(("⏱️", "⏰")) else _say(say, resp_v, event, in_thread=True)
+            inds_v = [i for i in ("tma", "sla") if i in _inds_citados(question)] or [_efic_indicator(question) or "tma"]
+            _say(say, f"Vou separar o que mudou no {' e no '.join(i.upper() for i in inds_v)} entre mix (o que chegou) e "
+                      "performance (o atendimento). Já te trago ⏳", event, in_thread=True)
+            try:
+                for ind_v in inds_v:
+                    q_v = re.sub(r"(?i)\b(tma|sla)\b(\s+e\s+\b(tma|sla)\b)?", ind_v.upper(), question, count=1)
+                    resp_v = _send_efic_variacao(event, client, eps, q_v, progress, _it_periodos(event),
+                                                 (event.get("_it") or {}).get("fila"))
+                    if resp_v:
+                        _say_sections(say, resp_v, event) if resp_v.startswith(("⏱️", "⏰")) else _say(
+                            say, resp_v, event, in_thread=True)
+            finally:
+                progress.done()
             return
         if (not efic_extra and _DIARIO_RE.search(_norm_text(question)) and not _inds_citados(question)
                 and not re.search(r"\b(operador\w*|analista\w*|supervisor\w*|equipe|casos?|motivos?)\b", _norm_text(question))):
@@ -11127,7 +11291,7 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                            f"Vou levantar as causas em `{fila_v}`: primeiro a variação (mix de motivos e response rate); "
                            "se não for só mix, em seguida a esteira de impacto por pilar. Leva alguns minutos ⏳"),
                      event, in_thread=True)
-                cur, ref, l_cur, l_ref = _variation_periods(f"{question} ontem" if d1_ctx else question)
+                cur, ref, l_cur, l_ref = _it_periodos(event) or _variation_periods(f"{question} ontem" if d1_ctx else question)
                 var_data = {}
                 if CSAT_SQL_FIXO == "on":
                     var_data = _csat_variacao_fixa(eps, fila_v, cur, ref, send_progress) or {}
@@ -11157,6 +11321,17 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                          "Produto) é postada separadamente pelo app nesta thread. NÃO chame a Lyra Qualidade e NÃO liste pilares: "
                          "chame só a Lyra Indicadores (Pedido: variação do CSAT) e responda a variação (efeito mix x performance "
                          "e response rate). Feche com 1 frase sobre o que é da EPS cobrar.\n\n")
+        if not extra and _is_anomalia_request(question):
+            event["_route"] = "anomalia"
+            dia_a = _anomalia_dia(question, event)
+            fila_a = _fila_in_question(question, eps) or _fila_ref(question, eps, event)
+            if not fila_a and re.search(r"\bsuper\b", _norm_text(question)) and eps:
+                fila_a = f"CX Super Cliente - {eps}" if _compact(eps) in {"aec", "csu"} else None
+            send_progress(f"Vou levantar o que fugiu do normal em {dia_a.strftime('%d/%m')}"
+                          + (f" na `{fila_a}`" if fila_a else "") + " (CSAT, TMA e SLA contra os dias anteriores). ⏳")
+            pack = _anomalia_pack(eps, fila_a, dia_a, _inds_citados(question) or {"csat", "tma", "sla"})
+            if pack:
+                extra = ANOMALIA_INSTRUCTION + "DADOS:\n" + pack + "\n\n"
         if not extra and (_is_identity_question(question) or _identity_thread(event, question)):
             extra = IDENTITY_INSTRUCTION
             event["_route"] = "apresentacao"
@@ -11171,17 +11346,6 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 _norm_text(question)) and not re.search(r"\bcsat\b", _norm_text(question)):
             extra = EFICIENCIA_INSTRUCTION
             event["_route"] = "eficiencia"
-        elif not extra and _is_anomalia_request(question):
-            event["_route"] = "anomalia"
-            dia_a = _anomalia_dia(question, event)
-            fila_a = _fila_in_question(question, eps) or _fila_ref(question, eps, event)
-            if not fila_a and re.search(r"\bsuper\b", _norm_text(question)) and eps:
-                fila_a = f"CX Super Cliente - {eps}" if _compact(eps) in {"aec", "csu"} else None
-            send_progress(f"Vou levantar o que fugiu do normal em {dia_a.strftime('%d/%m')}"
-                          + (f" na `{fila_a}`" if fila_a else "") + " (CSAT, TMA e SLA contra os dias anteriores). ⏳")
-            pack = _anomalia_pack(eps, fila_a, dia_a, _inds_citados(question) or {"csat", "tma", "sla"})
-            if pack:
-                extra = ANOMALIA_INSTRUCTION + "DADOS:\n" + pack + "\n\n"
         elif not extra and _MOTIVOS_RE.search(_norm_text(question)):
             extra = MOTIVOS_INSTRUCTION
             event["_route"] = "motivos"
@@ -11220,7 +11384,9 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             event["_route"] = event.get("_route") or f"livre:{shape['key']}"
             _catalog_log(shape, question, event)
         context = _thread_context(event) or _dm_context(event)
-        prompt = (f"{_scope_instruction(eps)}\n\n{_speaker_line(event)}{_date_context(question)}{context}{extra}"
+        orig_line = (f"INFORMAÇÃO INTERNA PARA A LYRA — a pessoa escreveu: \"{event['_orig_q']}\". Entendi como: "
+                     f"\"{question}\". Responda ao que ela escreveu, no jeito dela.\n\n" if event.get("_orig_q") else "")
+        prompt = (f"{_scope_instruction(eps)}\n\n{_speaker_line(event)}{orig_line}{_date_context(question)}{context}{extra}"
                   f"{DEFAULTS_INSTRUCTION if not extra else ''}{FREE_ANALYSIS_INSTRUCTION if shape else ''}{FULL_ACCESS_INSTRUCTION if _operator_names_allowed(eps) else ''}"
                   f"{ANSWER_LAYOUT_INSTRUCTION}{_learnings_instruction(eps)}{_table_context(eps)}"
                   f"{_inject_mop_context(question, eps)}"
