@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.41.0"
+APP_VERSION = "5.41.1"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -759,6 +759,11 @@ def _dm_scope(user: str) -> tuple[bool, str | None]:
     elif any(domain == d or domain.endswith("." + d) for d in DM_ALLOWED_DOMAINS):
         result = (True, None)
     _DM_SCOPE_CACHE[user] = result
+    try:  # quem entra na DM e com qual visão (uma vez por pessoa a cada deploy), para o time conferir acessos
+        _alert(f"🔐 DM da Lyra: <@{user}> ({email}) → "
+               + ("visão completa do iFood" if result == (True, None) else f"só a {result[1]}" if result[0] else "bloqueada"))
+    except Exception:
+        logger.warning("DM access alert failed", exc_info=True)
     return result
 
 
@@ -2941,6 +2946,27 @@ def _xlsx_sheet(wb: Any, title: str, header: list[str], rows: list[list[Any]], w
         ws.auto_filter.ref = ws.dimensions
 
 
+def _case_list_alvos(event: dict[str, Any], eps: str | None, question: str) -> tuple[list[tuple[str | None, str]], str]:
+    """Antes de avisar que vai montar a base: para quais (EPS, pergunta) montar, ou o que perguntar de volta.
+    Na visão iFood, "da review" / "da super" vale para as duas EPSs (uma base de cada)."""
+    tq = _norm_text(question)
+    fila = _fila_in_question(question, eps) or (_fila_ref(question, eps, event) if not _TEAM_RE.search(tq) else None)
+    if fila:
+        return [(eps, question)], ""
+    if _TEAM_RE.search(tq):
+        return [(eps, question)], ""  # a equipe (ou a pergunta de volta) é resolvida no _send_case_list
+    if eps is None:
+        qn = _norm_text(f"{question} {event.get('_orig_q') or ''}")
+        for pal, chave in ((r"review\w*|revis\w* cx", "review"), (r"super\w*|platin\w*|vip", "cx super cliente")):
+            if re.search(rf"\b({pal})\b", qn):
+                hits = [(e, f) for e, cel in EPS_CELULAS.items() for f in cel if chave in _norm_text(f)]
+                if len(hits) > 1:
+                    event["_case_ifood"] = True  # visão iFood dividida por EPS: mantém o acesso do iFood (e-mail do operador)
+                    return [(e, f"{question} ({f})") for e, f in hits], ""
+    return [], ("Monto sim! De qual fila ou equipe? (ex.: \"Super Cliente\" ou \"equipe da Supervisora 3\"). Trago caso a "
+                "caso e a abertura por operador.")
+
+
 def _send_case_list(event: dict[str, Any], client: Any, eps: str | None, question: str) -> str | None:
     ind = _case_indicator(question)
     fila = _fila_in_question(question, eps) or (
@@ -2958,7 +2984,7 @@ def _send_case_list(event: dict[str, Any], client: Any, eps: str | None, questio
         f"Só estes operadores (e-mails): {', '.join(team[:400])}\n" if team else "")
     base = (f"{_scope_instruction(eps)}\n\nTAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Chame a *Lyra Indicadores* com exatamente:\nEPS: {eps or 'iFood'}\n"
             # base caso a caso e abertura por operador servem para a liderança agir: o operador vem identificado (e-mail)
-            + ("Acesso: completo\nLista: completa\n" if _operator_names_allowed(eps) else ""))
+            + ("Acesso: completo\nLista: completa\n" if _operator_names_allowed(eps) or event.get("_case_ifood") else ""))
     fim = "Devolva SOMENTE o CSV que ela responder (ou a linha ERRO:), sem comentar."
     if ind == "csat":
         p_casos = (base + f"Pedido: avaliações detalhadas (CSV)\n{filtro}Período: {spec['cur']}\nNotas: "
@@ -11164,17 +11190,25 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             event["_route"] = "avaliacoes"
             todos_ind = not _inds_citados(question)
             nomes_ind = {'csat': 'CSAT', 'sla': 'SLA de 1ª resposta', 'tma': 'TMA'}
-            _say(say, ("Vou montar a base caso a caso de CSAT, SLA de 1ª resposta e TMA (uma planilha de cada) e a abertura "
-                       "por operador. Leva alguns minutos ⏳" if todos_ind else
-                       f"Vou montar a base caso a caso de {nomes_ind[_case_indicator(question)]} e a abertura por operador. "
-                       "Leva alguns minutos ⏳"), event, in_thread=True)
+            alvos, pergunta_volta = _case_list_alvos(event, eps, question)
+            if not alvos:  # pergunta antes de prometer a base
+                progress.done()
+                _say(say, pergunta_volta, event, in_thread=True)
+                return
+            de_quem = (" da " + " e da ".join(_fila_in_question(q, e) or e or "" for e, q in alvos) + " (uma de cada)"
+                       if len(alvos) > 1 else "")
+            _say(say, (f"Vou montar a base caso a caso de CSAT, SLA de 1ª resposta e TMA{de_quem} (uma planilha de cada "
+                       "indicador) e a abertura por operador. Leva alguns minutos ⏳" if todos_ind else
+                       f"Vou montar a base caso a caso de {nomes_ind[_case_indicator(question)]}{de_quem} e a abertura por "
+                       "operador. Leva alguns minutos ⏳"), event, in_thread=True)
             try:
-                for q_ind in ([f"{question} (csat)", f"{question} (sla)", f"{question} (tma)"] if todos_ind else [question]):
-                    problem = _send_case_list(event, client, eps, q_ind)
-                    if problem:
-                        _say(say, problem, event, in_thread=True)
-                        if "De qual fila ou equipe" in problem:
-                            break
+                for eps_a, q_a in alvos:
+                    for q_ind in ([f"{q_a} (csat)", f"{q_a} (sla)", f"{q_a} (tma)"] if todos_ind else [q_a]):
+                        problem = _send_case_list(event, client, eps_a, q_ind)
+                        if problem:
+                            _say(say, problem, event, in_thread=True)
+                            if "De qual fila ou equipe" in problem or "De qual equipe" in problem:
+                                break
             finally:
                 progress.done()
             return
