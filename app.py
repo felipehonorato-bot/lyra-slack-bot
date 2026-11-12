@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.41.1"
+APP_VERSION = "5.41.2"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -8298,6 +8298,61 @@ def _d1_context(question: str, event: dict[str, Any]) -> bool:
     return bool(d1) and (not mes or d1[-1] > mes[-1])
 
 
+_QUEDA_RE = re.compile(r"\b(caiu|cair|caindo|piorou|piorando|pior|derrub\w*|queda|baixou|despencou|afundou)\b")
+_ALTA_RE = re.compile(r"\b(subiu|subindo|melhorou|melhorando|melhor|aument\w*|cresceu)\b")
+
+
+def _variacao_resumo(fila: str, question: str, var_data: dict[str, Any], efic_out: dict[str, Any],
+                     l_cur: str, l_ref: str) -> str:
+    """Abre a resposta de "por que caiu/subiu?" respondendo à pergunta: confirma ou corrige a premissa com os números
+    (CSAT, TMA e SLA contra o período anterior) antes do detalhe de cada indicador."""
+    partes, piorou, melhorou = [], [], []
+    c_ref, c_cur = _num(var_data.get("csat_ref")), _num(var_data.get("csat_atual"))
+    if c_ref is not None and c_cur is not None:
+        d = c_cur - c_ref
+        verbo = "ficou estável" if abs(d) < 0.05 else ("subiu" if d > 0 else "caiu")
+        partes.append(f"o CSAT {verbo} ({_bfmt(c_ref)}% → {_bfmt(c_cur)}%"
+                      + ("" if abs(d) < 0.05 else f", {'+' if d > 0 else '−'}{_bfmt(abs(d))} p.p.") + ")")
+        (melhorou if d >= 0.05 else piorou if d <= -0.05 else []).append("CSAT")
+        mix, perf = _num(var_data.get("mix_pp")), _num(var_data.get("performance_pp"))
+        if mix is not None and perf is not None and abs(d) >= 0.5:
+            partes[-1] += (", mais pelo atendimento do que pelo tipo de contato" if abs(perf) >= abs(mix)
+                           else ", mais pelo tipo de contato que chegou do que pelo atendimento")
+    for ind, unidade in (("TMA", "s"), ("SLA", "p.p.")):
+        txt = str(efic_out.get(ind) or "")
+        m = re.search(r"\*?([\d.,]+)\s*(?:s|%)\*?\s*→\s*\*?([\d.,]+)\s*(?:s|%)\*?\s*\(([+−-])([\d.,]+)", txt)
+        if not m:
+            continue
+        sinal, val = (-1 if m.group(3) in "−-" else 1), m.group(4)
+        try:
+            dv = sinal * float(val.replace(".", "").replace(",", "."))
+        except ValueError:
+            continue
+        if ind == "TMA":
+            bom = dv < -0.5
+            ruim = dv > 0.5
+            partes.append(f"o TMA {'subiu' if dv > 0 else 'caiu'} {val} s ({m.group(1)} s → {m.group(2)} s"
+                          f"{', melhor' if bom else ', pior' if ruim else ''})")
+        else:
+            bom, ruim = dv >= 0.05, dv <= -0.05
+            partes.append(f"o SLA {'subiu' if dv > 0 else 'caiu'} {val} p.p. ({m.group(1)}% → {m.group(2)}%)")
+        (melhorou if bom else piorou if ruim else []).append(ind)
+    if not partes:
+        return ""
+    lista = "; ".join(partes)
+    lista = lista[0].upper() + lista[1:]
+    comp = f"{l_cur} contra {l_ref}"
+    t = _norm_text(question)
+    if _QUEDA_RE.search(t) and not piorou:
+        return (f"💡 *Na verdade a `{fila}` não caiu* ({comp}). {lista}.\n\nSe você viu queda num dia específico ou "
+                "em outro recorte, me diz qual que eu olho. Abaixo, o detalhe de cada indicador.")
+    if _ALTA_RE.search(t) and not _QUEDA_RE.search(t) and not melhorou and piorou:
+        return f"💡 *Na verdade a `{fila}` não melhorou* ({comp}). {lista}.\n\nAbaixo, o detalhe de cada indicador."
+    if _QUEDA_RE.search(t):
+        return (f"💡 *Caiu sim no {' e no '.join(piorou)}* ({comp}). {lista}.\n\nAbaixo, o que explica cada um.")
+    return f"💡 *Resumo · `{fila}`* ({comp}). {lista}.\n\nAbaixo, o detalhe de cada indicador."
+
+
 def _above_meta_note(fila: str | None, eps: str | None, kind: str) -> str | None:
     """Fila que bateu a própria meta no período: explica que o impacto negativo no consolidado é de peso (fila de meta
     baixa), não de desempenho, e aponta quem ficou abaixo da própria meta. None = fila abaixo da meta (segue a análise)."""
@@ -11409,12 +11464,13 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                     return
                 if note:  # com o intérprete: diz isso E responde o "caiu?" de verdade (variação de CSAT, TMA e SLA)
                     nota_curta = "\n".join(l for l in note.split("\n") if not l.startswith(("Quem ficou abaixo", "Todas as filas")))
-                    _say(say, nota_curta.strip() + "\n\nMesmo assim, vou ver se ela caiu "
-                         "em relação ao período anterior e por quê. ⏳", event, in_thread=True)
-                _say(say, (f"Vou olhar o mix de motivos de `{fila_v}` (este mês x referência). Já te trago ⏳" if mix_only else
-                           f"Vou levantar as causas em `{fila_v}`: primeiro a variação (mix de motivos e response rate); "
-                           "se não for só mix, em seguida a esteira de impacto por pilar. Leva alguns minutos ⏳"),
-                     event, in_thread=True)
+                    _say(say, nota_curta.strip() + "\n\nVou comparar com o período anterior pra ver se ela caiu e por quê "
+                         "(CSAT, TMA e SLA). Leva alguns minutos ⏳", event, in_thread=True)
+                else:
+                    _say(say, (f"Vou olhar o mix de motivos de `{fila_v}` (este mês x referência). Já te trago ⏳" if mix_only else
+                               f"Vou levantar as causas em `{fila_v}`: primeiro a variação (mix de motivos e response rate); "
+                               "se não for só mix, em seguida a esteira de impacto por pilar. Leva alguns minutos ⏳"),
+                         event, in_thread=True)
                 cur, ref, l_cur, l_ref = _it_periodos(event) or _variation_periods(f"{question} ontem" if d1_ctx else question)
                 efic_out: dict[str, Any] = {}
                 efic_ths = []
@@ -11441,6 +11497,17 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 progress.done()
                 rendered = _render_variation(fila_v, var_data, l_cur, l_ref, with_esteira=not mix_only) if var_data else None
                 if rendered:
+                    if efic_ths:  # responde primeiro à pergunta ("caiu?") com os três indicadores, depois o detalhe
+                        for th in efic_ths:
+                            th.join(timeout=600)
+                        try:
+                            resumo = _variacao_resumo(fila_v, event.get("_orig_q") or question, var_data, efic_out,
+                                                      l_cur, l_ref)
+                        except Exception:
+                            logger.warning("Resumo da variação falhou", exc_info=True)
+                            resumo = ""
+                        if resumo:
+                            _say(say, resumo, event, in_thread=True)
                     _say_sections(say, rendered, event)
                     rose = (_num(var_data.get("csat_atual")) or 0) >= (_num(var_data.get("csat_ref")) or 0)
                     if not mix_only and not _mix_dominant(var_data) and not rose:
