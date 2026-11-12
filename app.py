@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.41.3"
+APP_VERSION = "5.41.4"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -3327,6 +3327,9 @@ APP_SQL_MAX_CONCURRENT = int(os.getenv("APP_SQL_MAX_CONCURRENT", "2"))
 APP_SQL_RETRIES = int(os.getenv("APP_SQL_RETRIES", "3"))
 APP_SQL_RETRY_WAIT_S = int(os.getenv("APP_SQL_RETRY_WAIT_S", "20"))
 _APP_SQL_SLOTS = threading.BoundedSemaphore(APP_SQL_MAX_CONCURRENT)
+# Erro de análise num SQL pronto (que já roda certo) = a Indicadores mexeu no texto ao executar: vale tentar de novo.
+_APP_SQL_MEXIDO_RE = re.compile(r"MISSING_AGGREGATION|PARSE_SYNTAX_ERROR|UNRESOLVED_(COLUMN|ROUTINE)|"
+                                r"AMBIGUOUS_REFERENCE|DATATYPE_MISMATCH|SQLSTATE: 42", re.I)
 _APP_SQL_BUSY_RE = re.compile(r"admission timeout|acquiring slot|too many (concurrent|queued)|queue (is )?full|"
                               r"warehouse .*(busy|overloaded)|rate limit", re.I)
 
@@ -3343,7 +3346,8 @@ def _run_app_sql(filled: str, progress: Callable[[str], Any] | None, nome: str,
              "sem separador de milhar. Se a execução falhar, devolva só: ERRO: <mensagem do Databricks>.\n\n```sql\n"
              + filled + "\n```")
     ans = ""
-    for tentativa in range(APP_SQL_RETRIES + 1):
+    refez = False
+    for tentativa in range(APP_SQL_RETRIES + 2):
         try:
             with _APP_SQL_SLOTS:  # poucas consultas ao mesmo tempo: o warehouse recusa quando lota ("admission timeout")
                 if TOQAN_INDICADORES_KEY:
@@ -3356,7 +3360,11 @@ def _run_app_sql(filled: str, progress: Callable[[str], Any] | None, nome: str,
                                     max_attempts=INTERACTIVE_MAX_POLLS)
         except Exception as exc:
             return None, f"A consulta falhou ({str(exc)[:120]})."
-        if not _APP_SQL_BUSY_RE.search(str(ans)) or tentativa == APP_SQL_RETRIES:
+        if _APP_SQL_MEXIDO_RE.search(str(ans)) and not refez:  # uma vez só, numa conversa nova
+            refez = True
+            logger.warning("%s: erro de SQL num SQL pronto (a Indicadores alterou?); tentando de novo", nome)
+            continue
+        if not _APP_SQL_BUSY_RE.search(str(ans)) or tentativa >= APP_SQL_RETRIES:
             break
         logger.info("%s: warehouse lotado, tentando de novo em %ss", nome, APP_SQL_RETRY_WAIT_S)
         time.sleep(APP_SQL_RETRY_WAIT_S)
@@ -5084,6 +5092,7 @@ def _csat_sql(nome: str, ini: date, fim: date, params: dict[str, str]) -> str | 
            .replace("{base_inicio}", ini.isoformat()).replace("{base_fim}", fim.isoformat()))
     for k, v in params.items():
         sql = sql.replace("{" + k + "}", v)
+    sql = sql.replace("{op_ini}", "1")  # paginação: sem página pedida, começa do primeiro
     return _compact_sql(sql)
 
 
@@ -5103,6 +5112,8 @@ def _csat_fixed_rows(nome: str, ini: date, fim: date, params: dict[str, str], pr
 
 
 # --- quem mais impacta: operador e supervisor ---------------------------------
+PESSOAS_PAGINA = int(os.getenv("PESSOAS_PAGINA", "200"))  # operadores por consulta na lista completa
+PESSOAS_PAGINAS_MAX = 6
 _PESSOAS_RE = re.compile(r"\b(operador\w*|analista\w*|atendente\w*|supervisor\w*|supervisora\w*|coordenador\w*|"
                          r"equipes?|times)\b")
 _PESSOAS_IMPACTO_RE = re.compile(r"\b(impact\w*|pesa\w*|puxa\w*|ofensor\w*|derrub\w*|contribu\w*|consolidado|"
@@ -5325,16 +5336,35 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
     completo = bool(_ABERTURA_RE.search(t))
     quer_arquivo = bool(_WANTS_FILE_RE.search(t))
     params = _pessoas_sql_params(eps, fila, people, fim, emails, d1)
-    if completo or quer_arquivo:  # todos os operadores (a lista completa vai na planilha)
-        params["top_ops"] = "5000"
-    rows, problema = _csat_fixed_rows("csat_pessoas.sql", ini, fim, params, progress, f"CSAT por operador ({ini} a {fim})")
 
     def _usavel(rs: list[dict[str, str]] | None) -> bool:
         tipos = {r.get("tipo", "").upper() for r in (rs or [])}
         return "TOTAL" in tipos and bool(tipos & {"OP", "SUP"})
 
-    lista_cortada = ""
-    for menor in ("300", "50"):  # a lista inteira não voltou (ou voltou cortada): tenta os que mais pesam
+    rows, problema, lista_cortada = None, "", ""
+    if completo or quer_arquivo:  # todos os operadores: a lista vem em páginas (uma resposta só não cabe)
+        vistos: set[tuple[str, str]] = set()
+        for pag in range(PESSOAS_PAGINAS_MAX):
+            p_ini = pag * PESSOAS_PAGINA + 1
+            params.update(op_ini=str(p_ini), top_ops=str(p_ini + PESSOAS_PAGINA - 1))
+            rows_p, problema = _csat_fixed_rows("csat_pessoas.sql", ini, fim, params, progress,
+                                                f"CSAT por operador ({ini} a {fim}, parte {pag + 1})")
+            if not _usavel(rows_p):
+                if rows is not None:  # parte seguinte falhou: fica com o que já veio e avisa
+                    lista_cortada = str(len([r for r in rows if r.get("tipo", "").upper() == "OP"]))
+                break
+            novos = [r for r in rows_p if r.get("tipo", "").upper() == "OP"
+                     and (_compact(r.get("eps", "")), r.get("nome", "")) not in vistos]
+            vistos |= {(_compact(r.get("eps", "")), r.get("nome", "")) for r in novos}
+            rows = rows_p if rows is None else rows + novos
+            if len([r for r in rows_p if r.get("tipo", "").upper() == "OP"]) < PESSOAS_PAGINA:
+                break  # última página
+        params.update(op_ini="1", top_ops="5000" if rows is None else "300")  # nada veio: o laço abaixo tenta 300 e 50
+    else:
+        rows, problema = _csat_fixed_rows("csat_pessoas.sql", ini, fim, params, progress,
+                                          f"CSAT por operador ({ini} a {fim})")
+
+    for menor in ("300", "50"):  # a lista não voltou em páginas: tenta os que mais pesam
         if _usavel(rows) or int(params["top_ops"]) <= int(menor):
             break
         logger.warning("CSAT pessoas: top_ops=%s voltou sem as pessoas; tentando %s", params["top_ops"], menor)
@@ -5375,20 +5405,30 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
     event["_catalog"] = "csat|pessoas|impacto"
     n_ops = sum(len(c["ops"]) for _, c in calcs)
     if quer_arquivo or (completo and n_ops > 15):
+        ja_mostrado = False
         try:
+            # o texto vai antes, separado: comentário longo no upload faz o Slack repetir o arquivo. Se o ranking já
+            # está na conversa ("manda tudo num excel" logo depois), vai só a planilha.
+            ja_mostrado = quer_arquivo and "Quem mais pesa no CSAT" in _conversa_ctx(event)[-6000:]
+            if not ja_mostrado:
+                _say_sections(say, "\n\n".join(textos), event)
+                ja_mostrado = True
             (client or slack_app.client).files_upload_v2(
                 channel=event.get("channel"), thread_ts=_reply_ts(event), content=_csat_pessoas_xlsx(calcs, eps),
                 filename=f"CSAT_por_supervisor_{(fila or eps or 'iFood').replace(' ', '_')}_{ini.strftime('%d-%m')}_a_{fim.strftime('%d-%m')}.xlsx",
                 title=f"CSAT por supervisor e operador · {fila or eps or 'iFood'} · {label}",
-                initial_comment="\n\n".join(textos) + (
-                    "\n\n📎 Na planilha: todas as equipes e todos os operadores, com as fórmulas de CSAT e do impacto."
+                initial_comment=(
+                    f"📎 Aqui está: todas as equipes e todos os {_fmt_int(n_ops)} operadores do ranking, com as fórmulas de CSAT "
+                    "e do impacto."
                     if not lista_cortada else
-                    f"\n\n📎 Na planilha: todas as equipes e os {lista_cortada} operadores que mais puxam para baixo (mais os "
+                    f"📎 Aqui está: todas as equipes e os {lista_cortada} operadores que mais puxam para baixo (mais os "
                     "que mais seguram), com as fórmulas. A lista inteira não voltou da consulta agora; se precisar de "
                     "todos, me pede de novo daqui a pouco."))
             return None
         except Exception:
             logger.warning("CSAT por pessoa: upload do Excel falhou; mando só o texto", exc_info=True)
+            if ja_mostrado:
+                return "Não consegui anexar a planilha agora. Tenta de novo daqui a pouco?"
     _say_sections(say, "\n\n".join(textos), event)
     return None
 

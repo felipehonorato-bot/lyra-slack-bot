@@ -3,7 +3,7 @@
 -- (promotoras − meta × avaliações) ÷ avaliações do conjunto × 100, somando as filas em que atendeu. Supervisor = soma
 -- dos operadores dele (vínculo do MOP, mandado pelo app). Só sai o usuário do e-mail (parte antes do @).
 -- Parâmetros: {base_inicio}, {base_fim}, {lista_madrugada}, {eps_lista}, {eps_like}, {filtro_fila}, {metas_values},
--- {mop_values}, {filtro_equipe}, {min_aval}, {top_ops}.
+-- {mop_values}, {filtro_equipe}, {min_aval}, {top_ops}, {op_ini} (paginação da lista completa; padrão 1).
 {base},
 metas AS (
     SELECT fila, CAST(meta AS DOUBLE) AS meta FROM VALUES {metas_values} AS t(fila, meta)
@@ -54,7 +54,7 @@ sem_mop AS (   -- amostra de quem atendeu e não está no MOP de hoje (para o ti
 ops_rank AS (
     SELECT * FROM pessoas
     WHERE aval >= {min_aval} AND aval_meta > 0
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY eps ORDER BY imp ASC) <= {top_ops}
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY eps ORDER BY imp ASC) BETWEEN {op_ini} AND {top_ops}
          OR ROW_NUMBER() OVER (PARTITION BY eps ORDER BY imp DESC) <= 3
 )
 SELECT 'TOTAL' AS `TIPO`, eps AS `EPS`, '' AS `NOME`, '' AS `FILA`, n AS `AVALIACOES`, prom AS `PROMOTORAS`,
