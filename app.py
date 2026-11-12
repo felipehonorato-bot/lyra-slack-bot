@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.41.2"
+APP_VERSION = "5.41.3"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -3160,7 +3160,7 @@ def _mask_pii(value: str) -> str:
     """Comentário de cliente vai para a planilha sem dado pessoal (e-mail, CPF, cartão, telefone). E-mail de operador
     da EPS (if-aec/if-csu) fica."""
     v = str(value or "")
-    if re.fullmatch(r"\s*[\w.+-]+@if-(aec|csu)\.com\.br\s*", v, re.I) or re.fullmatch(r"\s*\d{6,10}\s*", v):
+    if re.fullmatch(r"\s*[\w.+-]+@[\w.-]*(aec|csu)[\w.-]*\.[a-z]{2,}\s*", v, re.I) or re.fullmatch(r"\s*\d{6,10}\s*", v):
         return v.strip()  # e-mail do operador / número do caso
     for rx, rep_ in _PII_RES:
         v = rx.sub(rep_, v)
@@ -3495,6 +3495,43 @@ def _render_capa(rows: list[dict[str, str]], eps: str | None, label: str) -> str
         linhas += ["", "💡 *Leitura*"] + [f"↳ {t}" for t in leitura[:3]]
         blocos.append("\n".join(linhas))
     return "\n\n".join(blocos)
+
+
+def _render_capa_fila(rows: list[dict[str, str]], eps: str | None, label: str, fila: str, inds: set[str]) -> str:
+    """Pergunta de uma fila ("a super tá segurando o SLA?"): responde a fila, com o indicador pedido primeiro e o
+    consolidado da EPS só como referência."""
+    eps_k = _compact(eps) if eps else None
+    alvo = [r for r in rows if _norm_text(r.get("celula", "")) == _norm_text(fila)
+            and (eps_k is None or _norm_text(r.get("eps", "")) == eps_k)]
+    if not alvo:
+        return ""
+    r = alvo[0]
+    tma, tma_p = _cv(r, "tempo atribuicao (ticket)"), _cv(r, "tempo atendimento plan (ticket)")
+    sla, corte = _cv(r, "sla"), r.get("corte sla", "")
+    sla = sla * 100 if sla is not None and sla <= 1.5 else sla
+    meta = _capa_sla_meta(fila)
+    tk, tk_p = _cv(r, "ticket unico real"), _cv(r, "ticket unico plan")
+    l_sla = l_tma = ""
+    ruim_sla = sla is not None and sla < meta
+    ruim_tma = tma is not None and bool(tma_p) and tma > tma_p + 0.5
+    if sla is not None:
+        v = (f"🔴 {_bfmt(meta - sla)} p.p. abaixo da meta {_fmt_meta(meta)}%" if ruim_sla else
+             f"🟢 {_bfmt(sla - meta)} p.p. acima da meta {_fmt_meta(meta)}%" if sla > meta else "🟢 na meta")
+        l_sla = f"• SLA de 1ª resposta{(' ' + corte) if corte else ''} *{_bfmt(sla)}%* → {v}"
+    if tma is not None:
+        v = ("⚪ plan a definir" if not tma_p else f"🔴 {_fmt_int(tma - tma_p)} s acima do plan {_fmt_int(tma_p)} s"
+             if ruim_tma else f"🟢 {_fmt_int(tma_p - tma)} s abaixo do plan {_fmt_int(tma_p)} s" if tma < tma_p - 0.5
+             else "🟢 no plan")
+        l_tma = f"• TMA *{_fmt_int(tma)} s* → {v}"
+    so_tma = inds == {"tma"}
+    ordem = [l_tma, l_sla] if so_tma else [l_sla, l_tma]
+    nome_ind = "TMA" if so_tma else "SLA" if inds == {"sla"} else "TMA e SLA"
+    ruim = (ruim_tma if so_tma else ruim_sla if inds == {"sla"} else ruim_sla or ruim_tma)
+    linhas = [f"{'🔴' if ruim else '🟢'} *{nome_ind} ·* `{fila}` *— {label}*"] + [l for l in ordem if l]
+    if tk is not None:
+        linhas.append(f"• {_fmt_int(tk)} tickets" + (f" ({'+' if tk >= tk_p else '−'}{_bfmt(abs(tk / tk_p - 1) * 100, 0)}% "
+                                                     "vs plan)" if tk_p else ""))
+    return "\n".join(linhas)
 
 
 def _capa_resumo(rows: list[dict[str, str]], eps: str | None, label: str) -> str:
@@ -3842,7 +3879,16 @@ def _send_capa(event: dict[str, Any], client: Any, eps: str | None, question: st
         return problema or "Não consegui puxar TMA e SLA agora."
     if not diaria:
         _capa_check_referencia(rows, ini, fim)
-    texto = _render_capa_diaria(rows, eps, label, celula) if diaria else _render_capa(rows, eps, label)
+    fila_q = None if diaria else (_fila_in_question(question, eps) or _fila_ref(question, eps, {}))
+    texto = ""
+    if fila_q:  # pergunta de uma fila: responde a fila (o quadro da EPS inteira vai só se pedirem)
+        inds_q = ({i for i in ((event.get("_it") or {}).get("indicadores") or []) if i in {"tma", "sla"}}
+                  or {i for i in _inds_citados(event.get("_orig_q") or question) if i in {"tma", "sla"}} or {"tma", "sla"})
+        texto = _render_capa_fila(rows, eps, label, fila_q, inds_q)
+        if texto:
+            texto += f"\n\n_Pra ver todas as filas da {eps or 'EPS'}: \"TMA e SLA da {eps or 'AeC'}\"._"
+    if not texto:
+        texto = _render_capa_diaria(rows, eps, label, celula) if diaria else _render_capa(rows, eps, label)
     if not texto:
         return "Não veio volume nesse período."
     if not re.search(r"\b(planilha|excel|xlsx|base|arquivo)\b", _norm_text(question)):
@@ -5282,9 +5328,19 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
     if completo or quer_arquivo:  # todos os operadores (a lista completa vai na planilha)
         params["top_ops"] = "5000"
     rows, problema = _csat_fixed_rows("csat_pessoas.sql", ini, fim, params, progress, f"CSAT por operador ({ini} a {fim})")
-    if rows is None and params["top_ops"] == "5000":  # a lista inteira não voltou: tenta os 50 que mais pesam
-        params["top_ops"] = "50"
+
+    def _usavel(rs: list[dict[str, str]] | None) -> bool:
+        tipos = {r.get("tipo", "").upper() for r in (rs or [])}
+        return "TOTAL" in tipos and bool(tipos & {"OP", "SUP"})
+
+    lista_cortada = ""
+    for menor in ("300", "50"):  # a lista inteira não voltou (ou voltou cortada): tenta os que mais pesam
+        if _usavel(rows) or int(params["top_ops"]) <= int(menor):
+            break
+        logger.warning("CSAT pessoas: top_ops=%s voltou sem as pessoas; tentando %s", params["top_ops"], menor)
+        params["top_ops"] = menor
         rows, problema = _csat_fixed_rows("csat_pessoas.sql", ini, fim, params, progress, f"CSAT por operador ({ini} a {fim})")
+        lista_cortada = menor
     if rows is None:
         return problema
     so_sup = bool(re.search(r"\b(supervisor\w*|supervisora\w*|equipes)\b", t)) and not re.search(
@@ -5324,8 +5380,12 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
                 channel=event.get("channel"), thread_ts=_reply_ts(event), content=_csat_pessoas_xlsx(calcs, eps),
                 filename=f"CSAT_por_supervisor_{(fila or eps or 'iFood').replace(' ', '_')}_{ini.strftime('%d-%m')}_a_{fim.strftime('%d-%m')}.xlsx",
                 title=f"CSAT por supervisor e operador · {fila or eps or 'iFood'} · {label}",
-                initial_comment="\n\n".join(textos) + "\n\n📎 Na planilha: todas as equipes e todos os operadores, com as "
-                                                      "fórmulas de CSAT e do impacto.")
+                initial_comment="\n\n".join(textos) + (
+                    "\n\n📎 Na planilha: todas as equipes e todos os operadores, com as fórmulas de CSAT e do impacto."
+                    if not lista_cortada else
+                    f"\n\n📎 Na planilha: todas as equipes e os {lista_cortada} operadores que mais puxam para baixo (mais os "
+                    "que mais seguram), com as fórmulas. A lista inteira não voltou da consulta agora; se precisar de "
+                    "todos, me pede de novo daqui a pouco."))
             return None
         except Exception:
             logger.warning("CSAT por pessoa: upload do Excel falhou; mando só o texto", exc_info=True)
@@ -5786,7 +5846,6 @@ def _render_csat_agentes_ia(rows: list[dict[str, str]], label: str) -> str:
     if not itens:
         return ""
     n_t, p_t = sum(i[1] for i in itens), sum(i[2] for i in itens)
-    mad_t = sum(i[3] for i in itens)
     csat_t = p_t / n_t * 100
     gap = csat_t - AGENTFORCE_META
     v = (f"🟢 na meta {_bfmt(AGENTFORCE_META, 0)}%" if abs(gap) < 0.05 else
@@ -5803,9 +5862,6 @@ def _render_csat_agentes_ia(rows: list[dict[str, str]], label: str) -> str:
         imp = n * (cs - csat_t) / n_t  # quanto o agente puxa o CSAT da Agentforce para cima/baixo
         linhas.append(f"{'🔴' if cs < AGENTFORCE_META - 0.05 else '🟢'} *{nome}* · CSAT *{_bfmt(cs)}%* · n={_fmt_int(n)} "
                       f"({_bfmt(peso)}% das avaliações) · {'' if abs(imp) < 0.05 else '+' if imp > 0 else '−'}{_bfmt(abs(imp))} p.p. no total")
-    if mad_t:
-        linhas += ["", f"🌙 {_fmt_int(mad_t)} dessas avaliações têm operador da Madrugada como último atendente: pela regra "
-                       "nova elas ficam com o agente de IA e não entram mais no CSAT da Madrugada."]
     linhas += ["", f"_Meta do Will: {_bfmt(AGENTFORCE_META, 0)}% (vale para cada agente e para a Agentforce CX)._"]
     return "\n".join(linhas)
 
@@ -6637,6 +6693,11 @@ def _pergunta_canonica(it: dict[str, Any], original: str) -> str | None:
         rec = f"da {it['eps']}"
     else:
         rec = ""
+        on = _norm_text(original)
+        if re.search(r"\breview\w*", on):  # visão iFood: "da review" sem EPS = as duas (a rota divide por EPS)
+            rec = "da review"
+        elif re.search(r"\b(super|platin\w*|vip)\b", on):
+            rec = "da super"
     per = _periodo_canonico(it.get("periodo"))
     arq = " em planilha excel" if it.get("formato") == "planilha" else ""
     todos = " abertura de todos" if it.get("todos") else ""
@@ -11058,7 +11119,8 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             return
         if _INTERPRETACOES_CMD_RE.match(re.sub(r"^\s*@?lyra\b[\s,:]*", "", question, flags=re.I)):
             event["_route"] = "interprete_log"
-            _say(say, _interpretacoes_txt(), event, True)
+            m_n = re.search(r"\b(\d{1,2})\b", question)
+            _say(say, _interpretacoes_txt(min(int(m_n.group(1)), 40) if m_n else 10), event, True)
             return
         admin = str(event.get("user") or "") in ADMIN_USERS
         if (eps is None or admin) and _DIAG_RE.search(_norm_text(question)):
@@ -11125,6 +11187,14 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 canal = _daylog_text([eps] if eps else list(EPS_CELULAS), limit=5) if CREAD else ""
                 _say_sections(say, news + ("\n\n" + canal if canal else "") + "\n\n" + NEWS_FOLLOWUP, event)
                 return
+        outra_eps = _eps_of_question(event.get("_orig_q") or question)
+        if eps and outra_eps and _compact(outra_eps) != _compact(eps) and not re.search(
+                rf"\b{re.escape(_norm_text(eps))}\b", _norm_text(event.get("_orig_q") or question)):
+            event["_route"] = "outra_eps"  # canal de uma EPS perguntando da outra: diz, em vez de mostrar a própria
+            progress_txt = (f"Aqui eu acompanho só a {eps} 🙂 Da {outra_eps} não consigo te mostrar por aqui. "
+                            f"Quer que eu te mostre como tá a {eps}?")
+            _say(say, progress_txt, event, in_thread=True)
+            return
         if _is_agentes_ia_request(question):
             event["_route"] = "csat_agentes_ia"
             if eps is None:
