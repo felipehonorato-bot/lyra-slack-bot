@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.39.1"
+APP_VERSION = "5.39.2"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -6316,6 +6316,24 @@ def _interprete_msg(question: str, eps: str | None, contexto: str, quem: str) ->
             f"MENSAGEM: {question.strip()}")
 
 
+_INTERPRETE_MOLDE = (
+    "PREENCHA ESTE MOLDE e devolva só ele (mesmas 15 chaves, nesta ordem, valores só dos permitidos):\n"
+    '{"intencao": "<dados|analise|processo|acao|conversa>", '
+    '"visao": "<resultado|dia_a_dia|motivos|pessoas|equipe|casos|variacao|anomalia|treinamento|outro|null>", '
+    '"indicadores": ["<csat|tma|sla>"], "eps": "<AeC|CSU|null>", "fila": "<nome exato de FILAS DA EPS|null>", '
+    '"lider": "<nome de LÍDERES DO MOP|null>", "minha_equipe": <true|false>, "pessoa": "<nome/e-mail|null>", '
+    '"periodo": {"inicio": "AAAA-MM-DD", "fim": "AAAA-MM-DD", "rotulo": "<curto>"}, '
+    '"comparar_com": <null|{"inicio": "AAAA-MM-DD", "fim": "AAAA-MM-DD", "rotulo": "<curto>"}>, '
+    '"todos": <true|false>, "formato": "<texto|planilha>", "herdado": "<o que veio da conversa>", '
+    '"duvida": <null|"pergunta curta">, "confianca": <0 a 1>}\n'
+    "Lembre: pedido de número/resultado/lista = intencao \"dados\"; porquê/anormal/o que treinar/o que cobrar = "
+    "\"analise\"; sem indicador citado = [\"csat\", \"tma\", \"sla\"]; sem período = mês atual do dia 1 até ontem.")
+_INTENCAO_SINONIMOS = {"consulta": "dados", "status": "dados", "resultado": "dados", "dado": "dados", "lista": "dados",
+                       "analis": "analise", "diagnost": "analise", "explica": "analise", "processo": "processo",
+                       "politica": "processo", "procedimento": "processo", "acao": "acao", "tarefa": "acao",
+                       "conversa": "conversa", "saudac": "conversa", "papo": "conversa", "agradec": "conversa"}
+
+
 def _parse_interpretacao(texto: str) -> dict[str, Any] | None:
     m = re.search(r"\{.*\}", texto or "", re.S)
     if not m:
@@ -6327,8 +6345,14 @@ def _parse_interpretacao(texto: str) -> dict[str, Any] | None:
             data = json.loads(re.sub(r",\s*([}\]])", r"\1", m.group(0)))
         except ValueError:
             return None
-    if not isinstance(data, dict) or data.get("intencao") not in _INTENCOES:
+    if not isinstance(data, dict):
         return None
+    if data.get("intencao") not in _INTENCOES:  # sinônimo ("consulta_status") vira o valor do molde, se tiver o resto
+        bruto = _norm_text(str(data.get("intencao") or data.get("intent") or ""))
+        alvo = next((v for k, v in _INTENCAO_SINONIMOS.items() if k in bruto), None)
+        if not alvo or ("visao" not in data and alvo in {"dados", "analise"}):
+            return None
+        data["intencao"] = alvo
     if data.get("visao") not in _VISOES:
         data["visao"] = None
     data["indicadores"] = [i for i in (data.get("indicadores") or []) if i in {"csat", "tma", "sla"}]
@@ -6360,7 +6384,7 @@ def _interpretar(question: str, eps: str | None, contexto: str = "", quem: str =
     corpo = ("TAREFA INTERNA DO APP — você NÃO está conversando com a pessoa e NÃO tem dados para consultar. Sua única "
              "tarefa é ler a MENSAGEM (e a CONVERSA) e devolver SOMENTE o JSON descrito nas regras abaixo, sem nenhuma "
              "palavra antes ou depois. Não responda a pergunta, não peça dados, não comente.\n\n"
-             + regras + "\n\n=== ENTRADA ===\n" + msg + "\n=== FIM DA ENTRADA ===\n\nDevolva agora só o JSON.")
+             + regras + "\n\n=== ENTRADA ===\n" + msg + "\n=== FIM DA ENTRADA ===\n\n" + _INTERPRETE_MOLDE)
 
     def chamar(texto: str) -> str:
         if TOQAN_INTERPRETE_KEY:
@@ -6372,8 +6396,8 @@ def _interpretar(question: str, eps: str | None, contexto: str = "", quem: str =
         raw = chamar(corpo)
         it = _parse_interpretacao(raw)
         if it is None:  # respondeu a pessoa em vez de interpretar: lembra o formato uma vez
-            raw = chamar(corpo + "\n\nATENÇÃO: sua resposta anterior não foi o JSON. Responda APENAS com o objeto JSON, "
-                                  "começando com { e terminando com }.")
+            raw = chamar(corpo + "\n\nATENÇÃO: sua resposta anterior não seguiu o molde (veio: " + str(raw)[:150]
+                         + "). Use EXATAMENTE as 15 chaves do molde, com os valores permitidos, e mais nada.")
             it = _parse_interpretacao(raw)
     except Exception as exc:
         return None, f"falhou: {exc}"
@@ -9171,6 +9195,10 @@ def _diagnostics_text() -> str:
                  + " · " + ("✅ chave da Lyra Indicadores (direto)" if TOQAN_INDICADORES_KEY else
                             "⚠️ sem TOQAN_INDICADORES_KEY: o SQL vai pela Lyra principal (mais lento)")
                  + f" · CSAT fixo: {CSAT_SQL_FIXO}")
+    lines.append("🧠 *Intérprete* · " + ("✅ agente dedicado (TOQAN_INTERPRETE_KEY)" if TOQAN_INTERPRETE_KEY else
+                                        "⚠️ sem TOQAN_INTERPRETE_KEY: usa a Lyra principal (mais lento)")
+                 + f" · modo: {INTERPRETE_MODE}" + (" (registrando em paralelo)" if INTERPRETE_MODE == "shadow"
+                                                     and TOQAN_INTERPRETE_KEY else ""))
     lines.append("")
     lines.append("📍 *Controles das EPSs (STATUS_CHANNELS)*")
     if not STATUS_CHANNELS:
