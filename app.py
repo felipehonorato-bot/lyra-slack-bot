@@ -541,7 +541,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.39.0"
+APP_VERSION = "5.39.1"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -6348,24 +6348,36 @@ def _parse_interpretacao(texto: str) -> dict[str, Any] | None:
 
 
 def _interpretar(question: str, eps: str | None, contexto: str = "", quem: str = "") -> tuple[dict[str, Any] | None, str]:
-    """(interpretação, texto cru). Usa o agente Lyra Intérprete (rápido, sem ferramentas); sem a chave, a Lyra principal
-    com o prompt do intérprete junto."""
+    """(interpretação, texto cru). As regras do intérprete vão SEMPRE junto da mensagem (não dependem do prompt do agente
+    no Toqan); com TOQAN_INTERPRETE_KEY usa o agente dedicado (rápido), senão a Lyra principal. Se não vier JSON, tenta
+    mais uma vez lembrando o formato."""
     msg = _interprete_msg(question, eps, contexto, quem)
     try:
+        with open(INTERPRETE_PROMPT_PATH, encoding="utf-8") as fh:
+            regras = fh.read()
+    except OSError:
+        regras = ""
+    corpo = ("TAREFA INTERNA DO APP — você NÃO está conversando com a pessoa e NÃO tem dados para consultar. Sua única "
+             "tarefa é ler a MENSAGEM (e a CONVERSA) e devolver SOMENTE o JSON descrito nas regras abaixo, sem nenhuma "
+             "palavra antes ou depois. Não responda a pergunta, não peça dados, não comente.\n\n"
+             + regras + "\n\n=== ENTRADA ===\n" + msg + "\n=== FIM DA ENTRADA ===\n\nDevolva agora só o JSON.")
+
+    def chamar(texto: str) -> str:
         if TOQAN_INTERPRETE_KEY:
-            conv, req = create_conversation(msg, TOQAN_INTERPRETE_KEY)
-            raw = get_answer(conv, req, api_key=TOQAN_INTERPRETE_KEY, max_attempts=INTERACTIVE_MAX_POLLS)
-        else:
-            try:
-                with open(INTERPRETE_PROMPT_PATH, encoding="utf-8") as fh:
-                    regras = fh.read()
-            except OSError:
-                return None, "prompt do intérprete não encontrado"
-            raw = ask_toqan("TAREFA INTERNA DO APP — NÃO responda a pessoa e NÃO chame subagentes. Siga as regras abaixo e "
-                            "devolva só o JSON.\n\n" + regras + "\n\n---\n\n" + msg, max_attempts=INTERACTIVE_MAX_POLLS)
+            conv, req = create_conversation(texto, TOQAN_INTERPRETE_KEY)
+            return get_answer(conv, req, api_key=TOQAN_INTERPRETE_KEY, max_attempts=INTERACTIVE_MAX_POLLS)
+        return ask_toqan(texto + "\n\nNÃO chame subagentes.", max_attempts=INTERACTIVE_MAX_POLLS)
+
+    try:
+        raw = chamar(corpo)
+        it = _parse_interpretacao(raw)
+        if it is None:  # respondeu a pessoa em vez de interpretar: lembra o formato uma vez
+            raw = chamar(corpo + "\n\nATENÇÃO: sua resposta anterior não foi o JSON. Responda APENAS com o objeto JSON, "
+                                  "começando com { e terminando com }.")
+            it = _parse_interpretacao(raw)
     except Exception as exc:
         return None, f"falhou: {exc}"
-    return _parse_interpretacao(raw), raw
+    return it, raw
 
 
 def _interpretacao_txt(it: dict[str, Any]) -> str:
