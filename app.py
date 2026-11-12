@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.41.5"
+APP_VERSION = "5.42.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -3893,7 +3893,13 @@ def _send_capa(event: dict[str, Any], client: Any, eps: str | None, question: st
         inds_q = ({i for i in ((event.get("_it") or {}).get("indicadores") or []) if i in {"tma", "sla"}}
                   or {i for i in _inds_citados(event.get("_orig_q") or question) if i in {"tma", "sla"}} or {"tma", "sla"})
         texto = _render_capa_fila(rows, eps, label, fila_q, inds_q)
-        if texto:
+        if texto and not _WANTS_FILE_RE.search(_norm_text(question)):
+            texto_ia = _redigir(event, question, eps, texto + "\n\nPara comparar, a EPS inteira:\n"
+                                + _render_capa(rows, eps, label),
+                                oferta=f"mostrar TMA e SLA de todas as filas da {eps or 'EPS'}",
+                                detalhe=_render_capa(rows, eps, label))
+            if texto_ia:
+                return texto_ia
             texto += f"\n\n_Pra ver todas as filas da {eps or 'EPS'}: \"TMA e SLA da {eps or 'AeC'}\"._"
     if not texto:
         texto = _render_capa_diaria(rows, eps, label, celula) if diaria else _render_capa(rows, eps, label)
@@ -8416,6 +8422,161 @@ def _d1_context(question: str, event: dict[str, Any]) -> bool:
     return bool(d1) and (not mes or d1[-1] > mes[-1])
 
 
+# --- Passo 3: a IA escreve a resposta a partir dos dados ------------------------------------------------------------
+# O app continua calculando tudo (consultas prontas). Com REDACAO_IA=on, em vez de mandar o modelo fixo, ele manda para
+# a Lyra a pergunta como a pessoa escreveu, a conversa e os números já calculados, e ela escreve a resposta. Se a IA
+# falhar, demorar ou usar número que não está nos dados, vai o modelo fixo (ninguém fica sem resposta). O detalhe
+# completo fica guardado na thread: "sim", "quero", "manda o detalhe" mostra.
+REDACAO_IA = os.getenv("REDACAO_IA", "off").strip().lower()
+REDACAO_MAX_POLLS = int(os.getenv("REDACAO_MAX_POLLS", "30"))
+REDACAO_LOG_KEY = "redacao_log"
+DETALHE_TTL_S = 3 * 3600
+
+REDACAO_INSTRUCTION = (
+    "TAREFA INTERNA DO APP — escreva a resposta que vai para o Slack. NÃO chame subagentes e NÃO consulte dados: os "
+    "números já foram calculados pelo app e estão em DADOS (são os oficiais).\n"
+    "Como responder:\n"
+    "1. A primeira frase responde direto o que a pessoa perguntou (sim/não, quanto, por quê), com o número principal. "
+    "Se a pergunta parte de uma premissa que os dados desmentem (ex.: \"por que caiu?\" e subiu), diga isso logo.\n"
+    "2. Depois, só o que explica: no máximo 3 pontos curtos com o que mais pesa. Escolha; não repita todos os números.\n"
+    "3. Use SÓ números que estão em DADOS, como estão (pode arredondar: \"quase 20 p.p.\"). Nunca calcule número novo e "
+    "nunca invente causa, motivo ou nome que não esteja em DADOS.\n"
+    "4. Tom de colega de trabalho que conhece a operação: português do Brasil, direto, sem jargão de sistema. Sem "
+    "fórmula, sem explicar como o número é calculado (a não ser que perguntem).\n"
+    "5. Formato Slack: *negrito* com um asterisco, nome de fila entre crases, sem título com #, sem tabela, no máximo "
+    "7 linhas.\n"
+    "6. Feche com a OFERTA abaixo, do seu jeito (uma pergunta curta), se ela fizer sentido para a conversa.\n"
+    "7. Não fale de app, consulta, SQL, dados internos nem que você é uma IA.\n"
+    "Responda SÓ o texto da mensagem.\n\n"
+)
+
+
+def _redacao_on() -> bool:
+    return REDACAO_IA == "on"
+
+
+def _num_vals(texto: str) -> list[float]:
+    """Números de um texto em pt-BR (16.449 = dezesseis mil; 70,7 = setenta vírgula sete). Ignora horas e datas."""
+    t = re.sub(r"\b\d{1,2}[:/h]\d{2}\b", " ", str(texto or ""))
+    vals = []
+    for m in re.finditer(r"\d[\d.]*(?:,\d+)?", t):
+        tok = m.group(0).rstrip(".")
+        try:
+            vals.append(float(tok.replace(".", "").replace(",", ".")))
+        except ValueError:
+            continue
+    return vals
+
+
+def _redacao_numeros_ok(texto: str, dados: str) -> tuple[bool, list[float]]:
+    """A IA só pode usar número que está nos dados (com folga para arredondar). Número pequeno inteiro (dias, posição,
+    quantidade de filas) passa."""
+    base = _num_vals(dados)
+    fora = []
+    for v in _num_vals(texto):
+        if v <= 31 and float(v).is_integer():
+            continue
+        if any(abs(v - x) <= max(0.6, abs(x) * 0.03) for x in base):
+            continue
+        fora.append(v)
+    return not fora, fora
+
+
+def _detalhe_key(event: dict[str, Any]) -> str:
+    return f"detalhe:{event.get('channel')}:{_reply_ts(event)}"
+
+
+def _detalhe_guardar(event: dict[str, Any], detalhe: str) -> None:
+    if detalhe:
+        STATE.set(_detalhe_key(event), json.dumps({"at": time.time(), "txt": detalhe[:12000]}, ensure_ascii=False))
+
+
+_DETALHE_PEDIDO_RE = re.compile(r"^\s*(sim|s|quero|pode|manda|mostra|bora|claro|ok|isso|pfv|por favor|uhum|aham|beleza|"
+                                r"quero sim|pode mandar|manda ai|mostra ai)\b")
+
+
+def _detalhe_pedido(event: dict[str, Any], question: str, say: Callable[..., Any]) -> bool:
+    """Resposta curta ("sim", "quero", "manda o detalhe") na thread de uma resposta escrita pela IA: mostra o detalhe."""
+    if not event.get("thread_ts"):
+        return False
+    t = _norm_text(re.sub(r"^\s*@?lyra\b[\s,:]*", "", question, flags=re.I))
+    curto = len(t.split()) <= 4 and bool(_DETALHE_PEDIDO_RE.search(t))
+    if not (curto or re.search(r"\b(detalh\w*|ver tudo|completo|abertura completa)\b", t)):
+        return False
+    if re.search(r"\b(excel|planilha|arquivo|xlsx)\b", t):
+        return False
+    try:
+        d = json.loads(STATE.get(_detalhe_key(event)) or "{}")
+    except ValueError:
+        return False
+    if not d or time.time() - float(d.get("at") or 0) > DETALHE_TTL_S:
+        return False
+    STATE.set(_detalhe_key(event), "")
+    _say_sections(say, d["txt"], event)
+    return True
+
+
+def _redacao_log(event: dict[str, Any], q: str, ok: bool, motivo: str = "") -> None:
+    try:
+        log = json.loads(STATE.get(REDACAO_LOG_KEY) or "[]")
+    except ValueError:
+        log = []
+    log.append({"t": _now_brazil().strftime("%d/%m %H:%M"), "q": q[:120], "rota": str(event.get("_route") or ""),
+                "ok": ok, "motivo": motivo[:160]})
+    STATE.set(REDACAO_LOG_KEY, json.dumps(log[-200:], ensure_ascii=False))
+
+
+def _redigir(event: dict[str, Any], question: str, eps: str | None, dados: str, oferta: str = "",
+             detalhe: str = "") -> str | None:
+    """A Lyra escreve a resposta a partir de DADOS. None = use o modelo fixo (IA desligada, falhou ou inventou número)."""
+    if not _redacao_on() or not dados.strip():
+        return None
+    pergunta = str(event.get("_orig_q") or question)
+    try:
+        ctx = _conversa_ctx(event)[-2500:]
+    except Exception:
+        ctx = ""
+    prompt = (f"{_scope_instruction(eps)}\n\n{REDACAO_INSTRUCTION}"
+              f"QUEM PERGUNTA: {_speaker_line(event) or '(não identificado)'}\n"
+              f"PERGUNTA (como a pessoa escreveu): {pergunta}\n"
+              f"CONVERSA ATÉ AGORA: {ctx.strip() or '(mensagem nova)'}\n"
+              f"OFERTA: {oferta or '(nenhuma)'}\n\n"
+              f"DADOS:\n{_strip_md(dados)[:9000]}")
+    try:
+        texto = str(ask_toqan(prompt, max_attempts=REDACAO_MAX_POLLS) or "").strip()
+    except Exception as exc:
+        _redacao_log(event, pergunta, False, f"falhou: {exc}")
+        return None
+    if not texto or _is_error_answer(texto) or len(texto) > 2500:
+        _redacao_log(event, pergunta, False, "resposta vazia, erro ou longa demais")
+        return None
+    ok, fora = _redacao_numeros_ok(texto, dados)
+    if not ok:
+        logger.warning("Redação: número fora dos dados %s; vai o modelo fixo", fora[:5])
+        _redacao_log(event, pergunta, False, f"número fora dos dados: {fora[:5]}")
+        return None
+    _redacao_log(event, pergunta, True)
+    event["_route"] = f"{event.get('_route') or ''}+ia"
+    if detalhe:
+        _detalhe_guardar(event, detalhe)
+    return texto
+
+
+def _redacoes_txt(n: int = 10) -> str:
+    try:
+        log = json.loads(STATE.get(REDACAO_LOG_KEY) or "[]")
+    except ValueError:
+        log = []
+    if not log:
+        return "Ainda não escrevi nenhuma resposta pelo passo 3." + ("" if _redacao_on() else " (REDACAO_IA está off.)")
+    ok = sum(1 for e in log if e.get("ok"))
+    linhas = [f"✍️ *Respostas escritas pela IA* · {ok} de {len(log)} saíram dela; o resto foi pelo modelo fixo"]
+    for e in log[-n:][::-1]:
+        linhas.append(f"• {e.get('t')} · _{e.get('q')}_ · `{e.get('rota')}` · "
+                      + ("✅ IA" if e.get("ok") else f"↩️ modelo fixo ({e.get('motivo')})"))
+    return "\n".join(linhas)
+
+
 _QUEDA_RE = re.compile(r"\b(caiu|cair|caindo|piorou|piorando|pior|derrub\w*|queda|baixou|despencou|afundou)\b")
 _ALTA_RE = re.compile(r"\b(subiu|subindo|melhorou|melhorando|melhor|aument\w*|cresceu)\b")
 
@@ -9642,6 +9803,9 @@ def _diagnostics_text() -> str:
                                         "⚠️ sem TOQAN_INTERPRETE_KEY: usa a Lyra principal (mais lento)")
                  + f" · modo: {INTERPRETE_MODE}" + (" (registrando em paralelo)" if INTERPRETE_MODE == "shadow"
                                                      and TOQAN_INTERPRETE_KEY else ""))
+    lines.append("✍️ *Passo 3 (IA escreve a resposta)* · " + ("✅ ligado (REDACAO_IA=on): \"por que caiu\", fila "
+                                                               "\"tá segurando?\" e resultado da fila"
+                                                               if _redacao_on() else "desligado (REDACAO_IA=off)"))
     lines.append("")
     lines.append("📍 *Controles das EPSs (STATUS_CHANNELS)*")
     if not STATUS_CHANNELS:
@@ -10489,6 +10653,33 @@ NEWS_FOLLOWUP = ("💬 Quer que eu aprofunde em alguma fila? Posso puxar as caus
 _CAUSE_FOLLOW_RE = re.compile(r"\b(causa|causas|por que|porque|pq|explica\w*|o que (esta|ta) puxando|de onde vem)\b")
 
 
+def _resultado_fila_ia(event: dict[str, Any], question: str, eps: str | None, tabela: str, fila: str,
+                       com_eficiencia: bool) -> str | None:
+    """Passo 3, "como tá a Review?": CSAT da fila (tabela do dia) + TMA e SLA da mesma fila no mesmo período, e a Lyra
+    escreve uma resposta só. None = segue o modelo fixo."""
+    if not _redacao_on():
+        return None
+    dados, detalhe = tabela, tabela
+    if com_eficiencia:
+        try:
+            q_per = event.get("_orig_q") or question
+            if re.search(r"\b(ontem|d 1|d1)\b", _norm_text(q_per)):
+                d1 = _as_date(_today_brazil()) - timedelta(days=1)
+                ini, fim, label = d1, d1, f"D-1 {d1.strftime('%d/%m')}"
+            else:
+                ini, fim, label = _capa_period(question, event)
+            rows_c, _ = _capa_rows(ini, fim)
+            capa_txt = _render_capa_fila(rows_c or [], eps, label, fila, {"tma", "sla"}) if rows_c else ""
+        except Exception:
+            logger.warning("Resultado da fila (IA): TMA e SLA falharam", exc_info=True)
+            capa_txt = ""
+        if capa_txt:
+            dados = f"{tabela}\n\nTMA e SLA da mesma fila:\n{capa_txt}"
+            detalhe = dados
+    return _redigir(event, question, eps, dados, oferta=f"abrir o que mais pesa na `{fila}` (motivos ou pessoas)",
+                    detalhe=detalhe)
+
+
 def _table_answer(question: str, eps: str | None, focus: dict[str, Any] | None = None) -> str | None:
     """Resposta pronta da tabela do dia (None = não é pergunta de tabela ou a tabela não está disponível).
     `focus` recebe a fila em destaque (a que mais impacta / a citada), para emendar a análise de causa."""
@@ -11200,6 +11391,17 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 return
         except Exception:
             logger.warning("Learning handling failed", exc_info=True)
+        if re.match(r"^\s*(@?lyra\b[\s,:]*)?reda(c|ç)(o|õ)es\b", question, re.I):
+            event["_route"] = "redacao_log"
+            m_n = re.search(r"\b(\d{1,2})\b", question)
+            _say(say, _redacoes_txt(min(int(m_n.group(1)), 40) if m_n else 10), event, True)
+            return
+        try:  # passo 3: "sim"/"quero"/"manda o detalhe" depois de uma resposta escrita pela IA
+            if _detalhe_pedido(event, question, say):
+                event["_route"] = "detalhe"
+                return
+        except Exception:
+            logger.warning("Detalhe guardado falhou", exc_info=True)
         try:  # passo 2: com INTERPRETE_MODE=on, a IA lê o pedido e escreve a pergunta do jeito que as consultas entendem
             question, ja_respondeu = _aplicar_interpretacao(question, event, eps, say, in_thread)
             if ja_respondeu:
@@ -11271,6 +11473,19 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 event["_route"] = "tabela"
                 geral = not re.search(r"\b(csat|nota\w*|avaliac\w*|tma|sla|tempo|primeira resposta|fila\w*|ranking|impact\w*)\b",
                                       _norm_text(question)) and bool(_capa_template()[0])
+                q_orig = str(event.get("_orig_q") or question)
+                fila_c = _fila_in_question(q_orig, eps) or _fila_ref(q_orig, eps, {}) or _fila_in_question(question, eps)
+                if (_redacao_on() and fila_c and eps and not _CAUSE_FOLLOW_RE.search(_norm_text(question))
+                        and not re.search(r"\b(ranking|impact\w*|todas as filas|por fila)\b", _norm_text(q_orig))):
+                    prog_t = _Progress(event)
+                    prog_t(f"Já olho a `{fila_c}` pra você ⏳")
+                    try:
+                        txt_f = _resultado_fila_ia(event, question, eps, table, fila_c, geral)
+                    finally:
+                        prog_t.done()
+                    if txt_f:
+                        _say(say, txt_f, event, in_thread=True)
+                        return
                 _say_sections(say, table + ("\n\n_TMA e SLA vêm logo abaixo, só um minutinho._ ⏳" if geral else ""), event)
                 if geral:  # "como tá a AeC?": o retrato inclui eficiência, não só CSAT
                     _post_efic_summary(say, event, eps, question)
@@ -11362,7 +11577,10 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             question = re.sub(r"(?i)\bcsat\b", "", question)  # "CSAT, TMA e SLA dia a dia": segue para o de TMA e SLA
         if not efic_extra and _is_capa_request(question):
             event["_route"] = "capa"
-            _say(say, "Já puxo TMA e SLA pra você ⏳", event, in_thread=True)
+            if _redacao_on():
+                progress("Já puxo TMA e SLA pra você ⏳")  # andamento: some quando a resposta chega
+            else:
+                _say(say, "Já puxo TMA e SLA pra você ⏳", event, in_thread=True)
             resp_capa = _send_capa(event, client, eps, question)
             progress.done()
             if resp_capa:
@@ -11589,10 +11807,16 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                     progress.done()
                     _say(say, note, event, in_thread=True)
                     return
-                if note:  # com o intérprete: diz isso E responde o "caiu?" de verdade (variação de CSAT, TMA e SLA)
+                nota_ia = ""
+                if note and _redacao_on():  # passo 3: a nota vira dado para a IA, e o aviso é só andamento (some depois)
+                    nota_ia = note
+                    send_progress(f"Vou comparar `{fila_v}` com o período anterior (CSAT, TMA e SLA). Leva alguns minutos ⏳")
+                elif note:  # com o intérprete: diz isso E responde o "caiu?" de verdade (variação de CSAT, TMA e SLA)
                     nota_curta = "\n".join(l for l in note.split("\n") if not l.startswith(("Quem ficou abaixo", "Todas as filas")))
                     _say(say, nota_curta.strip() + "\n\nVou comparar com o período anterior pra ver se ela caiu e por quê "
                          "(CSAT, TMA e SLA). Leva alguns minutos ⏳", event, in_thread=True)
+                elif _redacao_on():
+                    send_progress(f"Vou ver o que mudou em `{fila_v}` (CSAT, TMA e SLA). Leva alguns minutos ⏳")
                 else:
                     _say(say, (f"Vou olhar o mix de motivos de `{fila_v}` (este mês x referência). Já te trago ⏳" if mix_only else
                                f"Vou levantar as causas em `{fila_v}`: primeiro a variação (mix de motivos e response rate); "
@@ -11624,6 +11848,7 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 progress.done()
                 rendered = _render_variation(fila_v, var_data, l_cur, l_ref, with_esteira=not mix_only) if var_data else None
                 if rendered:
+                    resumo = ""
                     if efic_ths:  # responde primeiro à pergunta ("caiu?") com os três indicadores, depois o detalhe
                         for th in efic_ths:
                             th.join(timeout=600)
@@ -11633,8 +11858,25 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                         except Exception:
                             logger.warning("Resumo da variação falhou", exc_info=True)
                             resumo = ""
-                        if resumo:
-                            _say(say, resumo, event, in_thread=True)
+                    efic_txts = [efic_out.get(i) for i in ("TMA", "SLA")
+                                 if str(efic_out.get(i) or "").startswith(("⏱️", "⏰"))]
+                    detalhe_v = "\n\n".join([rendered] + efic_txts)
+                    if _redacao_on():
+                        progress("Já tenho os números, só organizando ⏳")
+                    texto_ia = _redigir(event, question, eps,
+                                        "\n\n".join(([nota_ia] if nota_ia else []) + ([resumo] if resumo else []) + [detalhe_v]),
+                                        oferta="mostrar o detalhe por motivo (o que mudou no CSAT"
+                                               + (", no TMA e no SLA" if efic_txts else "") + ")",
+                                        detalhe=detalhe_v)
+                    progress.done()
+                    if texto_ia:
+                        _say(say, texto_ia, event, in_thread=True)
+                        rose = (_num(var_data.get("csat_atual")) or 0) >= (_num(var_data.get("csat_ref")) or 0)
+                        if not mix_only and not _mix_dominant(var_data) and not rose:
+                            threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
+                        return
+                    if resumo:
+                        _say(say, resumo, event, in_thread=True)
                     _say_sections(say, rendered, event)
                     rose = (_num(var_data.get("csat_atual")) or 0) >= (_num(var_data.get("csat_ref")) or 0)
                     if not mix_only and not _mix_dominant(var_data) and not rose:
