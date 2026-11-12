@@ -43,8 +43,9 @@ v5.13 — Respostas grandes no visual do report diário (o report em si não mud
         aprendizado. "o que você aprendeu?" lista; "esquece o aprendizado N" desativa (só iFood). LEARNINGS=0 desliga.
         Perguntas sobre a própria Lyra (quem é, nome/constelação, como aprende) têm instrução própria.
         Regras oficiais do CSAT (Indicadores v1.10): L3, data da avaliação, Madrugada pelos operadores da célula
-        Madrugada do MOP (o app manda a lista em todo pedido da AeC/iFood), filas normalizadas (PF Super Clientes,
-        PF Revisão Manual), Agentforce CX = IA (só WillNegativas, nunca somada a EPS), BU FOOD/MULTI, Front/BKO e
+        Madrugada do MOP, menos o que termina na fila Agentforce CX (o app manda a lista em todo pedido da AeC/iFood),
+        filas normalizadas (PF Super Clientes, PF Revisão Manual), Agentforce CX = CSAT dos agentes de IA (todos, por
+        AgenteIA__c; só visão iFood, nunca somada a EPS), BU FOOD/MULTI, Front/BKO e
         impacto da fila = CSAT do conjunto com x sem a fila. Recorte padrão = mês (resultado, ranking, pior, impacto);
         D-1 só quando pedirem. Lembretes: "me lembra amanhã às 14h de X" vira DM no horário.
 
@@ -542,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.40.1"
+APP_VERSION = "5.41.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -694,7 +695,8 @@ def _madrugada_line(eps: str | None) -> str:
     if not emails:
         return ""
     return ("\nAo chamar a Lyra Indicadores (ou a Lyra Qualidade), inclua no pedido a linha: Madrugada: "
-            + ", ".join(emails) + " (operadores da célula Madrugada no MOP; tudo o que eles atendem é da fila Madrugada).")
+            + ", ".join(emails) + " (operadores da célula Madrugada no MOP; o que eles atendem é da fila Madrugada, MENOS o "
+            "ticket cuja fila é Agentforce CX: esse é CSAT do agente de IA, nunca da Madrugada nem da EPS).")
 
 
 def _scope_instruction(eps: str | None) -> str:
@@ -709,7 +711,8 @@ def _scope_instruction(eps: str | None) -> str:
 def _scope_instruction_base(eps: str | None) -> str:
     if eps is None:
         return ("ESCOPO: visão interna iFood — todas as EPS. Pode comparar EPS. Agentforce CX é atendimento de IA: "
-                "nunca some em AeC ou CSU nem compare com uma EPS.")
+                "nunca some em AeC ou CSU nem compare com uma EPS. Só fale de Agentforce, agentes de IA, Wills ou L2 "
+                "quando a pergunta pedir isso explicitamente; resultado geral, do iFood ou das EPSs é só AeC e CSU.")
     others = ", ".join(e for e in EPS_CELULAS if _compact(e) != _compact(eps)) or "outras EPS"
     celulas = _celulas_of(eps)
     return (
@@ -2953,7 +2956,9 @@ def _send_case_list(event: dict[str, Any], client: Any, eps: str | None, questio
     todas = d1 or bool(re.search(r"\b(todas|promotor\w*|todos os casos)\b", _norm_text(question)))
     filtro = (f"Fila: {fila}\n" if fila else "Fila: todas as filas da EPS\n") + (
         f"Só estes operadores (e-mails): {', '.join(team[:400])}\n" if team else "")
-    base = f"{_scope_instruction(eps)}\n\nTAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Chame a *Lyra Indicadores* com exatamente:\nEPS: {eps or 'iFood'}\n"
+    base = (f"{_scope_instruction(eps)}\n\nTAREFA INTERNA DO APP — NÃO é mensagem para o Slack. Chame a *Lyra Indicadores* com exatamente:\nEPS: {eps or 'iFood'}\n"
+            # base caso a caso e abertura por operador servem para a liderança agir: o operador vem identificado (e-mail)
+            + ("Acesso: completo\nLista: completa\n" if _operator_names_allowed(eps) else ""))
     fim = "Devolva SOMENTE o CSV que ela responder (ou a linha ERRO:), sem comentar."
     if ind == "csat":
         p_casos = (base + f"Pedido: avaliações detalhadas (CSV)\n{filtro}Período: {spec['cur']}\nNotas: "
@@ -5003,7 +5008,8 @@ def _csat_sql(nome: str, ini: date, fim: date, params: dict[str, str]) -> str | 
     mad = ", ".join(f"'{_EMAIL_SAFE_RE.sub('', e.lower())}'" for e in _madrugada_emails()) or "''"
     base = (base.replace("{base_inicio}", ini.isoformat()).replace("{base_fim}", fim.isoformat())
             .replace("{lista_madrugada}", mad))
-    sql = tpl.replace("{base}", base)
+    sql = (tpl.replace("{base}", base).replace("{lista_madrugada}", mad)
+           .replace("{base_inicio}", ini.isoformat()).replace("{base_fim}", fim.isoformat()))
     for k, v in params.items():
         sql = sql.replace("{" + k + "}", v)
     return _compact_sql(sql)
@@ -5724,6 +5730,76 @@ def _team_efic_rows(event: dict[str, Any], eps: str | None, question: str,
     if rows is not None:
         _CSAT_ROWS_CACHE[key] = (time.time(), rows)
     return rows, people, titulo, label, eps
+
+
+# --- CSAT dos agentes de IA (fila Agentforce CX, por AgenteIA__c) — só visão iFood -----------------------------------
+AGENTFORCE_META = float(os.getenv("AGENTFORCE_META", "11"))  # meta do Will (vale para cada agente e o total)
+_AGENTES_IA_RE = re.compile(r"\b(agentforce|agent force|agentes? (de )?ia|agentes? de inteligencia|agentes? virtua\w*|"
+                            r"ia designad\w*|agenteia|l2|camada 2|nivel 2)\b")
+
+
+def _is_agentes_ia_request(question: str) -> bool:
+    """"Como tá o CSAT dos agentes de IA / da Agentforce / do Will?" — resultado, não processo nem caso a caso."""
+    t = _norm_text(question)
+    ia = bool(_AGENTES_IA_RE.search(t)) or (bool(re.search(r"\bwill\w*", t))
+                                            and bool(re.search(r"\b(csat|nota\w*|avaliac\w*|resultado)\b", t)))
+    if not ia:
+        return False
+    if re.search(r"\b(tma|sla|primeira resposta)\b", t) and not re.search(r"\bcsat\b", t):
+        return False
+    return not re.search(r"\b(casos?|tickets?|operador\w*|analista\w*|supervisor\w*|trein\w*|como funciona|"
+                         r"o que e|o que significa|processo|acionar|aciona\w*|marc\w* resolvido)\b", t)
+
+
+def _render_csat_agentes_ia(rows: list[dict[str, str]], label: str) -> str:
+    itens = []
+    for r in rows:
+        n, p = _sql_num(r.get("avaliacoes")) or 0, _sql_num(r.get("promotoras")) or 0
+        if n:
+            itens.append((str(r.get("agente") or "Sem agente designado"), n, p, _sql_num(r.get("via madrugada")) or 0))
+    if not itens:
+        return ""
+    n_t, p_t = sum(i[1] for i in itens), sum(i[2] for i in itens)
+    mad_t = sum(i[3] for i in itens)
+    csat_t = p_t / n_t * 100
+    gap = csat_t - AGENTFORCE_META
+    v = (f"🟢 na meta {_bfmt(AGENTFORCE_META, 0)}%" if abs(gap) < 0.05 else
+         f"🔴 {_bfmt(-gap)} p.p. abaixo da meta {_bfmt(AGENTFORCE_META, 0)}%" if gap < 0 else
+         f"🟢 {_bfmt(gap)} p.p. acima da meta {_bfmt(AGENTFORCE_META, 0)}%")
+    linhas = [f"🤖 *CSAT dos agentes de IA ·* `Agentforce CX` *— {label}*",
+              "_Avaliação do caso que terminou com o agente de IA (fila Agentforce CX, camadas L2 e L3 — o Will de "
+              "Negativas entra depois do humano), por agente designado. Fica fora da AeC e da CSU._", "",
+              f"{'🔴' if gap < -0.05 else '🟢'} *Agentforce CX* · n={_fmt_int(n_t)}",
+              f"   • CSAT *{_bfmt(csat_t)}%* → {v}", "", "*Por agente*"]
+    for nome, n, p, _m in sorted(itens, key=lambda i: -i[1]):
+        cs = p / n * 100
+        peso = n / n_t * 100
+        imp = n * (cs - csat_t) / n_t  # quanto o agente puxa o CSAT da Agentforce para cima/baixo
+        linhas.append(f"{'🔴' if cs < AGENTFORCE_META - 0.05 else '🟢'} *{nome}* · CSAT *{_bfmt(cs)}%* · n={_fmt_int(n)} "
+                      f"({_bfmt(peso)}% das avaliações) · {'' if abs(imp) < 0.05 else '+' if imp > 0 else '−'}{_bfmt(abs(imp))} p.p. no total")
+    if mad_t:
+        linhas += ["", f"🌙 {_fmt_int(mad_t)} dessas avaliações têm operador da Madrugada como último atendente: pela regra "
+                       "nova elas ficam com o agente de IA e não entram mais no CSAT da Madrugada."]
+    linhas += ["", f"_Meta do Will: {_bfmt(AGENTFORCE_META, 0)}% (vale para cada agente e para a Agentforce CX)._"]
+    return "\n".join(linhas)
+
+
+def _send_csat_agentes_ia(event: dict[str, Any], eps: str | None, question: str, client: Any = None) -> str:
+    if eps is not None:
+        return (f"Aqui eu acompanho só a {eps} 🙂 O resultado dos agentes de IA (Agentforce) é visão interna do iFood. "
+                "Do lado da operação, posso te mostrar CSAT, TMA e SLA das filas e do time.")
+    ini, fim, label = _capa_period(question, event)
+    rows, problema = _csat_fixed_rows("csat_agentes_ia.sql", ini, fim, {}, None, f"CSAT dos agentes de IA ({ini} a {fim})")
+    if rows is None:
+        return problema or "Não consegui puxar o CSAT dos agentes de IA agora. Tenta de novo daqui a pouco?"
+    texto = _render_csat_agentes_ia(rows, label)
+    if not texto:
+        return f"Não veio avaliação da Agentforce CX em {label}."
+    if _WANTS_FILE_RE.search(_norm_text(question)) and _upload_xlsx(
+            event, client, _rows_xlsx([("Agentes de IA", rows, {"CSAT (%)": "=IFERROR({promotoras}{r}/{avaliacoes}{r}*100,\"\")"})]),
+            "CSAT_agentes_IA.xlsx", f"CSAT dos agentes de IA · {label}", texto):
+        return ""
+    return texto
 
 
 # --- CSAT dia a dia (consulta fixa; mesmo layout do dia a dia de TMA e SLA) ------------------------------------------
@@ -6538,6 +6614,8 @@ def _pergunta_canonica(it: dict[str, Any], original: str) -> str | None:
     per = _periodo_canonico(it.get("periodo"))
     arq = " em planilha excel" if it.get("formato") == "planilha" else ""
     todos = " abertura de todos" if it.get("todos") else ""
+    if _is_agentes_ia_request(original) or "agentforce" in _norm_text(str(it.get("fila") or "")):
+        return re.sub(r"\s+", " ", f"CSAT dos agentes de IA {per or ''}{arq}").strip()  # rota própria (visão iFood)
     t = _norm_text(original)
     quem = ("supervisores" if re.search(r"\b(supervisor\w*|equipes)\b", t) and not re.search(r"\b(operador\w*|analista\w*)\b", t)
             else "operadores" if re.search(r"\b(operador\w*|analista\w*|atendente\w*)\b", t)
@@ -10966,6 +11044,14 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 canal = _daylog_text([eps] if eps else list(EPS_CELULAS), limit=5) if CREAD else ""
                 _say_sections(say, news + ("\n\n" + canal if canal else "") + "\n\n" + NEWS_FOLLOWUP, event)
                 return
+        if _is_agentes_ia_request(question):
+            event["_route"] = "csat_agentes_ia"
+            if eps is None:
+                _say(say, "Já puxo o CSAT dos agentes de IA pra você ⏳", event, in_thread=True)
+            txt_ia = _send_csat_agentes_ia(event, eps, question, client)
+            if txt_ia:
+                _say(say, txt_ia, event, in_thread=True)
+            return
         if not _report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or "")):
             focus: dict[str, Any] = {}
             try:
@@ -11283,17 +11369,34 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 # esteira (Qualidade) em paralelo com a análise de variação (Indicadores): a pessoa não fica esperando
                 fila_v = block_q[1].get("fila") if block_q else fila_q
                 note = None if mix_only else _above_meta_note(fila_v, eps, "d1" if d1_ctx else "mes")
-                if note:  # a fila bateu a própria meta: o "ruim" é peso no consolidado, não desempenho
+                if note and not event.get("_canon"):  # a fila bateu a própria meta: o "ruim" é peso no consolidado
                     progress.done()
                     _say(say, note, event, in_thread=True)
                     return
+                if note:  # com o intérprete: diz isso E responde o "caiu?" de verdade (variação de CSAT, TMA e SLA)
+                    nota_curta = "\n".join(l for l in note.split("\n") if not l.startswith(("Quem ficou abaixo", "Todas as filas")))
+                    _say(say, nota_curta.strip() + "\n\nMesmo assim, vou ver se ela caiu "
+                         "em relação ao período anterior e por quê. ⏳", event, in_thread=True)
                 _say(say, (f"Vou olhar o mix de motivos de `{fila_v}` (este mês x referência). Já te trago ⏳" if mix_only else
                            f"Vou levantar as causas em `{fila_v}`: primeiro a variação (mix de motivos e response rate); "
                            "se não for só mix, em seguida a esteira de impacto por pilar. Leva alguns minutos ⏳"),
                      event, in_thread=True)
                 cur, ref, l_cur, l_ref = _it_periodos(event) or _variation_periods(f"{question} ontem" if d1_ctx else question)
+                efic_out: dict[str, Any] = {}
+                efic_ths = []
+                if not _inds_citados(question) and _query_text("eficiencia_variacao.sql"):
+                    # sem indicador = todos: TMA e SLA rodam em paralelo com o CSAT, pela consulta pronta
+                    def _efic_bg(ind_x: str) -> None:
+                        try:
+                            efic_out[ind_x] = _send_efic_variacao(event, client, eps, f"por que o {ind_x} mudou", None,
+                                                                  (cur, ref, l_cur, l_ref), fila_v)
+                        except Exception:
+                            logger.warning("Variação de %s em paralelo falhou", ind_x, exc_info=True)
+                    efic_ths = [threading.Thread(target=_efic_bg, args=(i,), daemon=True) for i in ("TMA", "SLA")]
+                    for th in efic_ths:
+                        th.start()
                 var_data = {}
-                if CSAT_SQL_FIXO == "on":
+                if CSAT_SQL_FIXO == "on" or event.get("_canon"):  # com o intérprete: consulta pronta primeiro (rápida)
                     var_data = _csat_variacao_fixa(eps, fila_v, cur, ref, send_progress) or {}
                 if not var_data:
                     var_answer = ask_toqan(_variation_prompt(eps, fila_v, cur, ref), progress_callback=send_progress,
@@ -11308,12 +11411,12 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                     rose = (_num(var_data.get("csat_atual")) or 0) >= (_num(var_data.get("csat_ref")) or 0)
                     if not mix_only and not _mix_dominant(var_data) and not rose:
                         threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()
-                    if not _inds_citados(question) and _query_text("eficiencia_variacao.sql"):
-                        # "por que a fila piorou?" sem indicador = todos: a mesma leitura para TMA e SLA
-                        for ind_x in ("TMA", "SLA"):
-                            resp_x = _send_efic_variacao(event, client, eps, f"{question} ({ind_x}) {fila_v}", None)
-                            if resp_x and resp_x.startswith(("⏱️", "⏰")):
-                                _say_sections(say, resp_x, event)
+                    for th in efic_ths:  # "por que a fila piorou?" sem indicador = todos: TMA e SLA na mesma leitura
+                        th.join(timeout=600)
+                    for ind_x in ("TMA", "SLA"):
+                        resp_x = efic_out.get(ind_x)
+                        if resp_x and resp_x.startswith(("⏱️", "⏰")):
+                            _say_sections(say, resp_x, event)
                     return
                 if not mix_only:
                     threading.Thread(target=_post_esteira_on_demand, args=(event, eps, question), daemon=True).start()

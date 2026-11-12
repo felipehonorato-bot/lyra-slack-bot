@@ -21,15 +21,14 @@ dedup AS (   -- uma avaliação por ticket
         SELECT b.*, ROW_NUMBER() OVER (PARTITION BY support_ticket_id ORDER BY data_ref DESC) AS rn FROM base b
     ) WHERE rn = 1
 ),
-filas_norm AS (   -- FILA (regra oficial): Madrugada pelo operador primeiro, depois a fila normalizada
+filas_norm AS (   -- FILA (regra oficial): Madrugada pelo operador (fora a Agentforce CX), depois a fila normalizada
     SELECT d.*,
         CASE
-            WHEN agente_email IN ({lista_madrugada}) THEN 'Madrugada'
+            WHEN agente_email IN ({lista_madrugada}) AND coalesce(fila, '') <> 'Agentforce CX' THEN 'Madrugada'
             WHEN fila = 'PF Clube Vip + Super clientes' THEN 'PF Super Clientes'
             WHEN fila IN ('PF Revisão Manual (Multi + Food)', 'Revisão Manual Multi + Food)') THEN 'PF Revisão Manual'
             WHEN fila = 'CX Review' THEN 'Review'
-            WHEN fila = 'Agentforce CX' AND agente_ia_designado = 'WillNegativas' THEN 'Agentforce CX'
-            WHEN fila = 'Agentforce CX' THEN NULL
+            WHEN fila = 'Agentforce CX' THEN 'Agentforce CX'   -- CSAT dos agentes de IA (quebra por agente_ia_designado); nunca EPS
             ELSE fila
         END AS fila_relatorio
     FROM dedup d
