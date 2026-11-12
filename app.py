@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.41.4"
+APP_VERSION = "5.41.5"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -5113,7 +5113,7 @@ def _csat_fixed_rows(nome: str, ini: date, fim: date, params: dict[str, str], pr
 
 # --- quem mais impacta: operador e supervisor ---------------------------------
 PESSOAS_PAGINA = int(os.getenv("PESSOAS_PAGINA", "200"))  # operadores por consulta na lista completa
-PESSOAS_PAGINAS_MAX = 6
+PESSOAS_PAGINAS_MAX = 8
 _PESSOAS_RE = re.compile(r"\b(operador\w*|analista\w*|atendente\w*|supervisor\w*|supervisora\w*|coordenador\w*|"
                          r"equipes?|times)\b")
 _PESSOAS_IMPACTO_RE = re.compile(r"\b(impact\w*|pesa\w*|puxa\w*|ofensor\w*|derrub\w*|contribu\w*|consolidado|"
@@ -5342,23 +5342,40 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
         return "TOTAL" in tipos and bool(tipos & {"OP", "SUP"})
 
     rows, problema, lista_cortada = None, "", ""
-    if completo or quer_arquivo:  # todos os operadores: a lista vem em páginas (uma resposta só não cabe)
+    esperado, recebidos = 0, 0
+    if completo or quer_arquivo:
+        # todos os operadores, em partes. A linha TOTAL diz quantos entram no ranking (RK) e cada operador vem com a
+        # posição: a próxima parte começa depois da última posição que chegou. Assim, se a Indicadores devolver menos
+        # linhas do que o pedido, a Lyra continua de onde parou em vez de achar que acabou.
         vistos: set[tuple[str, str]] = set()
+        p_ini = 1
         for pag in range(PESSOAS_PAGINAS_MAX):
-            p_ini = pag * PESSOAS_PAGINA + 1
             params.update(op_ini=str(p_ini), top_ops=str(p_ini + PESSOAS_PAGINA - 1))
             rows_p, problema = _csat_fixed_rows("csat_pessoas.sql", ini, fim, params, progress,
                                                 f"CSAT por operador ({ini} a {fim}, parte {pag + 1})")
             if not _usavel(rows_p):
-                if rows is not None:  # parte seguinte falhou: fica com o que já veio e avisa
-                    lista_cortada = str(len([r for r in rows if r.get("tipo", "").upper() == "OP"]))
                 break
-            novos = [r for r in rows_p if r.get("tipo", "").upper() == "OP"
-                     and (_compact(r.get("eps", "")), r.get("nome", "")) not in vistos]
-            vistos |= {(_compact(r.get("eps", "")), r.get("nome", "")) for r in novos}
-            rows = rows_p if rows is None else rows + novos
-            if len([r for r in rows_p if r.get("tipo", "").upper() == "OP"]) < PESSOAS_PAGINA:
-                break  # última página
+            if not esperado:
+                esperado = int(sum(_sql_num(r.get("rk")) or 0 for r in rows_p if r.get("tipo", "").upper() == "TOTAL"))
+            ops_p = [r for r in rows_p if r.get("tipo", "").upper() == "OP"]
+            novos = []
+            for r in ops_p:
+                k = (_compact(r.get("eps", "")), r.get("nome", ""))
+                if k not in vistos:
+                    vistos.add(k)
+                    novos.append(r)
+            rows = ([r for r in rows_p if r.get("tipo", "").upper() != "OP"] + novos) if rows is None else rows + novos
+            recebidos = len(vistos)
+            fim_p = p_ini + PESSOAS_PAGINA - 1  # posições desta parte (os 3 que mais seguram vêm sempre e ficam fora)
+            rks = [int(_sql_num(r.get("rk")) or 0) for r in ops_p if p_ini <= (_sql_num(r.get("rk")) or 0) <= fim_p]
+            if not esperado or recebidos >= esperado or not rks:
+                break
+            p_ini = max(rks) + 1
+            if p_ini > max(esperado, 1) or (pag >= 2 and len(rks) < PESSOAS_PAGINA / 2):
+                break  # a consulta está devolvendo bem menos que o pedido: não insiste além de 3 partes
+        if rows is not None and esperado and recebidos < esperado:
+            lista_cortada = f"{recebidos} de {esperado}"
+            logger.warning("CSAT pessoas: lista completa veio com %s operadores", lista_cortada)
         params.update(op_ini="1", top_ops="5000" if rows is None else "300")  # nada veio: o laço abaixo tenta 300 e 50
     else:
         rows, problema = _csat_fixed_rows("csat_pessoas.sql", ini, fim, params, progress,
@@ -5370,7 +5387,7 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
         logger.warning("CSAT pessoas: top_ops=%s voltou sem as pessoas; tentando %s", params["top_ops"], menor)
         params["top_ops"] = menor
         rows, problema = _csat_fixed_rows("csat_pessoas.sql", ini, fim, params, progress, f"CSAT por operador ({ini} a {fim})")
-        lista_cortada = menor
+        lista_cortada = f"os {menor} primeiros"
     if rows is None:
         return problema
     so_sup = bool(re.search(r"\b(supervisor\w*|supervisora\w*|equipes)\b", t)) and not re.search(
@@ -5421,9 +5438,9 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
                     f"📎 Aqui está: todas as equipes e todos os {_fmt_int(n_ops)} operadores do ranking, com as fórmulas de CSAT "
                     "e do impacto."
                     if not lista_cortada else
-                    f"📎 Aqui está: todas as equipes e os {lista_cortada} operadores que mais puxam para baixo (mais os "
-                    "que mais seguram), com as fórmulas. A lista inteira não voltou da consulta agora; se precisar de "
-                    "todos, me pede de novo daqui a pouco."))
+                    f"📎 Aqui está, com as fórmulas: todas as equipes, mas só {lista_cortada} operadores (os que mais "
+                    "puxam para baixo, mais os que mais seguram). A lista inteira não voltou da consulta agora; se "
+                    "precisar de todos, me pede de novo daqui a pouco."))
             return None
         except Exception:
             logger.warning("CSAT por pessoa: upload do Excel falhou; mando só o texto", exc_info=True)

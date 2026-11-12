@@ -4,6 +4,7 @@
 -- dos operadores dele (vínculo do MOP, mandado pelo app). Só sai o usuário do e-mail (parte antes do @).
 -- Parâmetros: {base_inicio}, {base_fim}, {lista_madrugada}, {eps_lista}, {eps_like}, {filtro_fila}, {metas_values},
 -- {mop_values}, {filtro_equipe}, {min_aval}, {top_ops}, {op_ini} (paginação da lista completa; padrão 1).
+-- RK: na linha TOTAL, quantos entram no ranking; na linha OP, a posição (1 = quem mais puxa para baixo).
 {base},
 metas AS (
     SELECT fila, CAST(meta AS DOUBLE) AS meta FROM VALUES {metas_values} AS t(fila, meta)
@@ -51,22 +52,26 @@ sem_mop AS (   -- amostra de quem atendeu e não está no MOP de hoje (para o ti
     SELECT * FROM pessoas WHERE sup = 'Sem supervisor no MOP'
     QUALIFY ROW_NUMBER() OVER (PARTITION BY eps ORDER BY aval DESC) <= 8
 ),
-ops_rank AS (
-    SELECT * FROM pessoas
+elegiveis AS (   -- quem entra no ranking (o app usa o total para saber se a lista completa veio inteira)
+    SELECT p.*, ROW_NUMBER() OVER (PARTITION BY eps ORDER BY imp ASC) AS rk,
+           ROW_NUMBER() OVER (PARTITION BY eps ORDER BY imp DESC) AS rk_desc
+    FROM pessoas p
     WHERE aval >= {min_aval} AND aval_meta > 0
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY eps ORDER BY imp ASC) BETWEEN {op_ini} AND {top_ops}
-         OR ROW_NUMBER() OVER (PARTITION BY eps ORDER BY imp DESC) <= 3
-)
-SELECT 'TOTAL' AS `TIPO`, eps AS `EPS`, '' AS `NOME`, '' AS `FILA`, n AS `AVALIACOES`, prom AS `PROMOTORAS`,
-       CAST(NULL AS DOUBLE) AS `ACIMA`, n_meta AS `AVAL_META`, meta_x AS `META_X`, CAST(NULL AS BIGINT) AS `N_OPS`,
-       CAST(NULL AS DOUBLE) AS `IMPACTO_PP`
-FROM tot
+),
+ops_rank AS (
+    SELECT * FROM elegiveis WHERE rk BETWEEN {op_ini} AND {top_ops} OR rk_desc <= 3
+),
+n_rank AS (SELECT eps, COUNT(*) AS n FROM elegiveis GROUP BY eps)
+SELECT 'TOTAL' AS `TIPO`, t.eps AS `EPS`, '' AS `NOME`, '' AS `FILA`, t.n AS `AVALIACOES`, t.prom AS `PROMOTORAS`,
+       CAST(NULL AS DOUBLE) AS `ACIMA`, t.n_meta AS `AVAL_META`, t.meta_x AS `META_X`, CAST(NULL AS BIGINT) AS `N_OPS`,
+       CAST(NULL AS DOUBLE) AS `IMPACTO_PP`, CAST(COALESCE(r.n, 0) AS BIGINT) AS `RK`
+FROM tot t LEFT JOIN n_rank r ON r.eps = t.eps
 UNION ALL
-SELECT 'FORA', eps, '', '', NULL, NULL, NULL, NULL, NULL, COUNT(*), NULL
+SELECT 'FORA', eps, '', '', NULL, NULL, NULL, NULL, NULL, COUNT(*), NULL, NULL
 FROM pessoas WHERE aval < {min_aval} GROUP BY eps
 UNION ALL
-SELECT 'SUP', eps, sup, '', aval, prom, acima, aval_meta, meta_x, n_ops, imp FROM sups
+SELECT 'SUP', eps, sup, '', aval, prom, acima, aval_meta, meta_x, n_ops, imp, NULL FROM sups
 UNION ALL
-SELECT 'OP', eps, usuario, fila, aval, prom, acima, aval_meta, meta_x, 1, imp FROM ops_rank
+SELECT 'OP', eps, usuario, fila, aval, prom, acima, aval_meta, meta_x, 1, imp, rk FROM ops_rank
 UNION ALL
-SELECT 'SEMMOP', eps, usuario, fila, aval, prom, NULL, NULL, NULL, 1, NULL FROM sem_mop
+SELECT 'SEMMOP', eps, usuario, fila, aval, prom, NULL, NULL, NULL, 1, NULL, NULL FROM sem_mop
