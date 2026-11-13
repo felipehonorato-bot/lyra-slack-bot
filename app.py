@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.43.4"
+APP_VERSION = "5.44.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -6565,10 +6565,11 @@ def _interprete_msg(question: str, eps: str | None, contexto: str, quem: str) ->
 
 
 _INTERPRETE_MOLDE = (
-    "PREENCHA ESTE MOLDE e devolva só ele (mesmas 15 chaves, nesta ordem, valores só dos permitidos):\n"
+    "PREENCHA ESTE MOLDE e devolva só ele (mesmas 17 chaves, nesta ordem, valores só dos permitidos):\n"
     '{"intencao": "<dados|analise|processo|acao|conversa>", '
     '"visao": "<resultado|dia_a_dia|motivos|pessoas|equipe|casos|variacao|anomalia|treinamento|outro|null>", '
     '"indicadores": ["<csat|tma|sla>"], "eps": "<AeC|CSU|null>", "fila": "<nome exato de FILAS DA EPS|null>", '
+    '"filas": ["<nomes exatos de FILAS DA EPS; [] = EPS inteira>"], "publico": "<q4|todos|top|null>", '
     '"lider": "<nome de LÍDERES DO MOP|null>", "minha_equipe": <true|false>, "pessoa": "<nome/e-mail|null>", '
     '"periodo": {"inicio": "AAAA-MM-DD", "fim": "AAAA-MM-DD", "rotulo": "<curto>"}, '
     '"comparar_com": <null|{"inicio": "AAAA-MM-DD", "fim": "AAAA-MM-DD", "rotulo": "<curto>"}>, '
@@ -6606,6 +6607,18 @@ def _parse_interpretacao(texto: str) -> dict[str, Any] | None:
     data["indicadores"] = [i for i in (data.get("indicadores") or []) if i in {"csat", "tma", "sla"}]
     if data["intencao"] in {"dados", "analise"} and not data["indicadores"]:
         data["indicadores"] = ["csat", "tma", "sla"]  # sem indicador = todos, na regra da EPS
+    conhecidas = {_norm_text(f): f for cel in EPS_CELULAS.values() for f in cel}
+    conhecidas[_norm_text("Agentforce CX")] = "Agentforce CX"
+    filas = data.get("filas") if isinstance(data.get("filas"), list) else []
+    filas = [conhecidas[_norm_text(str(f))] for f in filas if _norm_text(str(f)) in conhecidas]
+    if data.get("fila") and _norm_text(str(data["fila"])) in conhecidas and conhecidas[_norm_text(str(data["fila"]))] not in filas:
+        filas.insert(0, conhecidas[_norm_text(str(data["fila"]))])
+    data["filas"] = list(dict.fromkeys(filas))
+    if len(data["filas"]) == 1:
+        data["fila"] = data["filas"][0]
+    elif len(data["filas"]) > 1:
+        data["fila"] = None
+    data["publico"] = data.get("publico") if data.get("publico") in {"q4", "todos", "top"} else None
     per = data.get("periodo")
     if isinstance(per, dict):
         try:
@@ -6844,11 +6857,99 @@ def _it_periodos(event: dict[str, Any]) -> tuple[tuple[date, date], tuple[date, 
     return (ini, fim), (r_ini, r_fim), (per.get("rotulo") or fmt(ini, fim)), ((cmp_ or {}).get("rotulo") or fmt(r_ini, r_fim))
 
 
+# --- Despacho pela ficha do intérprete -------------------------------------------------------------------------------
+# O intérprete devolve uma ficha (o que a pessoa quer, filas, indicadores, período, público). Daqui o app decide pela
+# FICHA, não por palavra-chave: mais de uma fila (ex.: a Review das duas EPSs) = uma consulta por fila e uma resposta só;
+# treinamento e análise sem consulta pronta = direto para a Lyra principal com a ficha, sem as rotas por palavra.
+_VISOES_POR_FILA = {"resultado", "dia_a_dia", "motivos", "pessoas", "casos", "variacao", "anomalia"}
+
+
+def _eps_da_fila(fila: str) -> str | None:
+    return next((e for e, cel in EPS_CELULAS.items() if fila in cel), None)
+
+
+def _alvos_ficha(it: dict[str, Any], eps: str | None, original: str) -> list[tuple[str | None, str]]:
+    filas = list(it.get("filas") or ([it["fila"]] if it.get("fila") else []))
+    if not filas and eps is None:  # visão iFood: "review"/"super" sem EPS = as duas (mesmo se a ficha não trouxe)
+        tq = _norm_text(f"{original} {it.get('herdado') or ''}")
+        for pal, chave in ((r"review\w*", "review"), (r"super cliente\w*|super\b", "cx super cliente")):
+            if re.search(rf"\b({pal})", tq):
+                hits = [f for cel in EPS_CELULAS.values() for f in cel if chave in _norm_text(f)]
+                if len(hits) > 1:
+                    filas = hits
+                    break
+    alvos = [(_eps_da_fila(f) or eps, f) for f in filas if f != "Agentforce CX"]
+    if eps is not None:  # canal de uma EPS: só filas dela
+        alvos = [(e, f) for e, f in alvos if e is None or _compact(e) == _compact(eps)]
+    return alvos
+
+
+def _ficha_txt(it: dict[str, Any]) -> str:
+    campos = {k: it.get(k) for k in ("intencao", "visao", "indicadores", "eps", "filas", "publico", "lider",
+                                     "minha_equipe", "pessoa", "periodo", "comparar_com", "todos", "formato", "herdado")
+              if it.get(k) not in (None, "", [], False)}
+    return json.dumps(campos, ensure_ascii=False)
+
+
+def _despachar(event: dict[str, Any], eps: str | None, question: str, say: Callable[..., Any], in_thread: bool,
+               client: Any, failed: dict[str, bool]) -> bool:
+    """True = já respondeu. False = segue (com event['_despacho_livre'] a Lyra principal responde pela ficha)."""
+    it = event.get("_it")
+    if INTERPRETE_MODE != "on" or not it or event.get("_sub") or event.get("_route") == "interprete_duvida":
+        return False
+    if it.get("intencao") not in {"dados", "analise"} or float(it.get("confianca") or 0) < INTERPRETE_MIN_CONF:
+        return False
+    orig = str(event.get("_orig_q") or question)
+    alvos = _alvos_ficha(it, eps, orig)
+    visao = it.get("visao")
+    inds = it.get("indicadores") or ["csat", "tma", "sla"]
+    if visao == "treinamento":
+        alvo_txt = (" e ".join(f for _, f in alvos) if alvos else
+                    "que a pessoa indicou na conversa (leia a conversa; se não houver, a EPS inteira)")
+        extra = TRAINING_INSTRUCTION.format(fila=alvo_txt)
+        if it.get("publico") == "q4":
+            extra += ("PÚBLICO PEDIDO: o Q4 de cada fila (CSAT abaixo de 90% da meta da fila no período), com supervisor, "
+                      "CSAT, n e TMA de cada um — lista completa em planilha se passar de 25.\n")
+        extra += f"INDICADORES PEDIDOS: {', '.join(i.upper() for i in inds)}.\nLEITURA DO PEDIDO: {_ficha_txt(it)}\n\n"
+        event.update(_despacho_livre=True, _extra_forcado=extra, _route="treinamento", _training=alvo_txt)
+        return False
+    if it.get("intencao") == "analise" and visao in {None, "outro"}:
+        event.update(_despacho_livre=True, _route="livre:ficha",
+                     _extra_forcado=f"INFORMAÇÃO INTERNA PARA A LYRA — leitura do pedido: {_ficha_txt(it)}. Responda a "
+                                    "isso, chamando os subagentes que precisar.\n\n")
+        return False
+    if (len(alvos) > 1 and visao in _VISOES_POR_FILA
+            and not (it.get("lider") or it.get("minha_equipe") or it.get("pessoa"))):
+        rotas, livre = [], False
+        for i, (eps_a, fila) in enumerate(alvos, 1):
+            it_i = dict(it, fila=fila, filas=[fila], eps=eps_a)
+            canon_i = _pergunta_canonica(it_i, orig)
+            if not canon_i:
+                continue
+            sub = dict(event)
+            sub.update(text=canon_i, ts=f"{event.get('ts')}{i}", thread_ts=_reply_ts(event),
+                       client_msg_id=f"{event.get('client_msg_id') or event.get('ts')}-{i}", _sub=True, _it=it_i,
+                       _canon=canon_i, _orig_q=orig, _route=None)
+            try:
+                _process_event_inner(sub, say, True, client, failed)
+            except Exception:
+                logger.warning("Despacho por fila falhou (%s)", fila, exc_info=True)
+            rotas.append(str(sub.get("_route") or "").replace("+ia", ""))
+            livre = livre or bool(sub.get("_ia_livre"))
+        if not rotas:
+            return False
+        event["_route"] = next((r for r in rotas if r), "") + (":multi" if rotas else "")
+        if livre:
+            event["_ia_livre"] = True
+        return True
+    return False
+
+
 def _aplicar_interpretacao(question: str, event: dict[str, Any], eps: str | None, say: Callable[..., Any],
                            in_thread: bool) -> tuple[str, bool]:
     """(pergunta a seguir, já respondeu?). Só age com leitura confiante de pedido de dados/análise; o resto segue as
     regras de antes (processo, ação, conversa, leitura fraca ou falha do intérprete)."""
-    if INTERPRETE_MODE != "on" or not question.strip():
+    if INTERPRETE_MODE != "on" or not question.strip() or event.get("_sub"):
         return question, False
     t0 = time.time()
     ctx = _conversa_ctx(event)
@@ -8082,7 +8183,12 @@ TRAINING_INSTRUCTION = (
     "período, cada um com participação nas avaliações, CSAT do motivo (n) e impacto em p.p. no CSAT da fila. Depois, "
     "cada tema de treinamento diz a qual motivo ofensor ele responde (tema sem motivo ligado só entra se o comentário "
     "mostrar o problema em vários motivos, e aí diga isso).\n"
-    "Seja crítica: amostra pequena, operador com n baixo, ou causa fora do operador precisam ser ditos.\n\n")
+    "Seja crítica: amostra pequena, operador com n baixo, ou causa fora do operador precisam ser ditos.\n"
+    "Se a pessoa falar de TMA, SLA, eficiência ou dispersão: faça também o lado de eficiência na mesma resposta — peça à "
+    "Lyra Indicadores os motivos que mais pesam no TMA da fila e os analistas com maior impacto no TMA (com o TMA de "
+    "cada um), e cruze com o público de CSAT. Se pedirem o Q4 (CSAT abaixo de 90% da meta da fila), o público é o Q4 "
+    "da fila no período, com supervisor, CSAT, n e TMA de cada um.\n"
+    "Com mais de uma fila (ex.: a Review das duas EPSs), faça uma seção por fila, sem misturar as EPSs.\n\n")
 
 
 _TRAINING_THEME_RE = re.compile(r"\b(will\w*|rosie|agentforce|macro\w*|tabula\w*|processo\w*|politica\w*|ferramenta\w*|"
@@ -11311,7 +11417,7 @@ def _team_routines_tick(now: datetime) -> None:
 # --- Passo 3 em todas as respostas: o que as rotas prontas responderiam fica guardado e a IA escreve uma resposta só ---
 # Rotas cuja resposta é modelo fixo (a IA reescreve). As que já são escritas pela IA (livre, anomalia, conversa,
 # motivos, treinamento) ou são comando/sistema (diagnóstico, lembrete, aprendizado, detalhe) saem como estão.
-_ROTAS_MODELO = ("tabela", "novidades", "capa", "csat_diario", "efic_variacao", "motivos_tma", "motivos_sla",
+_ROTAS_MODELO = ("treinamento:pergunta", "tabela", "novidades", "capa", "csat_diario", "efic_variacao", "motivos_tma", "motivos_sla",
                  "tma_pessoas", "sla_pessoas", "pessoas_impacto", "contagem_equipe", "equipe", "reincidentes",
                  "operadores", "csat_agentes_ia", "avaliacoes", "registro do dia", "mop", "causa", "tabela+causa")
 
@@ -11334,7 +11440,8 @@ def _flush_redacao(event: dict[str, Any], say: Callable[..., Any]) -> None:
     rota = str(event.get("_route") or "")
     textos = [str(k.get("text") or "") for k in buf if str(k.get("text") or "").strip()]
     escrito = None
-    if "+ia" not in rota and not event.get("_ia_livre") and rota.split(":")[0] in _ROTAS_MODELO and textos:
+    if ("+ia" not in rota and not event.get("_ia_livre") and (rota in _ROTAS_MODELO or rota.split(":")[0] in _ROTAS_MODELO)
+            and textos):
         try:
             if prog:
                 prog("Já tenho os números, só organizando ⏳")
@@ -11554,26 +11661,43 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             question, ja_respondeu = _aplicar_interpretacao(question, event, eps, say, in_thread)
             if ja_respondeu:
                 return
+            if _despachar(event, eps, question, say, in_thread, client, failed):
+                return
         except Exception:
             logger.warning("Intérprete (on) falhou; seguindo pelas regras", exc_info=True)
-        if _TRAINING_RE.search(_norm_text(question)):
+        if _TRAINING_RE.search(_norm_text(question)) and not event.get("_despacho_livre"):
             thread_txt = _thread_context(event) if event.get("thread_ts") else ""
             fila_t = (_fila_in_question(question, eps) or (_status_fila(question, eps) if eps else None)
-                      or _fila_in_question(thread_txt[-2000:], eps))
+                      or _fila_ref(question, eps, {}) or _fila_in_question(thread_txt[-2000:], eps))
+            if not fila_t and eps is None:  # visão iFood: "Review"/"Super" sem EPS = as duas
+                tq = _norm_text(f"{event.get('_orig_q') or ''} {question} {thread_txt[-1500:]}")
+                for pal, chave in ((r"review\w*", "review"), (r"super cliente\w*|super\b", "cx super cliente")):
+                    if re.search(rf"\b({pal})", tq):
+                        hits = [f for cel in EPS_CELULAS.values() for f in cel if chave in _norm_text(f)]
+                        if len(hits) > 1:
+                            fila_t = " e ".join(hits)
+                            break
+            ja_perguntou = "Bora, mas antes me ajuda a mirar" in thread_txt
             theme = _TRAINING_THEME_RE.search(_norm_text(question))
             if theme and not fila_t:  # treinamento de tema (Will, macro, processo…): não é pelo CSAT da fila
                 event["_route"] = "treinamento:tema"
                 event["_training_theme"] = theme.group(0)
-            elif not fila_t:  # "quem eu treino?": treinamento começa pelo problema, não pela lista
+            elif not fila_t and not ja_perguntou:  # "quem eu treino?": treinamento começa pelo problema, não pela lista
                 ask = _training_question(eps)
                 if ask:
                     event["_route"] = "treinamento:pergunta"
                     _say(say, ask, event, in_thread)
                     return
-            else:
+            elif fila_t:
                 event["_route"] = "treinamento"
                 question = (f"{question}\n(Fila: {fila_t})")
                 event["_training"] = fila_t
+            else:  # já perguntamos a fila e não deu pra reconhecer: a IA lê a conversa, sem repetir a pergunta
+                event["_route"] = "treinamento"
+                event["_training"] = "que a pessoa indicou na conversa (leia a thread; se forem duas EPSs, uma seção por fila)"
+        q_real = None
+        if event.get("_despacho_livre"):  # a ficha já decidiu: as rotas por palavra não olham esta mensagem
+            q_real, question = question, "__"
         if CREAD and _DAYLOG_RE.search(_norm_text(question)):
             _ontem = "ontem" in _norm_text(question)
             day_txt = _daylog_text([eps] if eps else list(EPS_CELULAS),
@@ -11928,9 +12052,13 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             return
 
         send_progress = progress  # uma mensagem de andamento só, editada e apagada quando a resposta chega
+        if q_real is not None:
+            question = q_real
 
         extra = count_extra or efic_extra
-        if _ESTEIRA_REQ_RE.search(_norm_text(question)):
+        if event.get("_despacho_livre"):
+            extra = str(event.get("_extra_forcado") or "")
+        if _ESTEIRA_REQ_RE.search(_norm_text(question)) and not event.get("_despacho_livre"):
             fila_e = _fila_ref(question, eps, event)
             if fila_e:
                 d1_e = _d1_context(question, event)
@@ -11942,7 +12070,8 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                     _say(say, f"Não consegui montar a esteira de `{fila_e}` agora. Tenta de novo daqui a pouco?", event,
                          in_thread=True)
                 return
-        if _is_cause_request(question) and not _MOTIVOS_RE.search(_norm_text(question)):
+        if (_is_cause_request(question) and not _MOTIVOS_RE.search(_norm_text(question))
+                and not event.get("_despacho_livre")):
             fila_q = _fila_ref(question, eps, event)
             mix_only = bool(_MIX_ONLY_RE.search(_norm_text(question)))
             d1_ctx = _d1_context(question, event)
@@ -12044,7 +12173,7 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                          "Produto) é postada separadamente pelo app nesta thread. NÃO chame a Lyra Qualidade e NÃO liste pilares: "
                          "chame só a Lyra Indicadores (Pedido: variação do CSAT) e responda a variação (efeito mix x performance "
                          "e response rate). Feche com 1 frase sobre o que é da EPS cobrar.\n\n")
-        if not extra and _is_anomalia_request(question):
+        if not extra and _is_anomalia_request(question) and not event.get("_despacho_livre"):
             event["_route"] = "anomalia"
             dia_a = _anomalia_dia(question, event)
             fila_a = _fila_in_question(question, eps) or _fila_ref(question, eps, event)
