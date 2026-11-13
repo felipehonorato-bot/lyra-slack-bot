@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.42.0"
+APP_VERSION = "5.43.1"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -8440,12 +8440,14 @@ REDACAO_INSTRUCTION = (
     "Se a pergunta parte de uma premissa que os dados desmentem (ex.: \"por que caiu?\" e subiu), diga isso logo.\n"
     "2. Depois, só o que explica: no máximo 3 pontos curtos com o que mais pesa. Escolha; não repita todos os números.\n"
     "3. Use SÓ números que estão em DADOS, como estão (pode arredondar: \"quase 20 p.p.\"). Nunca calcule número novo e "
-    "nunca invente causa, motivo ou nome que não esteja em DADOS.\n"
+    "nunca invente motivo ou nome que não esteja em DADOS. Interpretar os números é com você (ex.: volume acima do plan "
+    "com TMA dentro do plan = fila acumulando antes do atendimento).\n"
     "4. Tom de colega de trabalho que conhece a operação: português do Brasil, direto, sem jargão de sistema. Sem "
     "fórmula, sem explicar como o número é calculado (a não ser que perguntem).\n"
     "5. Formato Slack: *negrito* com um asterisco, nome de fila entre crases, sem título com #, sem tabela, no máximo "
     "7 linhas.\n"
-    "6. Feche com a OFERTA abaixo, do seu jeito (uma pergunta curta), se ela fizer sentido para a conversa.\n"
+    "6. Feche com a OFERTA abaixo, do seu jeito (uma pergunta curta), se ela fizer sentido. Ofereça só isso: é o que "
+    "você tem pronto para mandar se a pessoa disser sim.\n"
     "7. Não fale de app, consulta, SQL, dados internos nem que você é uma IA.\n"
     "Responda SÓ o texto da mensagem.\n\n"
 )
@@ -8476,7 +8478,12 @@ def _redacao_numeros_ok(texto: str, dados: str) -> tuple[bool, list[float]]:
     for v in _num_vals(texto):
         if v <= 31 and float(v).is_integer():
             continue
-        if any(abs(v - x) <= max(0.6, abs(x) * 0.03) for x in base):
+        # com casa decimal tem que bater (70,7 é 70,7); inteiro pode ser arredondamento ("77%" de 77,3; "11 mil")
+        tol = (lambda x: 0.051) if not float(v).is_integer() else (lambda x: max(0.6, abs(x) * 0.02))
+        if any(abs(v - x) <= tol(x) for x in base):
+            continue
+        # diferença entre dois números dos dados ("2,9 p.p. acima da meta" = 74,9 − 72) é leitura, não invenção
+        if len(base) <= 400 and any(abs(v - abs(a - b)) <= 0.051 for i, a in enumerate(base) for b in base[i + 1:]):
             continue
         fora.append(v)
     return not fora, fora
@@ -9803,8 +9810,7 @@ def _diagnostics_text() -> str:
                                         "⚠️ sem TOQAN_INTERPRETE_KEY: usa a Lyra principal (mais lento)")
                  + f" · modo: {INTERPRETE_MODE}" + (" (registrando em paralelo)" if INTERPRETE_MODE == "shadow"
                                                      and TOQAN_INTERPRETE_KEY else ""))
-    lines.append("✍️ *Passo 3 (IA escreve a resposta)* · " + ("✅ ligado (REDACAO_IA=on): \"por que caiu\", fila "
-                                                               "\"tá segurando?\" e resultado da fila"
+    lines.append("✍️ *Passo 3 (IA escreve a resposta)* · " + ("✅ ligado (REDACAO_IA=on) em todas as respostas de dados"
                                                                if _redacao_on() else "desligado (REDACAO_IA=off)"))
     lines.append("")
     lines.append("📍 *Controles das EPSs (STATUS_CHANNELS)*")
@@ -11226,6 +11232,55 @@ def _team_routines_tick(now: datetime) -> None:
             threading.Thread(target=run, daemon=True).start()
 
 
+# --- Passo 3 em todas as respostas: o que as rotas prontas responderiam fica guardado e a IA escreve uma resposta só ---
+# Rotas cuja resposta é modelo fixo (a IA reescreve). As que já são escritas pela IA (livre, anomalia, conversa,
+# motivos, treinamento) ou são comando/sistema (diagnóstico, lembrete, aprendizado, detalhe) saem como estão.
+_ROTAS_MODELO = ("tabela", "novidades", "capa", "csat_diario", "efic_variacao", "motivos_tma", "motivos_sla",
+                 "tma_pessoas", "sla_pessoas", "pessoas_impacto", "contagem_equipe", "equipe", "reincidentes",
+                 "operadores", "csat_agentes_ia", "avaliacoes", "registro do dia", "mop", "causa", "tabela+causa")
+
+
+def _is_progress_text(text: str) -> bool:
+    t = str(text or "").strip()
+    return len(t) < 320 and ("⏳" in t or ":hourglass" in t) and not re.search(r"\d+[,.]\d+\s*%", t)
+
+
+def _flush_redacao(event: dict[str, Any], say: Callable[..., Any]) -> None:
+    """Fim da conversa: a IA escreve UMA resposta a partir de tudo o que as rotas prontas iam mandar. Se ela falhar
+    (ou a rota já for escrita pela IA, ou for comando), sai exatamente o que a rota mandaria."""
+    buf = event.get("_buf")
+    event["_buf"] = None  # daqui pra frente (threads em segundo plano) posta direto
+    prog = event.pop("_buf_prog", None)
+    if not buf:
+        if prog:
+            prog.done()
+        return
+    rota = str(event.get("_route") or "")
+    textos = [str(k.get("text") or "") for k in buf if str(k.get("text") or "").strip()]
+    escrito = None
+    if "+ia" not in rota and not event.get("_ia_livre") and rota.split(":")[0] in _ROTAS_MODELO and textos:
+        try:
+            if prog:
+                prog("Já tenho os números, só organizando ⏳")
+            dados = "\n\n".join(re.sub(r"(?im)^.*(vêm logo abaixo|só um minutinho).*$", "", t) for t in textos)
+            escrito = _redigir(event, str(event.get("_orig_q") or _strip_mentions(str(event.get("text") or ""))),
+                               event.get("_eps"), dados,
+                               oferta="mandar o detalhe completo, com todos os números" if len(dados) > 900 else "",
+                               detalhe="\n\n".join(textos) if len(dados) > 900 else "")
+        except Exception:
+            logger.warning("Passo 3 (todas as rotas) falhou; vai o modelo fixo", exc_info=True)
+            escrito = None
+    if prog:
+        prog.done()
+    if escrito:
+        kw = {k: v for k, v in buf[0].items() if k not in {"text", "blocks"}}
+        kw["text"] = _slack_md(escrito)
+        say(**kw)
+        return
+    for kw in buf:
+        say(**kw)
+
+
 def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bool, client: Any = None) -> None:
     """Processa a mensagem e registra a conversa (pergunta, resposta, tempo, rota) para auditoria e saúde."""
     started = time.time()
@@ -11235,6 +11290,14 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
 
     def say(*args: Any, **kwargs: Any) -> Any:  # noqa: F811 — guarda o que foi respondido
         text = kwargs.get("text") if "text" in kwargs else (args[0] if args else "")
+        buf = event.get("_buf")
+        if buf is not None and not args:  # passo 3 em tudo: segura a resposta para a IA escrever no fim
+            if _is_progress_text(str(text or "")):
+                prog = event.setdefault("_buf_prog", _Progress(event))
+                prog(str(text))  # andamento: uma mensagem só, apagada quando a resposta sai
+                return None
+            buf.append(dict(kwargs))
+            return None
         said.append(str(text or ""))
         resp = orig_say(*args, **kwargs)
         try:
@@ -11258,8 +11321,13 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
                              daemon=True).start()
         except Exception:
             logger.warning("Intérprete (shadow) não iniciou", exc_info=True)
+    if _redacao_on():  # REDACAO_IA=on: toda resposta de dados passa pela IA
+        event["_buf"] = []
     try:
-        _process_event_inner(event, say, in_thread, client, failed)
+        try:
+            _process_event_inner(event, say, in_thread, client, failed)
+        finally:
+            _flush_redacao(event, say)
         if FEEDBACK_REACTIONS and said_ts and not failed["v"] and \
                 str(event.get("_route") or "livre") not in {"lembrete", "aprendizado", "report_manual", "mop_upload"}:
             _add_feedback_reactions(str(event.get("channel") or ""), said_ts[-1])
@@ -11365,6 +11433,11 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             _say(say, ("🧠 *Como eu li:* _" + m_int.group(1).strip()[:200] + "_\n" + _interpretacao_txt(it)) if it else
                  f"🧠 Não consegui interpretar agora ({str(raw)[:200]}).", event, True)
             return
+        if re.match(r"^\s*reda(c|ç)(o|õ)es\b", re.sub(r"^\s*(<@\w+>|@?lyra\b)[\s,:]*", "", question, flags=re.I), re.I):
+            event["_route"] = "redacao_log"
+            m_n = re.search(r"\b(\d{1,2})\b", question)
+            _say(say, _redacoes_txt(min(int(m_n.group(1)), 40) if m_n else 10), event, True)
+            return
         if _INTERPRETACOES_CMD_RE.match(re.sub(r"^\s*@?lyra\b[\s,:]*", "", question, flags=re.I)):
             event["_route"] = "interprete_log"
             m_n = re.search(r"\b(\d{1,2})\b", question)
@@ -11391,11 +11464,6 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 return
         except Exception:
             logger.warning("Learning handling failed", exc_info=True)
-        if re.match(r"^\s*(@?lyra\b[\s,:]*)?reda(c|ç)(o|õ)es\b", question, re.I):
-            event["_route"] = "redacao_log"
-            m_n = re.search(r"\b(\d{1,2})\b", question)
-            _say(say, _redacoes_txt(min(int(m_n.group(1)), 40) if m_n else 10), event, True)
-            return
         try:  # passo 3: "sim"/"quero"/"manda o detalhe" depois de uma resposta escrita pela IA
             if _detalhe_pedido(event, question, say):
                 event["_route"] = "detalhe"
@@ -11800,6 +11868,8 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             d1_ctx = _d1_context(question, event)
             block_q = _report_block_for(str(event.get("channel") or ""), str(event.get("thread_ts") or ""))
             if fila_q or block_q:
+                if not str(event.get("_route") or "").startswith("tabela"):
+                    event["_route"] = "causa"
                 # esteira (Qualidade) em paralelo com a análise de variação (Indicadores): a pessoa não fica esperando
                 fila_v = block_q[1].get("fila") if block_q else fila_q
                 note = None if mix_only else _above_meta_note(fila_v, eps, "d1" if d1_ctx else "mes")
@@ -11956,6 +12026,7 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
         if shape:  # pergunta de indicador sem consulta pronta: análise livre com trilho, registrada para o catálogo
             event["_route"] = event.get("_route") or f"livre:{shape['key']}"
             _catalog_log(shape, question, event)
+        event["_ia_livre"] = True  # daqui pra baixo quem escreve é a Lyra principal: o passo 3 não reescreve
         context = _thread_context(event) or _dm_context(event)
         orig_line = (f"INFORMAÇÃO INTERNA PARA A LYRA — a pessoa escreveu: \"{event['_orig_q']}\". Entendi como: "
                      f"\"{question}\". Responda ao que ela escreveu, no jeito dela.\n\n" if event.get("_orig_q") else "")
@@ -13014,6 +13085,13 @@ def _topic_prompt(eps: str, title: str, conversa: str, n_imgs: int) -> str:
         + "Decida e responda em UM destes formatos, sem nada antes:\n"
         "1. `SILENCIO` — se for só informativo, ritual, aviso ou conversa entre a operação, sem dúvida, divergência "
         "ou pedido para o iFood.\n"
+        "PEDIDO DA EPS AO iFOOD (mesmo marcando alguém do time, ex.: liberar cupom/voucher, estorno, ajuste em caso, "
+        "prazo de política, acesso): você é a primeira linha e substitui o time do iFood. Tente resolver ao máximo: "
+        "consulte a *Lyra Conhecimento* (política, prazos, processo) e responda o que dá para responder (o que a regra "
+        "diz, o que a EPS deve fazer ou dizer ao cliente). Se depender de uma AÇÃO que você não consegue executar "
+        "(liberar ou antecipar cupom, estorno manual, acesso, correção em sistema) ou a base não responder, diga o que já "
+        "dá para fazer e termine com a linha `ESCALAR: experiencia|eficiencia: <o que precisa ser feito, com o número "
+        "do caso>` para chamar o dono do tema.\n"
         "2. A resposta, em até 6 linhas, se for dúvida/divergência (ex.: como o iFood calcula um indicador, por que o "
         "número deles difere do nosso, regra de processo) E a base responder: consulte a *Lyra Conhecimento* (regras, "
         "definições, processos) e, se for número ou cálculo, a *Lyra Indicadores*. Use só o que elas devolverem.\n"
@@ -13034,8 +13112,9 @@ def _topic_prompt(eps: str, title: str, conversa: str, n_imgs: int) -> str:
         "DÚVIDA de regra/cálculo/processo que a base não responde (NÃO SEI) ou que depende de decisão do time. "
         "experiencia = CSAT, avaliações, detratoras, aderência a processo/política. eficiencia = TMA, SLA, volume, fila, "
         "produtividade, HC, palitagem e o resto.\n"
-        "Se o conteúdo principal estiver em imagem que você não vê, diga em 1 frase que não consegue ver a imagem e "
-        "peça o texto ou o Excel — não escale e não chute o conteúdo. Nunca chute número nem regra."
+        "Imagem que você não vê: se o TEXTO da mensagem já explica o pedido (caso, valor, o que aconteceu), responda pelo "
+        "texto e ignore a imagem. Só peça o texto ou a planilha quando o pedido depender do que está na imagem — e aí "
+        "não escale nem chute o conteúdo. Nunca chute número nem regra."
     )
 
 
