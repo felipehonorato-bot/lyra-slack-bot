@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.47.6"
+APP_VERSION = "5.48.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -6788,6 +6788,18 @@ _INTERPRETE_CMD_RE = re.compile(r"^\s*interpreta\w*\s*[:\-]\s*(.+)$", re.I | re.
 _INTERPRETACOES_CMD_RE = re.compile(r"^\s*interpreta(c|ç)(o|õ)es\b", re.I)
 _VISOES = {"resultado", "dia_a_dia", "motivos", "pessoas", "equipe", "casos", "variacao", "anomalia", "treinamento", "crise",
            "outro"}
+CRISE_FEED_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA: a pessoa quer saber de CRISE / INCIDENTE / PROBLEMA operacional no período "
+    "{periodo} — não de resultado. Crise, incidente, problema, instabilidade, falha e queda são a mesma pergunta: use a "
+    "palavra que a pessoa usou. As mensagens dos canais de alerta já foram lidas pelo app e estão abaixo: NÃO chame "
+    "subagente para ler canal. Responda curto, só com o que está nas mensagens: teve ou não; o que aconteceu e quando "
+    "(~hhhmm); causa (ou 'em investigação'); impacto no atendimento (filas, transbordo, backlog); status. Mais de uma "
+    "ocorrência: uma por linha, da mais recente para a mais antiga; ocorrência menor (alerta, lentidão, chamado da EPS) "
+    "entra marcada 'sem impacto relevante no atendimento'. Nada nas mensagens: diga que não teve ocorrência registrada "
+    "no período nos canais lidos (cite-os). Canal que não abriu: diga em 1 linha. NÃO traga CSAT, TMA, SLA, operadores "
+    "nem cobrança (só se a pessoa pedir); no máximo ofereça cruzar com os indicadores. Não marque ninguém e não copie "
+    "nomes de pessoas das mensagens.\n\n"
+)
 CRISE_INSTRUCTION = (
     "INFORMAÇÃO INTERNA PARA A LYRA: a pessoa quer saber de CRISE / INCIDENTE operacional (sistema, Rosie, plataforma, "
     "Salesforce, fila travada, ferramenta fora) — não de resultado. Crise, incidente, problema, instabilidade, falha e "
@@ -7258,9 +7270,15 @@ def _despachar(event: dict[str, Any], eps: str | None, question: str, say: Calla
         except ValueError:
             periodo = "agora"
         eps_c = it.get("eps") or eps
-        event.update(_despacho_livre=True, _route="crise",
-                     _extra_forcado=CRISE_INSTRUCTION.format(periodo=periodo,
-                                                             eps_txt=f" e `EPS: {eps_c}`" if eps_c else ""))
+        feed = ""
+        try:
+            fim_dt = min(datetime(fim.year, fim.month, fim.day, tzinfo=BRAZIL_TIMEZONE) + timedelta(days=1), _now_brazil())
+            feed = _crisis_feed_txt(datetime(ini.year, ini.month, ini.day, tzinfo=BRAZIL_TIMEZONE), fim_dt)
+        except Exception:
+            logger.warning("Crisis feed (pergunta de crise) falhou", exc_info=True)
+        extra_c = (CRISE_FEED_INSTRUCTION.format(periodo=periodo) + feed) if feed else CRISE_INSTRUCTION.format(
+            periodo=periodo, eps_txt=f" e `EPS: {eps_c}`" if eps_c else "")
+        event.update(_despacho_livre=True, _route="crise" if feed else "crise:toqan", _extra_forcado=extra_c)
         return False
     if visao == "treinamento":
         if not alvos and (event.get("_ficha_anterior") or {}).get("filas"):  # "manda o excel": filas da conversa
@@ -7733,8 +7751,116 @@ CRISIS_CHECK_TTL = int(os.getenv("CRISIS_CHECK_TTL", "1800"))  # status/prints r
 CRISIS_STATUS_WINDOW_HOURS = 3
 
 
+# Os canais de alerta são lidos pelo PRÓPRIO app (a Lyra do Slack é membro deles); o leitor de Slack do Toqan não
+# enxerga esses canais. As mensagens vão junto do pedido e a IA só interpreta.
+CRISIS_CHANNELS = [tuple(x.split(":", 1)) for x in os.getenv(
+    "CRISIS_CHANNELS", "C09B5QLL4GN:#incidente-salesforce,C0AHHN66VN1:#hubble-insights,CN662E5UG:#support-operations"
+).split(",") if ":" in x]
+CRISIS_FEED_MAX_CHARS = int(os.getenv("CRISIS_FEED_MAX_CHARS", "18000"))
+_CRISIS_FEED_CACHE: dict[str, tuple[float, tuple[str, list[str], list[str]]]] = {}
+_CRISIS_FEED_LOCK = threading.Lock()
+
+
+def _msg_texto(m: dict[str, Any], limite: int) -> str:
+    """Texto da mensagem + anexos (alertas de bot vêm em attachments), sem marcar ninguém."""
+    partes = [str(m.get("text") or "")]
+    for at in m.get("attachments") or []:
+        partes += [str(at.get(k) or "") for k in ("title", "text", "fallback") if at.get(k)]
+    t = " / ".join(p.strip() for p in partes if p and p.strip())
+    t = re.sub(r"<@[A-Z0-9]+(\|[^>]*)?>", "@pessoa", t)
+    t = re.sub(r"<!(here|channel|everyone)>", "@aviso", t)
+    t = re.sub(r"<(https?://[^|>]+)\|([^>]+)>", r"\2", t)
+    return re.sub(r"\s+", " ", t)[:limite]
+
+
+def _crisis_feed(start: datetime, end: datetime) -> tuple[str, list[str], list[str]]:
+    """(mensagens dos canais de alerta no período, canais lidos, canais que falharam). Cache de 5 min."""
+    chave = f"{int(start.timestamp()) // 300}:{int(end.timestamp()) // 300}"
+    with _CRISIS_FEED_LOCK:
+        hit = _CRISIS_FEED_CACHE.get(chave)
+        if hit and time.time() - hit[0] < 300:
+            return hit[1]
+    lidos: list[str] = []
+    falhas: list[str] = []
+    blocos: list[str] = []
+    por_canal = max(CRISIS_FEED_MAX_CHARS // max(len(CRISIS_CHANNELS), 1), 2000)
+    hora = lambda ts: datetime.fromtimestamp(float(ts), BRAZIL_TIMEZONE).strftime("%d/%m %H:%M")
+    for cid, nome in CRISIS_CHANNELS:
+        try:
+            r = slack_app.client.conversations_history(channel=cid, oldest=str(start.timestamp()),
+                                                       latest=str(end.timestamp()), limit=200, inclusive=True)
+            msgs = [m for m in (_resp_get(r, "messages", []) or []) if isinstance(m, dict)]
+        except Exception as e:
+            erro = ""
+            try:
+                erro = str(e.response.get("error"))  # type: ignore[attr-defined]
+            except Exception:
+                erro = type(e).__name__
+            falhas.append(f"{nome} ({erro})")
+            continue
+        lidos.append(nome)
+        msgs = [m for m in msgs if "judge" not in _norm_text(str((m.get("bot_profile") or {}).get("name") or
+                                                                 m.get("username") or ""))]
+        msgs.sort(key=lambda m: float(m.get("ts") or 0))
+        com_thread = sorted([m for m in msgs if int(m.get("reply_count") or 0) > 0],
+                            key=lambda m: -int(m.get("reply_count") or 0))[:6]
+        respostas: dict[str, list[str]] = {}
+        for m in com_thread:  # o detalhe do incidente (diagnóstico, mitigação, normalização) fica na thread
+            try:
+                rs = _fetch_thread(cid, str(m.get("ts")))[1:16]
+                respostas[str(m.get("ts"))] = [f"   ↳ {hora(x.get('ts'))} {_msg_texto(x, 280)}" for x in rs
+                                               if _msg_texto(x, 280)]
+            except Exception:
+                logger.warning("Crisis feed: thread %s/%s failed", nome, m.get("ts"), exc_info=True)
+        linhas = [f"### {nome} — {len(msgs)} mensagem(ns) no período"]
+        for m in msgs:
+            t = _msg_texto(m, 450)
+            if not t:
+                continue
+            linhas.append(f"[{hora(m.get('ts'))}] {t}")
+            linhas += respostas.get(str(m.get("ts")), [])
+        bloco = "\n".join(linhas)
+        if len(bloco) > por_canal:  # muito movimento: fica com as mais recentes (e as threads delas)
+            bloco = linhas[0] + "\n(…mensagens mais antigas omitidas…)\n" + bloco[-(por_canal - 200):]
+        blocos.append(bloco)
+    out = ("\n\n".join(blocos), lidos, falhas)
+    with _CRISIS_FEED_LOCK:
+        _CRISIS_FEED_CACHE[chave] = (time.time(), out)
+    return out
+
+
+def _crisis_feed_txt(start: datetime, end: datetime) -> str:
+    """Bloco pronto para o prompt: mensagens + quais canais foram lidos / não abriram. Vazio se nenhum abriu."""
+    try:
+        feed, lidos, falhas = _crisis_feed(start, end)
+    except Exception:
+        logger.warning("Crisis feed failed", exc_info=True)
+        return ""
+    if not lidos:
+        if falhas:
+            logger.warning("Crisis feed: nenhum canal abriu: %s", falhas)
+        return ""
+    return ("MENSAGENS DOS CANAIS DE ALERTA NO PERÍODO (lidas agora pelo app; horários BRT; @pessoa = alguém marcado):\n"
+            f"Canais lidos: {', '.join(lidos)}" + (f" · não abriram: {', '.join(falhas)}" if falhas else "")
+            + "\n" + (feed or "(nenhuma mensagem no período)") + "\n\n")
+
+
 def _crisis_prompt(start: datetime, end: datetime, eps: str | None) -> str:
     f = lambda d: d.strftime("%d/%m/%Y %H:%M")
+    feed = _crisis_feed_txt(start, end)
+    if feed:  # o app já leu os canais: a IA só interpreta (rápido e sem depender do leitor de Slack do Toqan)
+        return (
+            "TAREFA INTERNA DO APP — checagem de crise. Não é mensagem para o Slack. Responda APENAS com JSON válido. "
+            "NÃO chame subagente e não tente ler canal: as mensagens já estão abaixo.\n"
+            f"Período: {f(start)} a {f(end)} (BRT)" + (f" · EPS: {eps}" if eps else "") + "\n\n" + feed +
+            "Crise = evento com impacto no atendimento (bot fora, transbordo, fila subindo, sistema do atendimento "
+            "instável). Alerta técnico que se resolveu sem efeito na fila não é crise. Devolva:\n"
+            '{"crise": true, "resumo": "<sistema e o que aconteceu, 1 frase>", "inicio": "~hhhmm", "fim": "~hhhmm ou '
+            'em andamento", "impacto": "<efeito no atendimento>", "filas": ["<fila citada>"], "status": '
+            '"Estabilizado|Estabilizando|Em andamento|Em investigação"}\n'
+            'Sem crise: {"crise": false, "verificado": true, "canais": [<os canais lidos>], "limitacao": "<os que não '
+            'abriram, ou vazio>"}'
+        )
     return (
         "TAREFA INTERNA DO APP — checagem de crise. Não é mensagem para o Slack. Responda APENAS com JSON válido.\n"
         "Chame o subagente *Lyra Crises* com 'Pedido: checagem de crise' e "
@@ -10785,6 +10911,17 @@ def _diagnostics_text() -> str:
     lines += ["", "📣 *Report e conversa (EPS_CHANNELS)*"]
     for eps, ch in EPS_CHANNELS.items():
         lines.append(f"• *{eps}* <#{ch}> · {member(ch)}")
+    lines += ["", "🚨 *Canais de alerta (Lyra Crises — o app lê o histórico)*"]
+    for cid, nome in CRISIS_CHANNELS:
+        try:
+            slack_app.client.conversations_history(channel=cid, limit=1)
+            leitura = "✅ lê o histórico"
+        except Exception as exc:
+            m = str(exc)
+            leitura = ("❌ não lê: adicione a @Lyra" if "not_in_channel" in m or "channel_not_found" in m
+                       else "❌ não lê: falta o escopo channels:history/groups:history no app do Slack"
+                       if "missing_scope" in m else f"⚠️ não lê ({type(exc).__name__}: {m[:80]})")
+        lines.append(f"• {nome} · {member(cid)} · {leitura}")
     if MELHORIAS_CHANNELS:
         lines += ["", "🛠️ *Canais de melhorias*"]
         for eps, ch in MELHORIAS_CHANNELS.items():
