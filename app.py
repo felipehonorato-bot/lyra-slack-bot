@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.45.0"
+APP_VERSION = "5.46.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -3694,6 +3694,65 @@ def _divergencias_oficiais(texto: str, oficiais: dict[str, dict[str, float]]) ->
     return div
 
 
+_SUP_REF_RE = re.compile(r"\b([Ss]up\.|[Ss]upervisor[a]?|[Ss]upervisão|[Ee]quipe d[aeo]|[Tt]ime d[aeo])\s*:?\s+"
+                         r"([A-ZÁÉÍÓÚÂÊÔÃÕÇ][\wÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç]+(?:\s+(?:d[aeo]s?\s+)?[A-ZÁÉÍÓÚÂÊÔÃÕÇ]"
+                         r"[\wÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç]+){0,4})")
+
+
+def _corrigir_supervisores(answer: str, eps: str | None) -> str:
+    """Trava: vínculo operador → supervisor só pelo MOP. Linha com e-mail de operador: o supervisor citado vira o do
+    MOP (ou 'sem supervisor no MOP'). Nome citado como supervisor/equipe que não é supervisor no MOP: a Lyra reescreve
+    sem ele. Nunca sai uma equipe inventada."""
+    if not answer or not _SUP_REF_RE.search(answer):
+        return answer
+    people = {}
+    for e in ([eps] if eps else ["AeC", "CSU"]):
+        try:
+            people.update(_mop_people(e))
+        except Exception:
+            pass
+    if not people:
+        return answer
+    sups = {_nice_name(p["supervisor"]) for p in people.values() if p.get("supervisor")}
+    trocas = []
+
+    def linha_ok(linha: str) -> str:
+        m_mail = re.search(r"[\w.+-]+@[\w.-]*(aec|csu)[\w.-]*\.[a-z]{2,}", linha, re.I)
+        if not m_mail:
+            return linha
+        p = people.get(m_mail.group(0).lower())
+        certo = _nice_name(p["supervisor"]) if p and p.get("supervisor") else "sem supervisor no MOP"
+
+        def troca(m: re.Match[str]) -> str:
+            if _name_hit(certo, m.group(2)) or _name_hit(m.group(2), certo):
+                return m.group(0)
+            trocas.append(f"{m.group(2)} → {certo}")
+            return f"{m.group(1)} {certo}"
+        return _SUP_REF_RE.sub(troca, linha)
+
+    texto = "\n".join(linha_ok(l) for l in answer.split("\n"))
+    falsos = sorted({m.group(2) for m in _SUP_REF_RE.finditer(texto)
+                     if not any(_name_hit(m.group(2), s_) or _name_hit(s_, m.group(2)) for s_ in sups)
+                     and m.group(2) != "sem supervisor no MOP" and len(m.group(2).split()) >= 2})
+    if falsos:
+        try:
+            novo = str(ask_toqan(
+                "TAREFA INTERNA — CORREÇÃO. Os nomes abaixo foram citados como supervisor/equipe, mas NÃO são supervisores "
+                "no MOP. Reescreva a MESMA resposta tirando esses vínculos (não atribua equipe a ninguém sem o MOP; se a "
+                "frase dependia disso, tire a frase). Mantenha o resto igual. Devolva só a resposta.\n"
+                f"NOMES ERRADOS: {', '.join(falsos)}\n\nRESPOSTA:\n{texto}", max_attempts=REDACAO_MAX_POLLS) or "").strip()
+        except Exception:
+            novo = ""
+        if novo and not _is_error_answer(novo) and not any(_name_hit(f, novo) for f in falsos):
+            texto = novo
+        else:
+            texto = "\n".join(l for l in texto.split("\n") if not any(_name_hit(f, l) for f in falsos))
+    if trocas or falsos:
+        _alert("🛠️ Corrigi vínculo de supervisor fora do MOP numa resposta livre: "
+               + "; ".join(trocas[:5] + [f"{f} (não é supervisor no MOP)" for f in falsos[:3]]))
+    return texto
+
+
 def _corrigir_oficiais(answer: str, question: str, event: dict[str, Any], eps: str | None) -> str:
     """Trava da análise livre: TMA/SLA tem que ser o oficial (CAPA). Se a resposta trouxe outro número, a Lyra
     reescreve com os oficiais; se ainda assim não bater, vai o quadro oficial. Nunca sai número errado."""
@@ -5610,7 +5669,7 @@ def _csat_pessoas_xlsx(calcs: list[tuple[str, dict[str, Any]]], eps: str | None)
         ws = wb.create_sheet(titulo)
         ws.append(["EPS", "Supervisor" if tipo == "sups" else "Operador", "Fila" if tipo == "ops" else "Operadores",
                    "Avaliações", "Promotoras", "CSAT (%)", "Meta (%)", "Avaliações do conjunto", "Impacto (p.p.)",
-                   "Positivas faltantes"])
+                   "Positivas faltantes", "Quadrante"] + (["Supervisor"] if tipo == "ops" else []))
         for c in ws[1]:
             c.font, c.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="EA1D2C")
         i = 1
@@ -5625,7 +5684,13 @@ def _csat_pessoas_xlsx(calcs: list[tuple[str, dict[str, Any]]], eps: str | None)
                 ws.cell(row=i, column=6, value=f"=IFERROR(E{i}/D{i}*100,\"\")")
                 ws.cell(row=i, column=9, value=f"=(E{i}-G{i}/100*D{i})/H{i}*100")
                 ws.cell(row=i, column=10, value=f"=MAX(0,ROUNDUP(G{i}/100*D{i}-E{i},0))")
-        for col, w in zip("ABCDEFGHIJ", (8, 44, 24, 12, 12, 10, 10, 20, 14, 18)):
+                # quadrante: CSAT ÷ meta (Q1 ≥ 100%, Q2 95–99,9%, Q3 90–94,9%, Q4 < 90%)
+                ws.cell(row=i, column=11, value=f'=IF(F{i}="","",IF(F{i}/G{i}>=1,"Q1",IF(F{i}/G{i}>=0.95,"Q2",'
+                                                f'IF(F{i}/G{i}>=0.9,"Q3","Q4"))))')
+                if tipo == "ops":
+                    ws.cell(row=i, column=12, value=_nice_name(x["sup"]) if x.get("sup") else "")
+        ws.auto_filter.ref = ws.dimensions
+        for col, w in zip("ABCDEFGHIJKL", (8, 44, 24, 12, 12, 10, 10, 20, 14, 18, 11, 30)):
             ws.column_dimensions[col].width = w
         ws.freeze_panes = "C2"
     buf = io.BytesIO()
@@ -6656,7 +6721,7 @@ INTERPRETE_LOG_MAX = 300
 _INTERPRETE_CMD_RE = re.compile(r"^\s*interpreta\w*\s*[:\-]\s*(.+)$", re.I | re.S)
 _INTERPRETACOES_CMD_RE = re.compile(r"^\s*interpreta(c|ç)(o|õ)es\b", re.I)
 _VISOES = {"resultado", "dia_a_dia", "motivos", "pessoas", "equipe", "casos", "variacao", "anomalia", "treinamento", "outro"}
-_INTENCOES = {"dados", "analise", "processo", "acao", "conversa"}
+_INTENCOES = {"dados", "analise", "processo", "acao", "conversa", "questionamento"}
 
 
 def _lideres_mop(eps: str | None) -> list[str]:
@@ -6692,7 +6757,7 @@ def _interprete_msg(question: str, eps: str | None, contexto: str, quem: str) ->
 
 _INTERPRETE_MOLDE = (
     "PREENCHA ESTE MOLDE e devolva só ele (mesmas 17 chaves, nesta ordem, valores só dos permitidos):\n"
-    '{"intencao": "<dados|analise|processo|acao|conversa>", '
+    '{"intencao": "<dados|analise|processo|acao|conversa|questionamento>", '
     '"visao": "<resultado|dia_a_dia|motivos|pessoas|equipe|casos|variacao|anomalia|treinamento|outro|null>", '
     '"indicadores": ["<csat|tma|sla>"], "eps": "<AeC|CSU|null>", "fila": "<nome exato de FILAS DA EPS|null>", '
     '"filas": ["<nomes exatos de FILAS DA EPS; [] = EPS inteira>"], "publico": "<q4|todos|top|null>", '
@@ -6996,6 +7061,8 @@ def _eps_da_fila(fila: str) -> str | None:
 
 def _alvos_ficha(it: dict[str, Any], eps: str | None, original: str) -> list[tuple[str | None, str]]:
     filas = list(it.get("filas") or ([it["fila"]] if it.get("fila") else []))
+    if not filas and it.get("_herda_filas"):
+        filas = list(it["_herda_filas"])
     if not filas and eps is None:  # visão iFood: "review"/"super" sem EPS = as duas (mesmo se a ficha não trouxe)
         tq = _norm_text(f"{original} {it.get('herdado') or ''}")
         for pal, chave in ((r"review\w*", "review"), (r"super cliente\w*|super\b", "cx super cliente")):
@@ -7017,6 +7084,22 @@ def _ficha_txt(it: dict[str, Any]) -> str:
     return json.dumps(campos, ensure_ascii=False)
 
 
+QUESTIONAMENTO_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA — a pessoa está contestando ou pedindo explicação de algo que você respondeu antes "
+    "nesta conversa. Isso é conversa, não relatório:\n"
+    "1. Releia a sua resposta anterior (está na conversa) e confira o ponto contestado contra as FONTES OFICIAIS abaixo "
+    "(e, se precisar, chame a Lyra Indicadores com as regras oficiais). TMA e SLA só pela CAPA; vínculo de equipe só "
+    "pelo MOP.\n"
+    "2. Se a pessoa tem razão: diga direto que errou, qual é o certo, de onde vem o número certo e o que muda na "
+    "conclusão. Sem rodeio e sem pedir desculpas em excesso.\n"
+    "3. Se você estava certa: explique com calma de onde veio o número (régua, período, fonte) e o que pode explicar a "
+    "diferença que a pessoa viu (outro período, outra régua, outro recorte). Nunca defenda informação que não está "
+    "nas fontes.\n"
+    "4. Se não dá para saber: diga o que você conferiu e o que falta para fechar.\n"
+    "Resposta curta, de colega para colega, sem título nem seções.\n\n"
+)
+
+
 def _despachar(event: dict[str, Any], eps: str | None, question: str, say: Callable[..., Any], in_thread: bool,
                client: Any, failed: dict[str, bool]) -> bool:
     """True = já respondeu. False = segue (com event['_despacho_livre'] a Lyra principal responde pela ficha)."""
@@ -7030,6 +7113,24 @@ def _despachar(event: dict[str, Any], eps: str | None, question: str, say: Calla
                                         "subagentes que precisar. TMA e SLA só pela régua oficial (CAPA).\n\n")
         return False
     intencao = it.get("intencao")
+    if intencao == "questionamento":  # contestação: reconfere a resposta anterior com as fontes oficiais
+        fontes = ""
+        try:
+            if set(it.get("indicadores") or []) & {"tma", "sla"} or re.search(r"\b(tma|sla)\b", _norm_text(question)):
+                pf = _per_ficha(it)
+                if pf:
+                    event["_per_ficha"] = pf
+                of = _oficiais_capa(question, event, eps)
+                fontes += ("TMA E SLA OFICIAIS (CAPA): " + "; ".join(
+                    f"{k}: " + " · ".join(x for x in ((f"TMA {v['tma']:.0f} s" if "tma" in v else ""),
+                                                      (f"SLA {v['sla']:.1f}%" if "sla" in v else "")) if x)
+                    for k, v in of.items()) + "\n") if of else ""
+        except Exception:
+            logger.warning("Fontes oficiais do questionamento falharam", exc_info=True)
+        event.update(_despacho_livre=True, _route="questionamento",
+                     _extra_forcado=QUESTIONAMENTO_INSTRUCTION + (f"FONTES OFICIAIS:\n{fontes}\n" if fontes else "")
+                     + f"LEITURA DO PEDIDO: {_ficha_txt(it)}\n\n")
+        return False
     if intencao == "processo":  # dúvida de processo/política: base de conhecimento, pela Lyra principal
         event.update(_despacho_livre=True, _route="conhecimento", _extra_forcado=KNOWLEDGE_INSTRUCTION)
         return False
@@ -7046,10 +7147,37 @@ def _despachar(event: dict[str, Any], eps: str | None, question: str, say: Calla
                                     "Confira com a conversa e responda.\n\n")
         return False
     orig = str(event.get("_orig_q") or question)
+    ant = event.get("_ficha_anterior") or {}
+    if not (it.get("filas") or it.get("fila")) and ant.get("filas") and it.get("herdado"):
+        it["_herda_filas"] = ant["filas"]  # continuação ("manda o excel", "e na semana?"): mesmas filas da conversa
     alvos = _alvos_ficha(it, eps, orig)
     visao = it.get("visao")
     inds = it.get("indicadores") or ["csat", "tma", "sla"]
     if visao == "treinamento":
+        if not alvos and (event.get("_ficha_anterior") or {}).get("filas"):  # "manda o excel": filas da conversa
+            alvos = _alvos_ficha(dict(it, _herda_filas=event["_ficha_anterior"]["filas"]), eps, orig)
+        if it.get("formato") == "planilha" or _WANTS_FILE_RE.search(_norm_text(orig)):
+            event["_route"] = "pessoas_impacto"
+            prog = _Progress(event)
+            try:
+                pf = _per_ficha(it)
+                if pf:
+                    event["_per_ficha"] = pf
+                for eps_a, fila in (alvos or [(eps, None)]):
+                    alvo_q = f"da {fila}" if fila else f"da {eps_a or 'AeC'}"
+                    prog(f"Montando a planilha de quem treinar {alvo_q} ⏳")
+                    prob = _send_pessoas_impacto(event, client, eps_a, f"quais operadores e supervisores mais impactam o "
+                                                 f"CSAT {alvo_q} abertura de todos em planilha excel", say, prog)
+                    if prob:
+                        _say(say, prob, event, in_thread=True)
+                    if {"tma", "sla"} & set(inds):
+                        prob = _send_tma_pessoas(event, client, eps_a, f"quais analistas mais impactam o TMA {alvo_q} "
+                                                 "abertura de todos em planilha excel", say, prog, ind="tma")
+                        if prob:
+                            _say(say, prob, event, in_thread=True)
+            finally:
+                prog.done()
+            return True
         alvo_txt = (" e ".join(f for _, f in alvos) if alvos else
                     "que a pessoa indicou na conversa (leia a conversa; se não houver, a EPS inteira)")
         extra = TRAINING_INSTRUCTION.format(fila=alvo_txt)
@@ -7269,7 +7397,18 @@ def _aplicar_interpretacao(question: str, event: dict[str, Any], eps: str | None
         return question, False
     t0 = time.time()
     ctx = _conversa_ctx(event)
+    chave_ficha = f"ficha:{event.get('channel')}:{_reply_ts(event)}"
+    try:
+        anterior = json.loads(STATE.get(chave_ficha) or "null")
+    except ValueError:
+        anterior = None
+    if anterior:
+        event["_ficha_anterior"] = anterior
+        ctx = (f"LEITURA ANTERIOR NESTA CONVERSA (ficha da última pergunta; herde o que a nova mensagem não disser): "
+               f"{_ficha_txt(anterior)}\n{ctx or ''}")
     it, raw = _interpretar(question, eps, ctx, _speaker_line(event))
+    if it:
+        STATE.set(chave_ficha, json.dumps(it, ensure_ascii=False, default=str))
     entry = {"t": _now_brazil().strftime("%d/%m %H:%M"), "c": str(event.get("channel") or ""), "q": _mask_pii(question)[:200],
              "it": it, "erro": None if it else str(raw)[:200], "s": round(time.time() - t0, 1)}
     resultado = (question, False)
@@ -12599,6 +12738,10 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             answer = _corrigir_oficiais(answer, question, event, eps)
         except Exception:
             logger.warning("Trava de TMA/SLA oficiais falhou", exc_info=True)
+        try:  # trava: equipe/supervisor só pelo MOP
+            answer = _corrigir_supervisores(answer, eps)
+        except Exception:
+            logger.warning("Trava de supervisores do MOP falhou", exc_info=True)
         answer = _route_n3_flags(answer, f"pergunta de {_first_name(str(event.get('user') or '')) or 'alguém'}: "
                                           f"_{question[:120]}_", event)
         esc_q = _parse_escalation(answer or "")
