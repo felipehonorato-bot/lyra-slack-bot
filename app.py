@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.47.3"
+APP_VERSION = "5.47.6"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -6786,7 +6786,20 @@ INTERPRETE_MAX_POLLS = int(os.getenv("INTERPRETE_MAX_POLLS", "10"))  # ~1 min: p
 INTERPRETE_LOG_MAX = 300
 _INTERPRETE_CMD_RE = re.compile(r"^\s*interpreta\w*\s*[:\-]\s*(.+)$", re.I | re.S)
 _INTERPRETACOES_CMD_RE = re.compile(r"^\s*interpreta(c|ç)(o|õ)es\b", re.I)
-_VISOES = {"resultado", "dia_a_dia", "motivos", "pessoas", "equipe", "casos", "variacao", "anomalia", "treinamento", "outro"}
+_VISOES = {"resultado", "dia_a_dia", "motivos", "pessoas", "equipe", "casos", "variacao", "anomalia", "treinamento", "crise",
+           "outro"}
+CRISE_INSTRUCTION = (
+    "INFORMAÇÃO INTERNA PARA A LYRA: a pessoa quer saber de CRISE / INCIDENTE operacional (sistema, Rosie, plataforma, "
+    "Salesforce, fila travada, ferramenta fora) — não de resultado. Crise, incidente, problema, instabilidade, falha e "
+    "queda são a mesma pergunta: responda com a palavra que a pessoa usou, e traga também ocorrência menor (alerta, "
+    "lentidão, chamado da EPS) marcada como 'sem impacto relevante no atendimento' — quem pergunta de 'problema' quer "
+    "saber dela. Chame a *Lyra Crises* com `Pedido: report de crise` "
+    "e `Período: {periodo}`{eps_txt}. Responda com o que ela devolver, curto: teve ou não teve crise; o que aconteceu e "
+    "quando; causa (ou 'em investigação'); impacto no atendimento (filas, transbordo, backlog); status. Mais de uma "
+    "ocorrência no período: uma por linha, da mais recente para a mais antiga. Sem crise: diga que não teve crise "
+    "registrada no período e em quais canais ela olhou. NÃO traga CSAT, TMA, SLA, operadores nem cobrança (só se a "
+    "pessoa pedir); no máximo ofereça em 1 linha cruzar a crise com os indicadores. Sem marcar ninguém.\n\n"
+)
 _INTENCOES = {"dados", "analise", "processo", "acao", "conversa", "questionamento"}
 
 
@@ -6876,7 +6889,10 @@ def _parse_interpretacao(texto: str) -> dict[str, Any] | None:
     elif len(data["filas"]) > 1:
         data["fila"] = None
     data["publico"] = data.get("publico") if data.get("publico") in {"q4", "todos", "top"} else None
-    data["jornada"] = data.get("jornada") if data.get("jornada") in KB_JORNADAS else None
+    jr = data.get("jornadas") if isinstance(data.get("jornadas"), list) else []
+    jr = [j for j in [data.get("jornada"), *jr] if isinstance(j, str) and j in KB_JORNADAS]
+    data["jornadas"] = list(dict.fromkeys(jr))[:3]  # caso que pode ser de mais de uma jornada (atraso ou PNE?)
+    data["jornada"] = data["jornadas"][0] if data["jornadas"] else None
     data["segmento"] = data.get("segmento") if data.get("segmento") in KB_SEGMENTOS else None
     data["esteira"] = data.get("esteira") if data.get("esteira") in {"food", "multi"} else None
     data["busca"] = str(data.get("busca") or "")[:300]
@@ -6885,6 +6901,8 @@ def _parse_interpretacao(texto: str) -> dict[str, Any] | None:
         try:
             ini, fim = date.fromisoformat(str(per.get("inicio"))), date.fromisoformat(str(per.get("fim")))
             d1 = _as_date(_today_brazil()) - timedelta(days=1)
+            if data.get("visao") == "crise":  # crise: "hoje"/"agora" vale (é leitura de canal, não base fechada)
+                d1 = _as_date(_today_brazil())
             if fim > d1:  # nunca no futuro
                 fim = d1
             per.update(inicio=min(ini, fim).isoformat(), fim=fim.isoformat())
@@ -7223,6 +7241,27 @@ def _despachar(event: dict[str, Any], eps: str | None, question: str, say: Calla
     alvos = _alvos_ficha(it, eps, orig)
     visao = it.get("visao")
     inds = it.get("indicadores") or ["csat", "tma", "sla"]
+    if _redacao_on():  # pedido de dados/análise: a checagem de crise roda em paralelo com as contas (pela ficha)
+        try:
+            _crise_iniciar(event, it.get("eps") or eps, it)
+        except Exception:
+            logger.warning("Checagem de crise pela ficha não iniciou", exc_info=True)
+    if visao == "crise":  # "teve crise?", "a Rosie caiu?", "tá rolando algo agora?": Lyra Crises, não indicador
+        per = it.get("periodo") or {}
+        try:
+            ini, fim = date.fromisoformat(str(per.get("inicio"))), date.fromisoformat(str(per.get("fim")))
+            agora = _now_brazil()
+            if fim == _as_date(agora) - timedelta(days=1) and ini < fim and "ontem" not in _norm_text(per.get("rotulo")):
+                fim = _as_date(agora)  # "essa semana", "esse mês": crise vale até agora, não só até ontem
+            fim_txt = agora.strftime("%d/%m/%Y %H:%M") if fim >= _as_date(agora) else f"{fim.strftime('%d/%m/%Y')} 23:59"
+            periodo = f"{ini.strftime('%d/%m/%Y')} 00:00 a {fim_txt} (BRT)"
+        except ValueError:
+            periodo = "agora"
+        eps_c = it.get("eps") or eps
+        event.update(_despacho_livre=True, _route="crise",
+                     _extra_forcado=CRISE_INSTRUCTION.format(periodo=periodo,
+                                                             eps_txt=f" e `EPS: {eps_c}`" if eps_c else ""))
+        return False
     if visao == "treinamento":
         if not alvos and (event.get("_ficha_anterior") or {}).get("filas"):  # "manda o excel": filas da conversa
             alvos = _alvos_ficha(dict(it, _herda_filas=event["_ficha_anterior"]["filas"]), eps, orig)
@@ -8806,22 +8845,32 @@ def _kb_context(query: str, extra: str = "", it: dict[str, Any] | None = None) -
     except Exception:
         logger.warning("KB search failed", exc_info=True)
         hits = []
+    jornadas = [j for j in (it.get("jornadas") or [it.get("jornada")]) if j]
     try:
-        pol = _kb_politica(it.get("segmento"), it.get("jornada"), it.get("esteira"))
+        pols = [_kb_politica(it.get("segmento"), j, it.get("esteira")) for j in (jornadas or [None])]
+        pols = [x for x in pols if x]
+        cota = int(KB_MAX_CHARS * 0.7) // max(len(pols), 1)  # deixa espaço para a ficha do motivo e os trechos
+        pol = "\n".join(x[:cota] for x in pols)
     except Exception:
         logger.warning("KB policy lookup failed", exc_info=True)
         pol = ""
     if pol:  # a regra exata do caso já veio: os outros pedaços da mesma matriz (outros segmentos/etapas) só confundem
         hits = [h for h in hits if not _norm_text(h["aba"]).startswith("segmentacoes")]
     try:  # ficha do motivo de contato da etapa (Visão Holística): contexto do processo, camadas, código, ferramentas
-        cat = KB_CATEGORIAS.get(str(it.get("jornada") or ""))
-        if cat:
+        top: list[dict[str, Any]] = []
+        ordem = None
+        for j in jornadas:
+            cat = KB_CATEGORIAS.get(str(j))
+            if not cat:
+                continue
             do_motivo = [d for d in _kb_ready() if _norm_text(d["aba"]).startswith("visao holistica")
                          and cat in _norm_text(d["texto"].split("|")[0])]
             if do_motivo:
-                ordem = {id(d): i for i, d in enumerate(_kb_search(f"{extra} {query}", k=400))}
-                top = sorted(do_motivo, key=lambda d: ordem.get(id(d), 10 ** 6))[:2]
-                hits = top + [h for h in hits if all(h is not t for t in top)]
+                if ordem is None:
+                    ordem = {id(d): i for i, d in enumerate(_kb_search(f"{extra} {query}", k=400))}
+                top += sorted(do_motivo, key=lambda d: ordem.get(id(d), 10 ** 6))[:2 if len(jornadas) == 1 else 1]
+        if top:
+            hits = top + [h for h in hits if all(h is not t for t in top)]
     except Exception:
         logger.warning("KB motivo lookup failed", exc_info=True)
     if not hits and not pol:
@@ -9098,6 +9147,10 @@ KNOWLEDGE_INSTRUCTION = (
     "'sem nota', 'reincidente') tem que aparecer na resposta: diga o que a regra faz com ela; se a base não tiver regra "
     "para aquela condição, diga isso em 1 frase e escale SÓ esse recorte (o resto você responde). Não troque a pergunta "
     "por outra que a base responde melhor.\n"
+    "Classifique o caso pela SITUAÇÃO, não pelo nome que a pessoa deu ao processo: se a situação descrita pode ser de "
+    "mais de uma jornada, diga isso e responda cada ramo, começando por como o analista confirma qual é (ex.: 'cliente "
+    "diz que não recebeu' = pedido atrasado se o pedido ainda está em andamento/no prazo estourado; = pedido não "
+    "entregue (PNE) se o status no Oráculo já está como entregue/concluído — aí não é mais atraso).\n"
     "Pergunta que descreve um CASO: aplique a regra ao caso, passo a passo — qual jornada/motivo, qual segmento, quem "
     "é o responsável (o Almir infere a responsabilidade mesmo sem foto ou nota; as evidências, o CRI e a reincidência "
     "entram nessa inferência) e, então, o desfecho e o que a operação faz. Quando o desfecho depende de algo que o caso "
@@ -9111,6 +9164,8 @@ KNOWLEDGE_INSTRUCTION = (
     "Cliente, que atende os clientes Platinum (dúvida de processo da VIP/Super = regra do Platinum). Sigla que não está aqui nem nos "
     "trechos: use como está, sem expandir. Quando a regra muda entre Food e Multi e a pessoa não disse qual, responda "
     "pelo Food e avise em 1 linha que no Multi muda.\n"
+    "Fale do processo como quem o conhece: nada de 'a base cobre', 'o que a base tem/não tem', 'pelo que está aqui' "
+    "nem títulos assim. O que não estiver definido, diga como processo ('isso não está definido hoje').\n"
     "Proibido: citar One Hub, Matriz CX, link, aba, planilha ou 'minha base' como resposta (fale do processo, não de "
     "onde ele está); mandar a pessoa procurar outro time, área ou pessoa; completar com conhecimento geral (CDC, "
     "'geralmente', outras empresas). Responda SÓ a pergunta atual. Só quando a base realmente não tiver a regra (nem nos "
@@ -9302,16 +9357,24 @@ _CRISE_DADOS_RE = re.compile(r"\b(csat|tma|sla|nota\w*|fila\w*|volume|resultado|
                              r"piorou|subiu|estranho|anormal|dia a dia|madrug\w*|review|super\w*|suporte|esperando)\b")
 
 
-def _crise_iniciar(event: dict[str, Any], eps: str | None) -> None:
+def _crise_iniciar(event: dict[str, Any], eps: str | None, it: dict[str, Any] | None = None) -> None:
     """Passo 3: em paralelo com as contas, pergunta à Lyra Crises se teve crise/incidente no período da pergunta.
     Se teve, entra nos DADOS e a IA pode usar para explicar um desvio (em vez de chutar uma causa)."""
-    if not CRISIS_CHECK:
+    if not CRISIS_CHECK or event.get("_crise"):
         return
     q = _strip_mentions(str(event.get("text") or ""))
-    if not _CRISE_DADOS_RE.search(_norm_text(q)):
+    if it is None and INTERPRETE_MODE == "on" and not event.get("_interprete_falhou"):
+        return  # com o intérprete, quem decide é a leitura do pedido (chamado de novo em _despachar, com a ficha)
+    if it is not None:
+        if it.get("intencao") not in {"dados", "analise"} or it.get("visao") == "crise":
+            return  # pedido de número/análise: confere crise junto; pergunta de crise já vai direto à Lyra Crises
+    elif not _CRISE_DADOS_RE.search(_norm_text(q)):  # sem intérprete (fora do ar): o filtro antigo
         return
     try:
-        ini, fim, _ = _capa_period(q, event)
+        if it is not None and _per_ficha(it):
+            ini, fim = _per_ficha(it)[:2]
+        else:
+            ini, fim, _ = _capa_period(q, event)
         start = datetime(ini.year, ini.month, ini.day, tzinfo=BRAZIL_TIMEZONE)
         end = min(datetime(fim.year, fim.month, fim.day, tzinfo=BRAZIL_TIMEZONE) + timedelta(days=1), _now_brazil())
     except Exception:
