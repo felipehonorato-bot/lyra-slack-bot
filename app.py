@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.46.0"
+APP_VERSION = "5.46.1"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -3640,6 +3640,8 @@ def _oficiais_capa(question: str, event: dict[str, Any], eps: str | None) -> dic
             tma, sla = _cv(r, "tempo atribuicao (ticket)"), _cv(r, "sla")
             if tma:
                 d["tma"] = tma
+                if _cv(r, "tempo atendimento plan (ticket)"):
+                    d["plan"] = _cv(r, "tempo atendimento plan (ticket)")
             if sla is not None:
                 d["sla"] = sla * 100 if sla <= 1.5 else sla
             if d:
@@ -3681,16 +3683,26 @@ def _divergencias_oficiais(texto: str, oficiais: dict[str, dict[str, float]]) ->
         fim = achados[i + 1][0] if i + 1 < len(achados) else len(t)
         trecho = t[b:min(fim, b + 260)]
         of = oficiais[alvo]
-        m = re.search(r"\bTMA\b[^\d\n]{0,25}(\d[\d.]*)\s*s\b", trecho)
-        if m and "tma" in of:
-            v = float(m.group(1).replace(".", ""))
-            if abs(v - of["tma"]) > max(6.0, of["tma"] * 0.03):
-                div.append(f"{alvo}: TMA {v:.0f} s (oficial {of['tma']:.0f} s)")
-        m = re.search(r"\bSLA\b[^\d\n]{0,40}?(\d{1,3}(?:,\d+)?)\s*%", trecho)
-        if m and "sla" in of:
-            v = float(m.group(1).replace(",", "."))
-            if abs(v - of["sla"]) > 1.0:
-                div.append(f"{alvo}: SLA {v:.1f}% (oficial {of['sla']:.1f}%)")
+
+        def da_fila(m: re.Match[str]) -> bool:  # a menção é da fila, não de um operador ou motivo citado ali perto
+            ini_l = trecho.rfind("\n", 0, m.start()) + 1
+            fim_l = trecho.find("\n", m.end())
+            linha = trecho[ini_l:fim_l if fim_l >= 0 else len(trecho)]
+            antes = trecho[ini_l:m.start()]
+            return not (re.search(r"@|\b(motivo|analista|operador|atendente|sup\.|supervisor)", _norm_text(linha))
+                        or "→" in antes or re.search(r"[A-ZÁÉÍÓÚ][a-záéíóúãõç]+ [A-ZÁÉÍÓÚ][a-záéíóúãõç]+", antes))
+        for m in re.finditer(r"\bTMA\b[^\d\n]{0,25}(\d[\d.]*)\s*s\b", trecho):
+            if "tma" in of and da_fila(m):
+                v = float(m.group(1).replace(".", ""))
+                if abs(v - of["tma"]) > max(6.0, of["tma"] * 0.03):
+                    div.append(f"{alvo}: TMA {v:.0f} s (oficial {of['tma']:.0f} s)")
+                break
+        for m in re.finditer(r"\bSLA\b[^\d\n]{0,40}?(\d{1,3}(?:,\d+)?)\s*%", trecho):
+            if "sla" in of and da_fila(m):
+                v = float(m.group(1).replace(",", "."))
+                if abs(v - of["sla"]) > 1.0:
+                    div.append(f"{alvo}: SLA {v:.1f}% (oficial {of['sla']:.1f}%)")
+                break
     return div
 
 
@@ -3777,6 +3789,27 @@ def _corrigir_oficiais(answer: str, question: str, event: dict[str, Any], eps: s
     if novo and not _is_error_answer(novo) and not _divergencias_oficiais(novo, oficiais):
         _alert(f"🛠️ Corrigi TMA/SLA fora da régua oficial numa resposta livre: {'; '.join(div[:4])}")
         return novo
+    corrigido = answer
+    for d in div:
+        mm = re.match(r"(.+?): (TMA|SLA) ([\d.]+)(?: s|%) \(oficial ([\d.]+)", d)
+        if not mm:
+            continue
+        ind, errado, certo = mm.group(2), float(mm.group(3)), float(mm.group(4))
+        of_a = oficiais.get(mm.group(1), {})
+        if ind == "TMA":  # a linha toda vira o oficial (número, plan e cor), para a conclusão não ficar errada
+            plan = of_a.get("plan")
+            frase = (f"TMA {_fmt_int(certo)} s (oficial CAPA)" + (
+                f" → {'🔴' if certo > plan + 0.5 else '🟢'} plan {_fmt_int(plan)} s "
+                f"({'+' if certo >= plan else '−'}{_fmt_int(abs(certo - plan))} s)" if plan else ""))
+            pad = rf"TMA[^\d\n]{{0,25}}{_fmt_int(errado).replace('.', '[.]?')}\s*s[^\n]*"
+        else:
+            meta = _capa_sla_meta(mm.group(1))
+            frase = (f"SLA {_bfmt(certo)}% (oficial CAPA) → {'🔴' if certo < meta else '🟢'} meta {_fmt_meta(meta)}%")
+            pad = rf"SLA[^\d\n]{{0,40}}?{_bfmt(errado).replace(',', '[,.]')}\s*%[^\n]*"
+        corrigido = re.sub(pad, lambda x: frase, corrigido, count=1)
+    if not _divergencias_oficiais(corrigido, oficiais):
+        _alert(f"🛠️ Troquei TMA/SLA fora da régua oficial pelos da CAPA numa resposta livre: {'; '.join(div[:4])}")
+        return corrigido
     _alert(f"🛠️ Resposta livre com TMA/SLA fora da régua oficial ({'; '.join(div[:4])}); mandei o quadro oficial.")
     seguro = ("Os números de TMA/SLA que eu tinha montado aqui não bateram com a régua oficial (CAPA), então não vou "
               "te passar. Me pede \"TMA e SLA\" da fila ou da EPS que eu trago o oficial.")
@@ -14692,7 +14725,9 @@ MELHORIAS_CHANNELS = _parse_channel_map(os.getenv("MELHORIAS_CHANNELS", "AeC:C0C
 CHAMADOS_DESTINO = _parse_channel_map(os.getenv("CHAMADOS_DESTINO", "AeC:C0C9F5BLVN1,CSU:C0C9L8NRPPC"))
 REWARDS_WEBHOOK_URL = os.getenv("REWARDS_WEBHOOK_URL", "").strip()
 REWARDS_PROBLEM_TYPES = [t.strip() for t in os.getenv(
-    "REWARDS_PROBLEM_TYPES", "Missão concluída, mas moedas não creditadas").split(";") if t.strip()]
+    "REWARDS_PROBLEM_TYPES", "Pedido/missão não contabilizada;Missão concluída, mas moedas não creditadas;"
+    "Cupom ou saldo resgatado indisponível;Missão não aparece no aplicativo;Check-in ou progresso reiniciado/incorreto;"
+    "Outro").split(";") if t.strip()]
 CHAMADOS_WORKSHEET_TITLE = "Chamados Moedas"
 CHAMADOS_HEADERS = ["Data", "Ticket SF", "ID do Cliente", "ID do Pedido", "Missão", "Tipo de problema",
                     "Prioridade", "Segmento", "Título", "Solicitante", "Status", "Aberto em", "Finalizado em",
