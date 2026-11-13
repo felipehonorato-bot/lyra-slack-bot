@@ -214,7 +214,7 @@ DONE_REACTION = "white_check_mark"
 ERROR_MESSAGE = "Não consegui processar agora, tente novamente"
 TIMEOUT_ERROR_MESSAGE = ("Essa travou do meu lado: a consulta passou do tempo e eu parei pra não te deixar esperando. "
                          "Já avisei o time. Tenta de novo daqui a pouco?")
-INTERACTIVE_MAX_POLLS = int(os.getenv("INTERACTIVE_MAX_POLLS", str(MAX_POLL_ATTEMPTS)))  # conversa: 30 min
+INTERACTIVE_MAX_POLLS = int(os.getenv("INTERACTIVE_MAX_POLLS", "360"))  # conversa: 360 x 10 s = 60 min (análise pesada)
 EMPTY_ANSWER_MESSAGE = "Não consegui obter uma resposta agora."
 
 DAILY_REPORT_CHANNEL = os.getenv("DAILY_REPORT_CHANNEL", "C0BF6JVFG7N")
@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.44.0"
+APP_VERSION = "5.45.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -3258,6 +3258,9 @@ _MES_NOMES = {"janeiro": 1, "fevereiro": 2, "marco": 3, "abril": 4, "maio": 5, "
 
 
 def _capa_period(question: str, event: dict[str, Any]) -> tuple[date, date, str]:
+    pf = (event or {}).get("_per_ficha")
+    if pf:  # a ficha do intérprete já decidiu o período: as consultas não releem a frase
+        return pf
     d1 = _as_date(_today_brazil()) - timedelta(days=1)
     t = _norm_text(question)
     m_rng = re.search(r"\b(\d{1,2})/(\d{1,2})\s*(?:a|ate|-)\s*(\d{1,2})/(\d{1,2})\b", t)
@@ -3618,6 +3621,129 @@ def _post_efic_motivos(say: Callable[..., Any], event: dict[str, Any], eps: str 
             _say(say, "\n\n".join(partes), event, True)
     except Exception:
         logger.warning("Motivos de TMA/SLA depois do CSAT falharam", exc_info=True)
+
+
+def _oficiais_capa(question: str, event: dict[str, Any], eps: str | None) -> dict[str, dict[str, float]]:
+    """{fila ou EPS: {"tma": s, "sla": %}} oficiais (CAPA) do período da pergunta — a régua que vale."""
+    try:
+        ini, fim, _ = _capa_period(question, event)
+        rows, _ = _capa_rows(ini, fim)
+    except Exception:
+        return {}
+    out: dict[str, dict[str, float]] = {}
+    for eps_k, eps_nome in (("aec", "AeC"), ("csu", "CSU")):
+        if eps and _compact(eps) != eps_k:
+            continue
+        cel = [r for r in rows or [] if _norm_text(r.get("eps", "")) == eps_k and (_cv(r, "interacoes real") or 0) > 0]
+        for r in cel:
+            d: dict[str, float] = {}
+            tma, sla = _cv(r, "tempo atribuicao (ticket)"), _cv(r, "sla")
+            if tma:
+                d["tma"] = tma
+            if sla is not None:
+                d["sla"] = sla * 100 if sla <= 1.5 else sla
+            if d:
+                out[str(r.get("celula") or "")] = d
+        s_t = sum(_cv(r, "soma tempo atribuicao") or 0 for r in cel)
+        s_k = sum(_cv(r, "ticket unico real") or 0 for r in cel)
+        s_b = sum(_cv(r, "sla base") or 0 for r in cel)
+        s_d = sum(_cv(r, "sla dentro") or 0 for r in cel)
+        d = {}
+        if s_t and s_k:
+            d["tma"] = s_t / s_k
+        if s_b:
+            d["sla"] = s_d / s_b * 100
+        if d:
+            out[eps_nome] = d
+    return out
+
+
+def _divergencias_oficiais(texto: str, oficiais: dict[str, dict[str, float]]) -> list[str]:
+    """TMA/SLA citados no texto perto do nome de uma fila (ou da EPS) que não batem com a CAPA."""
+    if not texto or not oficiais:
+        return []
+    t = _strip_md(texto)
+    nomes: list[tuple[str, str]] = []
+    for alvo in oficiais:
+        curto = re.sub(r"\s*-\s*(AeC|CSU)$", "", alvo)
+        for n in {alvo, curto, re.sub(r"^CX\s+", "", curto)}:
+            if len(n) >= 3:
+                nomes.append((n, alvo))
+    nomes.sort(key=lambda x: -len(x[0]))
+    achados: list[tuple[int, int, str]] = []
+    for n, alvo in nomes:
+        for m in re.finditer(rf"(?<![\w-]){re.escape(n)}(?![\w])", t, re.I):
+            if not any(a <= m.start() < b for a, b, _ in achados):
+                achados.append((m.start(), m.end(), alvo))
+    achados.sort()
+    div = []
+    for i, (a, b, alvo) in enumerate(achados):
+        fim = achados[i + 1][0] if i + 1 < len(achados) else len(t)
+        trecho = t[b:min(fim, b + 260)]
+        of = oficiais[alvo]
+        m = re.search(r"\bTMA\b[^\d\n]{0,25}(\d[\d.]*)\s*s\b", trecho)
+        if m and "tma" in of:
+            v = float(m.group(1).replace(".", ""))
+            if abs(v - of["tma"]) > max(6.0, of["tma"] * 0.03):
+                div.append(f"{alvo}: TMA {v:.0f} s (oficial {of['tma']:.0f} s)")
+        m = re.search(r"\bSLA\b[^\d\n]{0,40}?(\d{1,3}(?:,\d+)?)\s*%", trecho)
+        if m and "sla" in of:
+            v = float(m.group(1).replace(",", "."))
+            if abs(v - of["sla"]) > 1.0:
+                div.append(f"{alvo}: SLA {v:.1f}% (oficial {of['sla']:.1f}%)")
+    return div
+
+
+def _corrigir_oficiais(answer: str, question: str, event: dict[str, Any], eps: str | None) -> str:
+    """Trava da análise livre: TMA/SLA tem que ser o oficial (CAPA). Se a resposta trouxe outro número, a Lyra
+    reescreve com os oficiais; se ainda assim não bater, vai o quadro oficial. Nunca sai número errado."""
+    if not answer or not re.search(r"\b(TMA|SLA)\b", answer):
+        return answer
+    oficiais = _oficiais_capa(question, event, eps)
+    div = _divergencias_oficiais(answer, oficiais)
+    if not div:
+        return answer
+    logger.warning("Resposta livre com TMA/SLA fora da régua oficial: %s", div)
+    of_txt = "\n".join(f"- {k}: " + " · ".join(x for x in ((f"TMA {v['tma']:.0f} s" if "tma" in v else ""),
+                                                          (f"SLA {v['sla']:.1f}%" if "sla" in v else "")) if x)
+                       for k, v in oficiais.items())
+    try:
+        novo = str(ask_toqan(
+            "TAREFA INTERNA — CORREÇÃO DE NÚMEROS. A resposta abaixo usou TMA/SLA de uma régua errada. Reescreva a MESMA "
+            "resposta trocando TODOS os TMA e SLA pelos OFICIAIS e ajustando o que dependia deles (acima/abaixo do plan "
+            "ou da meta, cor, conclusão). Tire \"interações por ticket\". Mantenha o resto igual. Devolva só a resposta.\n"
+            f"OFICIAIS (CAPA):\n{of_txt}\n\nRESPOSTA:\n{answer}", max_attempts=REDACAO_MAX_POLLS) or "").strip()
+    except Exception:
+        novo = ""
+    if novo and not _is_error_answer(novo) and not _divergencias_oficiais(novo, oficiais):
+        _alert(f"🛠️ Corrigi TMA/SLA fora da régua oficial numa resposta livre: {'; '.join(div[:4])}")
+        return novo
+    _alert(f"🛠️ Resposta livre com TMA/SLA fora da régua oficial ({'; '.join(div[:4])}); mandei o quadro oficial.")
+    seguro = ("Os números de TMA/SLA que eu tinha montado aqui não bateram com a régua oficial (CAPA), então não vou "
+              "te passar. Me pede \"TMA e SLA\" da fila ou da EPS que eu trago o oficial.")
+    try:
+        ini, fim, label = _capa_period(question, event)
+        rows, _ = _capa_rows(ini, fim)
+        return _render_capa(rows or [], eps, label) or seguro
+    except Exception:
+        return seguro
+
+
+def _capa_oficial_ctx(question: str, event: dict[str, Any], eps: str | None) -> str:
+    """TMA e SLA oficiais (CAPA) do período, para a análise livre não recalcular TMA por outra régua."""
+    if not (re.search(r"\b(tma|sla|tempo medio|tempo de atendimento|primeira resposta)\b", _norm_text(question))
+            or set((event.get("_it") or {}).get("indicadores") or []) & {"tma", "sla"}):
+        return ""
+    try:
+        ini, fim, label = _capa_period(question, event)
+        rows, _ = _capa_rows(ini, fim)
+        txt = _render_capa(rows or [], eps, label) if rows else ""
+    except Exception:
+        logger.warning("CAPA para a análise livre falhou", exc_info=True)
+        return ""
+    return ("TMA E SLA OFICIAIS (CAPA, régua do time: Σ tempo de atribuição ÷ tickets únicos, plan da CAPA). Use ESTES "
+            "números de TMA e SLA por fila e da EPS; não peça nem calcule TMA por outra régua (nada de interações por "
+            f"ticket):\n{_strip_md(txt)}\n\n") if txt else ""
 
 
 def _drop_false_correction(answer: str, event: dict[str, Any]) -> str:
@@ -6801,7 +6927,7 @@ def _pergunta_canonica(it: dict[str, Any], original: str) -> str | None:
             and not re.search(r"\bsupervisor\w*\b", t) else "operadores e supervisores")
     j = lambda *xs: re.sub(r"\s+", " ", " ".join(x for x in xs if x)).strip()
     if visao == "resultado":
-        if todos_ind:
+        if todos_ind or ("csat" in inds and set(inds) & {"tma", "sla"}):
             return j("como ficou o resultado", rec, per)
         if set(inds) <= {"tma", "sla"}:
             return j("TMA e SLA", rec, per, arq)
@@ -6895,9 +7021,29 @@ def _despachar(event: dict[str, Any], eps: str | None, question: str, say: Calla
                client: Any, failed: dict[str, bool]) -> bool:
     """True = já respondeu. False = segue (com event['_despacho_livre'] a Lyra principal responde pela ficha)."""
     it = event.get("_it")
-    if INTERPRETE_MODE != "on" or not it or event.get("_sub") or event.get("_route") == "interprete_duvida":
+    if INTERPRETE_MODE != "on" or event.get("_sub") or event.get("_route") == "interprete_duvida":
         return False
-    if it.get("intencao") not in {"dados", "analise"} or float(it.get("confianca") or 0) < INTERPRETE_MIN_CONF:
+    if not it:
+        if event.get("_interprete_falhou"):  # intérprete fora: a Lyra principal lê a conversa (sem regras de palavra)
+            event.update(_despacho_livre=True, _route="livre:sem_ficha",
+                         _extra_forcado="INFORMAÇÃO INTERNA PARA A LYRA: responda à pessoa lendo a conversa; chame os "
+                                        "subagentes que precisar. TMA e SLA só pela régua oficial (CAPA).\n\n")
+        return False
+    intencao = it.get("intencao")
+    if intencao == "processo":  # dúvida de processo/política: base de conhecimento, pela Lyra principal
+        event.update(_despacho_livre=True, _route="conhecimento", _extra_forcado=KNOWLEDGE_INSTRUCTION)
+        return False
+    if intencao == "conversa":
+        event.update(_despacho_livre=True, _route="conversa",
+                     _extra_forcado=CHAT_INSTRUCTION + "Se a pessoa perguntar quem você é ou o que faz, use isto:\n"
+                                    + IDENTITY_INSTRUCTION)
+        return False
+    if intencao not in {"dados", "analise"}:
+        return False  # ação (MOP, gráfico, planilha, lembrete…): as ferramentas próprias seguem valendo
+    if float(it.get("confianca") or 0) < INTERPRETE_MIN_CONF:  # leitura fraca: a Lyra principal decide com a ficha
+        event.update(_despacho_livre=True, _route="livre:ficha",
+                     _extra_forcado=f"INFORMAÇÃO INTERNA PARA A LYRA — leitura do pedido (incerta): {_ficha_txt(it)}. "
+                                    "Confira com a conversa e responda.\n\n")
         return False
     orig = str(event.get("_orig_q") or question)
     alvos = _alvos_ficha(it, eps, orig)
@@ -6913,11 +7059,33 @@ def _despachar(event: dict[str, Any], eps: str | None, question: str, say: Calla
         extra += f"INDICADORES PEDIDOS: {', '.join(i.upper() for i in inds)}.\nLEITURA DO PEDIDO: {_ficha_txt(it)}\n\n"
         event.update(_despacho_livre=True, _extra_forcado=extra, _route="treinamento", _training=alvo_txt)
         return False
+    if visao == "anomalia":  # "o que teve de estranho": pacote de anomalia por fila (ou da EPS), direto para a Lyra
+        per = it.get("periodo") or {}
+        try:
+            dia = date.fromisoformat(str(per.get("fim") or per.get("inicio")))
+        except ValueError:
+            dia = _as_date(_today_brazil()) - timedelta(days=1)
+        packs = []
+        for eps_a, fila in (alvos or [(eps, None)]):
+            try:
+                pk = _anomalia_pack(eps_a, fila, dia, set(inds))
+            except Exception:
+                logger.warning("Pacote de anomalia falhou (%s)", fila, exc_info=True)
+                pk = None
+            if pk:
+                packs.append((f"[{fila}]\n" if fila and len(alvos) > 1 else "") + pk)
+        if packs:
+            event.update(_despacho_livre=True, _route="anomalia",
+                         _extra_forcado=ANOMALIA_INSTRUCTION + "DADOS:\n" + "\n\n".join(packs) + "\n\n")
+            return False
     if it.get("intencao") == "analise" and visao in {None, "outro"}:
         event.update(_despacho_livre=True, _route="livre:ficha",
                      _extra_forcado=f"INFORMAÇÃO INTERNA PARA A LYRA — leitura do pedido: {_ficha_txt(it)}. Responda a "
                                     "isso, chamando os subagentes que precisar.\n\n")
         return False
+    feito = _executar_ficha(event, eps, question, say, in_thread, client)
+    if feito is not None:
+        return feito
     if (len(alvos) > 1 and visao in _VISOES_POR_FILA
             and not (it.get("lider") or it.get("minha_equipe") or it.get("pessoa"))):
         rotas, livre = [], False
@@ -6945,6 +7113,154 @@ def _despachar(event: dict[str, Any], eps: str | None, question: str, say: Calla
     return False
 
 
+def _per_ficha(it: dict[str, Any]) -> tuple[date, date, str] | None:
+    per = it.get("periodo")
+    if not isinstance(per, dict):
+        return None
+    try:
+        ini, fim = date.fromisoformat(str(per.get("inicio"))), date.fromisoformat(str(per.get("fim")))
+    except ValueError:
+        return None
+    return ini, fim, str(per.get("rotulo") or f"{ini.strftime('%d/%m')} a {fim.strftime('%d/%m')}")
+
+
+def _executar_ficha(event: dict[str, Any], eps: str | None, question: str, say: Callable[..., Any], in_thread: bool,
+                    client: Any) -> bool | None:
+    """Com o intérprete ligado, a FICHA escolhe a consulta (nada de palavra-chave). True = respondeu; False = segue
+    para a Lyra principal (event['_despacho_livre']); None = deixa a frase canônica seguir (equipe/pessoa/variação de
+    CSAT, que ainda têm rota própria)."""
+    it = event.get("_it") or {}
+    visao = it.get("visao")
+    inds = [i for i in (it.get("indicadores") or []) if i in {"csat", "tma", "sla"}] or ["csat", "tma", "sla"]
+    efic = [i for i in inds if i in {"tma", "sla"}]
+    orig = str(event.get("_orig_q") or question)
+    pf = _per_ficha(it)
+    if pf:
+        event["_per_ficha"] = pf
+    label = pf[2] if pf else "mês"
+    if eps and it.get("eps") and _compact(str(it["eps"])) != _compact(eps):  # canal de uma EPS perguntando da outra
+        event["_route"] = "outra_eps"
+        _say(say, f"Aqui eu acompanho só a {eps} 🙂 Da {it['eps']} não consigo te mostrar por aqui. Quer que eu te mostre "
+                  f"como tá a {eps}?", event, in_thread=True)
+        return True
+    if "Agentforce CX" in (it.get("filas") or []) or it.get("fila") == "Agentforce CX":
+        event["_route"] = "csat_agentes_ia"
+        txt = _send_csat_agentes_ia(event, eps, _pergunta_canonica(it, orig) or orig, client)
+        if txt:
+            _say(say, txt, event, in_thread=True)
+        return True
+    if it.get("lider") or it.get("minha_equipe") or it.get("pessoa") or visao == "equipe":
+        return None  # equipe/pessoa: a rota de equipe resolve o líder pelo MOP
+    alvos = _alvos_ficha(it, eps, orig) or [(it.get("eps") or eps, None)]
+    prog = _Progress(event)
+
+    def q_de(eps_a: str | None, fila: str | None, inds_q: list[str] | None = None) -> str:
+        it_i = dict(it, fila=fila, filas=[fila] if fila else [], eps=eps_a, indicadores=inds_q or inds)
+        return _pergunta_canonica(it_i, orig) or orig
+
+    try:
+        if visao == "resultado":
+            event["_route"] = "tabela" if "csat" in inds else "capa"
+            for eps_a, fila in alvos:
+                if "csat" in inds:
+                    tab = _table_answer(q_de(eps_a, fila, ["csat"]), eps_a, {})
+                    if tab:
+                        _say_sections(say, re.sub(r"(?im)^.*(vêm logo abaixo|só um minutinho).*$", "", tab), event)
+                if efic:
+                    if "csat" in inds:
+                        ini_c, fim_c, label_c = _capa_period(orig, event)
+                        rows_c, _ = _capa_rows(ini_c, fim_c, None)
+                        txt = ((_render_capa_fila(rows_c, eps_a, label_c, fila, set(efic)) if fila else
+                                _capa_resumo(rows_c, eps_a, label_c)) if rows_c else "")
+                    else:
+                        prog("Já puxo TMA e SLA pra você ⏳")
+                        txt = _send_capa(event, client, eps_a, q_de(eps_a, fila, efic))
+                    if txt:
+                        _say(say, txt, event, in_thread=True)
+            return True
+        if visao == "dia_a_dia":
+            event["_route"] = "csat_diario" if "csat" in inds else "capa"
+            for eps_a, fila in alvos:
+                if "csat" in inds:
+                    prog("Já puxo o CSAT dia a dia pra você ⏳")
+                    txt = _send_csat_diario(event, eps_a, q_de(eps_a, fila, ["csat"]), None, client)
+                    if txt:
+                        _say(say, txt, event, in_thread=True)
+                if efic:
+                    prog("Já puxo TMA e SLA dia a dia pra você ⏳")
+                    txt = _send_capa(event, client, eps_a, q_de(eps_a, fila, efic))
+                    if txt:
+                        _say(say, txt, event, in_thread=True)
+            return True
+        if visao == "pessoas":
+            event["_route"] = "pessoas_impacto" if "csat" in inds else f"{efic[0]}_pessoas"
+            for eps_a, fila in alvos:
+                if "csat" in inds:
+                    prog("Vou ver quem mais pesa no CSAT (supervisores e operadores) ⏳")
+                    prob = _send_pessoas_impacto(event, client, eps_a, q_de(eps_a, fila, ["csat"]), say, prog)
+                    if prob:
+                        _say(say, prob, event, in_thread=True)
+                for ind_p in efic:
+                    prog(f"Vou ver quem mais pesa no {ind_p.upper()} (analistas e supervisores) ⏳")
+                    prob = _send_tma_pessoas(event, client, eps_a, q_de(eps_a, fila, [ind_p]), say, prog, ind=ind_p)
+                    if prob:
+                        _say(say, prob, event, in_thread=True)
+            return True
+        if visao == "casos":
+            event["_route"] = "avaliacoes"
+            for eps_a, fila in alvos:
+                for ind_c in inds:
+                    prog(f"Vou montar a base caso a caso de {ind_c.upper()}"
+                         + (f" da `{fila}`" if fila else "") + ". Leva alguns minutos ⏳")
+                    prob = _send_case_list(event, client, eps_a, q_de(eps_a, fila, [ind_c]))
+                    if prob:
+                        _say(say, prob, event, in_thread=True)
+                        if "De qual fila ou equipe" in prob:
+                            return True
+            return True
+        if visao == "motivos":
+            if efic:
+                event["_route"] = f"motivos_{efic[0]}"
+                ini_e, fim_e, label_e = _capa_period(orig, event)
+                prog("Vou levantar os motivos que mais pesam no " + " e no ".join(i.upper() for i in efic) + " ⏳")
+                rows_e, prob_e = _motivos_efic_rows(eps, ini_e, fim_e)
+                for eps_a, fila in alvos:
+                    for ind_e in efic:
+                        txt = _render_motivos_efic(rows_e, ind_e, label_e, fila) if rows_e else ""
+                        _say(say, txt or prob_e or f"Nenhum motivo está pesando contra o {ind_e.upper()} nesse recorte.",
+                             event, in_thread=True)
+            if "csat" in inds:  # motivos de CSAT: dados do SQL fixo e a Lyra principal analisa
+                ini_m, fim_m, label_m = _capa_period(orig, event)
+                dados = [_csat_motivos_texto(eps_a, fila, ini_m, fim_m, label_m, prog) or "" for eps_a, fila in alvos]
+                dados = [d for d in dados if d]
+                event.update(_despacho_livre=True, _route="motivos",
+                             _extra_forcado=MOTIVOS_INSTRUCTION + ("DADOS (calculados pelo app com o SQL fixo do CSAT — use "
+                                                                   "só estes números, sem nova consulta):\n"
+                                                                   + "\n\n".join(dados) + "\n\n" if dados else ""))
+                return False
+            return True
+        if visao == "variacao" and all(f is None for _, f in alvos):  # "por que a AeC caiu?": a EPS inteira
+            event.update(_despacho_livre=True, _route="livre:variacao_eps",
+                         _extra_forcado=("INFORMAÇÃO INTERNA PARA A LYRA — leitura do pedido: " + _ficha_txt(it) + ". "
+                                         "Explique a variação da EPS no período contra o anterior: quais filas mais "
+                                         "puxaram (CSAT pela Lyra Indicadores, com mix x performance) e, para TMA/SLA, "
+                                         "use só os oficiais abaixo.\n\n"))
+            return False
+        if visao == "variacao" and not ("csat" in inds):
+            event["_route"] = "efic_variacao"
+            for eps_a, fila in alvos:
+                for ind_v in efic:
+                    resp = _send_efic_variacao(event, client, eps_a, f"por que o {ind_v.upper()} mudou", prog,
+                                               _it_periodos(event), fila)
+                    if resp:
+                        _say_sections(say, resp, event) if resp.startswith(("⏱️", "⏰")) else _say(
+                            say, resp, event, in_thread=True)
+            return True
+    finally:
+        prog.done()
+    return None
+
+
 def _aplicar_interpretacao(question: str, event: dict[str, Any], eps: str | None, say: Callable[..., Any],
                            in_thread: bool) -> tuple[str, bool]:
     """(pergunta a seguir, já respondeu?). Só age com leitura confiante de pedido de dados/análise; o resto segue as
@@ -6957,6 +7273,8 @@ def _aplicar_interpretacao(question: str, event: dict[str, Any], eps: str | None
     entry = {"t": _now_brazil().strftime("%d/%m %H:%M"), "c": str(event.get("channel") or ""), "q": _mask_pii(question)[:200],
              "it": it, "erro": None if it else str(raw)[:200], "s": round(time.time() - t0, 1)}
     resultado = (question, False)
+    if not it:
+        event["_interprete_falhou"] = True
     if it:
         conf = float(it.get("confianca") or 0)
         event["_it"] = it
@@ -8560,7 +8878,9 @@ REDACAO_INSTRUCTION = (
     "números já foram calculados pelo app e estão em DADOS (são os oficiais).\n"
     "Como responder:\n"
     "1. A primeira frase responde direto o que a pessoa perguntou (sim/não, quanto, por quê), com o número principal. "
-    "Se a pergunta parte de uma premissa que os dados desmentem (ex.: \"por que caiu?\" e subiu), diga isso logo.\n"
+    "Se a pergunta parte de uma premissa que os dados desmentem (ex.: \"por que caiu?\" e subiu), diga isso logo. "
+    "Abra SEMPRE pelo PERÍODO PEDIDO (sem período na pergunta = o mês): se DADOS também trouxer D-1 ou outro recorte, "
+    "ele entra só como complemento, depois do número do período pedido.\n"
     "2. Depois, só o que explica: no máximo 3 pontos curtos com o que mais pesa. Escolha; não repita todos os números. "
     "Pergunta geral (\"como tá a AeC?\", \"como tá a Review?\") = CSAT, TMA e SLA: diga como está cada um dos três "
     "(o número do consolidado) e aponte o pior desvio de cada indicador, mesmo que seja em filas diferentes.\n"
@@ -8581,6 +8901,13 @@ REDACAO_INSTRUCTION = (
     "7. Não fale de app, consulta, SQL, dados internos nem que você é uma IA.\n"
     "Responda SÓ o texto da mensagem.\n\n"
 )
+
+
+def _periodo_pedido(event: dict[str, Any]) -> str:
+    """O recorte que a resposta tem que abrir. Sem período na pergunta = o mês (regra da Lyra); D-1 só se pediram."""
+    per = ((event.get("_it") or {}).get("periodo") or {})
+    rot = str(per.get("rotulo") or "").strip() if isinstance(per, dict) else ""
+    return rot or "mês atual até ontem (ninguém pediu outro recorte)"
 
 
 def _redacao_on() -> bool:
@@ -8728,6 +9055,7 @@ def _redigir(event: dict[str, Any], question: str, eps: str | None, dados: str, 
     prompt = (f"{_scope_instruction(eps)}\n\n{REDACAO_INSTRUCTION}"
               f"QUEM PERGUNTA: {_speaker_line(event) or '(não identificado)'}\n"
               f"PERGUNTA (como a pessoa escreveu): {pergunta}\n"
+              f"PERÍODO PEDIDO: {_periodo_pedido(event)}\n"
               f"CONVERSA ATÉ AGORA: {ctx.strip() or '(mensagem nova)'}\n"
               f"OFERTA: {oferta or '(nenhuma)'}\n\n"
               f"DADOS:\n{_strip_md(dados)[:9000]}")
@@ -12242,7 +12570,7 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
         prompt = (f"{_scope_instruction(eps)}\n\n{_speaker_line(event)}{orig_line}{_date_context(question)}{context}{extra}"
                   f"{DEFAULTS_INSTRUCTION if not extra else ''}{FREE_ANALYSIS_INSTRUCTION if shape else ''}{FULL_ACCESS_INSTRUCTION if _operator_names_allowed(eps) else ''}"
                   f"{ANSWER_LAYOUT_INSTRUCTION}{_learnings_instruction(eps)}{_table_context(eps)}"
-                  f"{_inject_mop_context(question, eps)}"
+                  f"{_inject_mop_context(question, eps)}{_capa_oficial_ctx(question, event, eps)}"
                   f"{_kb_context(question) if extra == KNOWLEDGE_INSTRUCTION else ''}"
                   f"{NOMINAL_INSTRUCTION if _NOMINAL_RE.search(_norm_text(question)) else ''}"
                   f"{SAME_SET_INSTRUCTION if event.get('thread_ts') and _SAME_SET_RE.search(_norm_text(question)) else ''}")
@@ -12267,6 +12595,10 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
             _remember_answer(prompt, answer)
         _passive_access_check(answer)
         answer = _strip_file_promises(answer)
+        try:  # trava: TMA/SLA da análise livre tem que ser o oficial da CAPA
+            answer = _corrigir_oficiais(answer, question, event, eps)
+        except Exception:
+            logger.warning("Trava de TMA/SLA oficiais falhou", exc_info=True)
         answer = _route_n3_flags(answer, f"pergunta de {_first_name(str(event.get('user') or '')) or 'alguém'}: "
                                           f"_{question[:120]}_", event)
         esc_q = _parse_escalation(answer or "")
