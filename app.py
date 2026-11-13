@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.48.0"
+APP_VERSION = "5.48.1"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -6788,6 +6788,21 @@ _INTERPRETE_CMD_RE = re.compile(r"^\s*interpreta\w*\s*[:\-]\s*(.+)$", re.I | re.
 _INTERPRETACOES_CMD_RE = re.compile(r"^\s*interpreta(c|ç)(o|õ)es\b", re.I)
 _VISOES = {"resultado", "dia_a_dia", "motivos", "pessoas", "equipe", "casos", "variacao", "anomalia", "treinamento", "crise",
            "outro"}
+CRISE_FORMATO = (
+    "FORMATO (o mesmo visual do report das 9h: título, seções separadas por linha em branco, rótulos em negrito, "
+    "sistema/canal em `código`; sem saudação, sem 'Felipe,', sem pergunta no fim, sem '---'):\n"
+    "🚨 *Crises e incidentes · <período, ex.: 09 a 13/11>*  (sem nenhuma ocorrência: ✅ *Sem crise registrada · "
+    "<período>*)\n\n"
+    "🔴 *<dd/mm> · ~<hhhmm>–~<hhhmm> · <sistema e o que foi, curto>*\n"
+    "• *O que aconteceu:* <1 frase>\n• *Causa:* <causa ou 'em investigação'>\n"
+    "• *Impacto no atendimento:* <filas, transbordo, backlog, chamados>\n• *Status:* <Estabilizado | Estabilizando | "
+    "Em andamento | Em investigação>\n\n"
+    "(uma seção dessas por ocorrência com impacto, da mais recente para a mais antiga; 🔴 em andamento, 🟡 em "
+    "investigação/estabilizando, 🟢 estabilizado)\n\n"
+    "⚪ *Sem impacto relevante no atendimento*\n• <dd/mm ~hhhmm> · <o que foi, 1 linha>  (só se houver)\n\n"
+    "📡 *Fontes:* <canais lidos> (· não abriram: <canais>, se houver)\n"
+    "Pode oferecer, numa linha final em itálico, cruzar com os indicadores.\n\n"
+)
 CRISE_FEED_INSTRUCTION = (
     "INFORMAÇÃO INTERNA PARA A LYRA: a pessoa quer saber de CRISE / INCIDENTE / PROBLEMA operacional no período "
     "{periodo} — não de resultado. Crise, incidente, problema, instabilidade, falha e queda são a mesma pergunta: use a "
@@ -7276,8 +7291,8 @@ def _despachar(event: dict[str, Any], eps: str | None, question: str, say: Calla
             feed = _crisis_feed_txt(datetime(ini.year, ini.month, ini.day, tzinfo=BRAZIL_TIMEZONE), fim_dt)
         except Exception:
             logger.warning("Crisis feed (pergunta de crise) falhou", exc_info=True)
-        extra_c = (CRISE_FEED_INSTRUCTION.format(periodo=periodo) + feed) if feed else CRISE_INSTRUCTION.format(
-            periodo=periodo, eps_txt=f" e `EPS: {eps_c}`" if eps_c else "")
+        extra_c = ((CRISE_FEED_INSTRUCTION.format(periodo=periodo) + feed) if feed else CRISE_INSTRUCTION.format(
+            periodo=periodo, eps_txt=f" e `EPS: {eps_c}`" if eps_c else "")) + CRISE_FORMATO
         event.update(_despacho_livre=True, _route="crise" if feed else "crise:toqan", _extra_forcado=extra_c)
         return False
     if visao == "treinamento":
