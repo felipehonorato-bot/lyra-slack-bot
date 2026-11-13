@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.46.1"
+APP_VERSION = "5.46.3"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -630,13 +630,41 @@ def _row_value(row: dict[str, Any], *names: str) -> str:
     return ""
 
 
+_ALERT_LOCK = threading.Lock()
+
+
+def _alert_thread(target: str) -> tuple[str, str | None]:
+    """Thread do dia para os alertas (uma mensagem-mãe por dia e destino; os avisos entram como resposta).
+    Devolve (canal, ts da mãe) — ts None se não deu para abrir a thread (aí o aviso sai solto)."""
+    dia = _now_brazil().strftime("%Y-%m-%d")
+    chave = f"alert_thread:{target}"
+    try:
+        salvo = json.loads(STATE.get(chave) or "{}")
+    except Exception:
+        salvo = {}
+    if salvo.get("dia") == dia and salvo.get("ts") and salvo.get("canal"):
+        return salvo["canal"], salvo["ts"]
+    try:
+        r = slack_app.client.chat_postMessage(
+            channel=target, text=f"🧵 Alertas da Lyra — {_now_brazil().strftime('%d/%m')} (os avisos do dia vão nesta thread)")
+        canal, ts = r.get("channel") or target, r.get("ts")
+        if ts:
+            STATE.set(chave, json.dumps({"dia": dia, "canal": canal, "ts": ts}))
+        return canal, ts
+    except Exception:
+        logger.exception("Could not open alert thread on %s", target)
+        return target, None
+
+
 def _alert(text: str) -> None:
-    """Avisa o responsável técnico (ALERT_CHANNEL) — sem expor dados pessoais."""
+    """Avisa o responsável técnico (ALERT_CHANNEL) — sem expor dados pessoais. Tudo numa thread por dia."""
     logger.warning("ALERTA: %s", text)
+    msg = f"Lyra — {text}" if text.lstrip().startswith("⚠️") or text.lstrip().startswith("🔐") else f"⚠️ Lyra — {text}"
     for target in [t.strip() for t in ALERT_CHANNEL.split(",") if t.strip()]:
         try:
-            slack_app.client.chat_postMessage(channel=target, text=f"Lyra — {text}" if text.lstrip().startswith("⚠️")
-                                              else f"⚠️ Lyra — {text}")
+            with _ALERT_LOCK:  # dois alertas ao mesmo tempo não abrem duas threads no mesmo dia
+                canal, ts = _alert_thread(target)
+            slack_app.client.chat_postMessage(channel=canal, text=msg, **({"thread_ts": ts} if ts else {}))
         except Exception:
             logger.exception("Could not post alert to %s", target)
 
@@ -759,9 +787,14 @@ def _dm_scope(user: str) -> tuple[bool, str | None]:
     elif any(domain == d or domain.endswith("." + d) for d in DM_ALLOWED_DOMAINS):
         result = (True, None)
     _DM_SCOPE_CACHE[user] = result
-    try:  # quem entra na DM e com qual visão (uma vez por pessoa a cada deploy), para o time conferir acessos
-        _alert(f"🔐 DM da Lyra: <@{user}> ({email}) → "
-               + ("visão completa do iFood" if result == (True, None) else f"só a {result[1]}" if result[0] else "bloqueada"))
+    try:  # quem entra na DM pela 1ª vez (de verdade, não a cada deploy) e com qual visão, para o time conferir acessos
+        vistos = set(json.loads(STATE.get("dm_vistos") or "[]"))
+        if user not in vistos:
+            vistos.add(user)
+            STATE.set("dm_vistos", json.dumps(sorted(vistos)))
+            _alert(f"🔐 DM da Lyra (1ª vez): <@{user}> ({email}) → "
+                   + ("visão completa do iFood" if result == (True, None) else f"só a {result[1]}" if result[0]
+                      else "bloqueada"))
     except Exception:
         logger.warning("DM access alert failed", exc_info=True)
     return result
@@ -3326,7 +3359,7 @@ def _capa_rows(ini: date, fim: date, progress: Callable[[str], Any] | None = Non
     return out, problema
 
 
-APP_SQL_MAX_CONCURRENT = int(os.getenv("APP_SQL_MAX_CONCURRENT", "2"))
+APP_SQL_MAX_CONCURRENT = int(os.getenv("APP_SQL_MAX_CONCURRENT", "3"))
 APP_SQL_RETRIES = int(os.getenv("APP_SQL_RETRIES", "3"))
 APP_SQL_RETRY_WAIT_S = int(os.getenv("APP_SQL_RETRY_WAIT_S", "20"))
 _APP_SQL_SLOTS = threading.BoundedSemaphore(APP_SQL_MAX_CONCURRENT)
@@ -13470,13 +13503,13 @@ def _shadow_note(channel: str, thread_ts: str, eps: str, title: str, text: str, 
 
 # --- Leitura contínua dos canais das EPSs ---------------------------------------------------------------------------
 # Toda conversa dos canais de indicadores é lida (uma leitura por thread, CREAD_DELAY_SECONDS depois da última
-# mensagem). A Lyra extrai três coisas e age: (1) cobrança do iFood para a EPS — se a EPS não responder em 30 min,
+# mensagem). A Lyra extrai três coisas e age: (1) cobrança do iFood para a EPS — se a EPS não responder em 2 h,
 # reforça; quando responder, confere se tem causa, ação e prazo; (2) compromisso com prazo da EPS — no prazo, cobra
 # se foi feito; (3) problema operacional relatado — vai para o registro do dia. Tudo entra no registro do dia
 # ("o que aconteceu hoje?") e as pendências de ontem saem numa resposta na thread do report.
 CREAD = os.getenv("CONTINUOUS_READ", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
 CREAD_DELAY_SECONDS = int(os.getenv("CREAD_DELAY_SECONDS", "180"))
-CREAD_FOLLOWUP_MINUTES = int(os.getenv("CREAD_FOLLOWUP_MINUTES", "30"))
+CREAD_FOLLOWUP_MINUTES = int(os.getenv("CREAD_FOLLOWUP_MINUTES", "120"))  # 2 h para a EPS responder a cobrança
 _CREAD_TIMERS: dict[str, threading.Timer] = {}
 _CREAD_LOCK = threading.Lock()
 _PENDING_LOCK = threading.Lock()
