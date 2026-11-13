@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.43.1"
+APP_VERSION = "5.43.2"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -5386,6 +5386,13 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
     else:
         rows, problema = _csat_fixed_rows("csat_pessoas.sql", ini, fim, params, progress,
                                           f"CSAT por operador ({ini} a {fim})")
+        if rows is not None and not _usavel(rows):  # voltou vazio/sem as pessoas: a Indicadores às vezes falha; de novo
+            logger.warning("CSAT pessoas: resposta sem pessoas (%s linhas); repetindo a consulta", len(rows))
+            _CSAT_ROWS_CACHE.clear()
+            rows2, problema2 = _csat_fixed_rows("csat_pessoas.sql", ini, fim, params, progress,
+                                                f"CSAT por operador ({ini} a {fim}, 2ª tentativa)")
+            if _usavel(rows2):
+                rows, problema = rows2, problema2
 
     for menor in ("300", "50"):  # a lista não voltou em páginas: tenta os que mais pesam
         if _usavel(rows) or int(params["top_ops"]) <= int(menor):
@@ -5424,6 +5431,10 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
             _alert(f"⚠️ CSAT por operador ({ini} a {fim}): a resposta não trouxe as linhas TOTAL do SQL fixo. "
                    f"Colunas: {sorted(rows[0].keys())[:8]} · 1ª linha: {_mask_pii(str(list(rows[0].values())[:5]))}")
             return "A consulta voltou num formato que eu não consegui ler. Já avisei o time; tenta de novo daqui a pouco?"
+        if (fim - ini).days >= 2:  # numa janela de dias, fila sem nenhuma avaliação é quase sempre falha da consulta
+            _alert(f"⚠️ CSAT por operador ({fila or eps or 'iFood'}, {ini} a {fim}): a consulta voltou vazia duas vezes.")
+            return (f"A consulta das avaliações de {fila or eps or 'AeC/CSU'} em {label} voltou vazia agora, o que não "
+                    "bate com o volume da fila. Já avisei o time; me pede de novo daqui a pouco?")
         return f"Não achei avaliações de {fila or eps or 'AeC/CSU'} em {label}. Quer outro período?"
     event["_catalog"] = "csat|pessoas|impacto"
     n_ops = sum(len(c["ops"]) for _, c in calcs)
@@ -7060,7 +7071,8 @@ def _crisis_prompt(start: datetime, end: datetime, eps: str | None) -> str:
         '{"crise": true|false, "resumo": "<sistema e o que aconteceu, 1 frase>", "inicio": "~hhhmm", "fim": "~hhhmm ou '
         'em andamento", "impacto": "<efeito no atendimento: transbordo, fila, filas afetadas>", "filas": ["<fila>"], '
         '"status": "Estabilizado|Estabilizando|Em andamento|Em investigação"}\n'
-        "Sem crise ou sem fonte: {\"crise\": false}. Se a consulta falhar: responda só 'ERRO: <motivo>'."
+        "Sem crise: {\"crise\": false, \"verificado\": true|false, \"canais\": [...], \"limitacao\": \"...\"} como ele "
+        "responder. Se a consulta falhar: responda só 'ERRO: <motivo>'."
     )
 
 
@@ -8438,10 +8450,16 @@ REDACAO_INSTRUCTION = (
     "Como responder:\n"
     "1. A primeira frase responde direto o que a pessoa perguntou (sim/não, quanto, por quê), com o número principal. "
     "Se a pergunta parte de uma premissa que os dados desmentem (ex.: \"por que caiu?\" e subiu), diga isso logo.\n"
-    "2. Depois, só o que explica: no máximo 3 pontos curtos com o que mais pesa. Escolha; não repita todos os números.\n"
+    "2. Depois, só o que explica: no máximo 3 pontos curtos com o que mais pesa. Escolha; não repita todos os números. "
+    "Pergunta geral (\"como tá a AeC?\", \"como tá a Review?\") = CSAT, TMA e SLA: diga como está cada um dos três "
+    "(o número do consolidado) e aponte o pior desvio de cada indicador, mesmo que seja em filas diferentes.\n"
     "3. Use SÓ números que estão em DADOS, como estão (pode arredondar: \"quase 20 p.p.\"). Nunca calcule número novo e "
     "nunca invente motivo ou nome que não esteja em DADOS. Interpretar os números é com você (ex.: volume acima do plan "
-    "com TMA dentro do plan = fila acumulando antes do atendimento).\n"
+    "com TMA dentro do plan = fila acumulando antes do atendimento). Mas NUNCA cite causa de fora dos dados (feriado, "
+    "data comemorativa, clima, evento, campanha, instabilidade de sistema): você não sabe se aconteceu. Se um número "
+    "pede explicação, diga o que ele mostra e sugira checar (\"volume 35% abaixo do plan na segunda: vale ver o que "
+    "houve\"). Exceção: OCORRÊNCIA REGISTRADA em DADOS (crise da Lyra Crises) é fato — use para explicar o desvio, "
+    "dizendo que foi registrada.\n"
     "4. Tom de colega de trabalho que conhece a operação: português do Brasil, direto, sem jargão de sistema. Sem "
     "fórmula, sem explicar como o número é calculado (a não ser que perguntem).\n"
     "5. Formato Slack: *negrito* com um asterisco, nome de fila entre crases, sem título com #, sem tabela, no máximo "
@@ -8455,6 +8473,55 @@ REDACAO_INSTRUCTION = (
 
 def _redacao_on() -> bool:
     return REDACAO_IA == "on"
+
+
+_CRISE_DADOS_RE = re.compile(r"\b(csat|tma|sla|nota\w*|fila\w*|volume|resultado|como (ta|esta|foi|fechou)|caiu|cair|"
+                             r"piorou|subiu|estranho|anormal|dia a dia|madrug\w*|review|super\w*|suporte|esperando)\b")
+
+
+def _crise_iniciar(event: dict[str, Any], eps: str | None) -> None:
+    """Passo 3: em paralelo com as contas, pergunta à Lyra Crises se teve crise/incidente no período da pergunta.
+    Se teve, entra nos DADOS e a IA pode usar para explicar um desvio (em vez de chutar uma causa)."""
+    if not CRISIS_CHECK:
+        return
+    q = _strip_mentions(str(event.get("text") or ""))
+    if not _CRISE_DADOS_RE.search(_norm_text(q)):
+        return
+    try:
+        ini, fim, _ = _capa_period(q, event)
+        start = datetime(ini.year, ini.month, ini.day, tzinfo=BRAZIL_TIMEZONE)
+        end = min(datetime(fim.year, fim.month, fim.day, tzinfo=BRAZIL_TIMEZONE) + timedelta(days=1), _now_brazil())
+    except Exception:
+        return
+    box: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            box["c"] = _crisis_check(start, end, eps)
+            if box["c"] is None:  # sem crise: só afirma "não teve" se a Lyra Crises leu os canais (verificado)
+                ans = _ask_cached(_crisis_prompt(start, end, eps), ttl_seconds=CRISIS_CHECK_TTL)
+                d = _block_data_from_json(ans) if not _is_error_answer(ans) else None
+                if isinstance(d, dict) and d.get("crise") is False and d.get("verificado") is True:
+                    box["sem"] = ", ".join(str(c) for c in (d.get("canais") or [])) or "canais de alerta"
+        except Exception:
+            box["c"] = None
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    event["_crise"] = (th, box)
+
+
+def _crise_texto(event: dict[str, Any]) -> str:
+    x = event.get("_crise")
+    if not x:
+        return ""
+    th, box = x
+    th.join(timeout=60)
+    c = box.get("c")
+    if c:
+        return _crisis_line(c, "registrada no período")
+    if box.get("sem"):
+        return f"nenhuma crise registrada no período (Lyra Crises leu {box['sem']})"
+    return ""
 
 
 def _num_vals(texto: str) -> list[float]:
@@ -8539,6 +8606,9 @@ def _redigir(event: dict[str, Any], question: str, eps: str | None, dados: str, 
     if not _redacao_on() or not dados.strip():
         return None
     pergunta = str(event.get("_orig_q") or question)
+    crise = _crise_texto(event)
+    if crise:
+        dados = f"{dados}\n\nOCORRÊNCIA REGISTRADA NO PERÍODO (Lyra Crises, fato): {_strip_md(crise)}"
     try:
         ctx = _conversa_ctx(event)[-2500:]
     except Exception:
@@ -11323,6 +11393,10 @@ def _process_event(event: dict[str, Any], say: Callable[..., Any], in_thread: bo
             logger.warning("Intérprete (shadow) não iniciou", exc_info=True)
     if _redacao_on():  # REDACAO_IA=on: toda resposta de dados passa pela IA
         event["_buf"] = []
+        try:
+            _crise_iniciar(event, _event_scope(event)[1])
+        except Exception:
+            logger.warning("Checagem de crise do passo 3 não iniciou", exc_info=True)
     try:
         try:
             _process_event_inner(event, say, in_thread, client, failed)
