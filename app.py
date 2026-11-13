@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.43.2"
+APP_VERSION = "5.43.3"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -3327,6 +3327,7 @@ APP_SQL_MAX_CONCURRENT = int(os.getenv("APP_SQL_MAX_CONCURRENT", "2"))
 APP_SQL_RETRIES = int(os.getenv("APP_SQL_RETRIES", "3"))
 APP_SQL_RETRY_WAIT_S = int(os.getenv("APP_SQL_RETRY_WAIT_S", "20"))
 _APP_SQL_SLOTS = threading.BoundedSemaphore(APP_SQL_MAX_CONCURRENT)
+_APP_SQL_LAST_RAW: dict[str, str] = {}  # última resposta crua por consulta (para o alerta quando volta vazia)
 # Erro de análise num SQL pronto (que já roda certo) = a Indicadores mexeu no texto ao executar: vale tentar de novo.
 _APP_SQL_MEXIDO_RE = re.compile(r"MISSING_AGGREGATION|PARSE_SYNTAX_ERROR|UNRESOLVED_(COLUMN|ROUTINE)|"
                                 r"AMBIGUOUS_REFERENCE|DATATYPE_MISMATCH|SQLSTATE: 42", re.I)
@@ -3368,6 +3369,7 @@ def _run_app_sql(filled: str, progress: Callable[[str], Any] | None, nome: str,
             break
         logger.info("%s: warehouse lotado, tentando de novo em %ss", nome, APP_SQL_RETRY_WAIT_S)
         time.sleep(APP_SQL_RETRY_WAIT_S)
+    _APP_SQL_LAST_RAW[re.sub(r",? ?(parte \d+|2ª tentativa)", "", nome)] = str(ans or "")[:600]
     parsed = None if _is_error_answer(ans) else _parse_data_csv(ans)
     if not parsed and _APP_SQL_BUSY_RE.search(str(ans)):
         logger.warning("%s: warehouse lotado mesmo depois de %s tentativas", nome, APP_SQL_RETRIES + 1)
@@ -5432,7 +5434,9 @@ def _send_pessoas_impacto(event: dict[str, Any], client: Any, eps: str | None, q
                    f"Colunas: {sorted(rows[0].keys())[:8]} · 1ª linha: {_mask_pii(str(list(rows[0].values())[:5]))}")
             return "A consulta voltou num formato que eu não consegui ler. Já avisei o time; tenta de novo daqui a pouco?"
         if (fim - ini).days >= 2:  # numa janela de dias, fila sem nenhuma avaliação é quase sempre falha da consulta
-            _alert(f"⚠️ CSAT por operador ({fila or eps or 'iFood'}, {ini} a {fim}): a consulta voltou vazia duas vezes.")
+            raw = _APP_SQL_LAST_RAW.get(f"CSAT por operador ({ini} a {fim})", "")
+            _alert(f"⚠️ CSAT por operador ({fila or eps or 'iFood'}, {ini} a {fim}): a consulta voltou sem as pessoas "
+                   f"duas vezes. Resposta da Indicadores: ```{_mask_pii(raw[:400]) or '(vazia)'}```")
             return (f"A consulta das avaliações de {fila or eps or 'AeC/CSU'} em {label} voltou vazia agora, o que não "
                     "bate com o volume da fila. Já avisei o time; me pede de novo daqui a pouco?")
         return f"Não achei avaliações de {fila or eps or 'AeC/CSU'} em {label}. Quer outro período?"
