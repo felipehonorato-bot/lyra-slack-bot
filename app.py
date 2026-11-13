@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.47.0"
+APP_VERSION = "5.47.3"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -8614,19 +8614,34 @@ def _kb_load_repo() -> list[dict[str, Any]]:
                 if len(text) >= 25:
                     chunks.append({"aba": ws.title, "texto": text, "tok": _kb_tokens(f"{ws.title} {text}")})
                 continue
-            # linha larga (ex.: Platinum × cada etapa da jornada): um trecho por coluna, sempre com o rótulo da linha,
-            # para nada ficar cortado no fim e a busca achar a etapa certa daquele segmento
+            # linha larga (ex.: Platinum × cada etapa da jornada; um motivo de contato com 20 colunas): em pedaços de
+            # colunas inteiras, todos com o rótulo da linha — nada fica cortado no fim e cada pedaço ainda tem contexto
             rotulo = " · ".join(c.replace("\n", " ").strip() for c in cells[:2] if c and len(c) <= 160)[:240]
+            pecas = []
             for i, c in enumerate(cells):
-                if not c or len(c) <= 160 and c in rotulo:
+                if not c or len(c) <= 160 and c.replace("\n", " ").strip() in rotulo:
                     continue
                 col = header[i] if header and i < len(header) and header[i] else ""
                 if col and _KB_PEOPLE_COL_RE.search(_norm_text(col)):
                     continue
-                piece = f"{rotulo} | {col + ': ' if col else ''}{c.replace(chr(10), ' / ')}"
-                for k in range(0, len(piece), KB_CHUNK_MAX):  # célula enorme: em partes, todas com o rótulo
-                    part = piece[k:k + KB_CHUNK_MAX] if not k else f"{rotulo} | {col} (cont.): " + piece[k:k + KB_CHUNK_MAX]
-                    chunks.append({"aba": ws.title, "texto": part, "tok": _kb_tokens(f"{ws.title} {part}")})
+                pecas.append(f"{col.replace(chr(10), ' ') + ': ' if col else ''}{c.replace(chr(10), ' / ')}")
+            atual = ""
+            for pc in pecas:
+                while len(pc) > KB_CHUNK_MAX:  # célula enorme sozinha: em partes
+                    if atual:
+                        chunks.append({"aba": ws.title, "texto": f"{rotulo} | {atual}",
+                                       "tok": _kb_tokens(f"{ws.title} {rotulo} {atual}")})
+                        atual = ""
+                    chunks.append({"aba": ws.title, "texto": f"{rotulo} | {pc[:KB_CHUNK_MAX]}",
+                                   "tok": _kb_tokens(f"{ws.title} {rotulo} {pc[:KB_CHUNK_MAX]}")})
+                    pc = "(cont.) " + pc[KB_CHUNK_MAX:]
+                if atual and len(atual) + len(pc) + 3 > KB_CHUNK_MAX:
+                    chunks.append({"aba": ws.title, "texto": f"{rotulo} | {atual}",
+                                   "tok": _kb_tokens(f"{ws.title} {rotulo} {atual}")})
+                    atual = ""
+                atual = f"{atual} | {pc}" if atual else pc
+            if atual:
+                chunks.append({"aba": ws.title, "texto": f"{rotulo} | {atual}", "tok": _kb_tokens(f"{ws.title} {rotulo} {atual}")})
     return chunks
 
 
@@ -8635,6 +8650,9 @@ def _kb_load_repo() -> list[dict[str, Any]]:
 _KB_POL: dict[str, Any] = {"linhas": None}
 KB_JORNADAS = {"confirmacao": "confirmacao", "preparo": "preparo", "atraso_1p": "atraso 1p", "atraso_3p": "atraso 3p",
                "cnl": "cnl", "pos_entrega": "pos entrega", "pne": "pne", "pagamento": "pagamento", "clube": "pagamento"}
+KB_CATEGORIAS = {"atraso_1p": "pedido atrasado", "atraso_3p": "pedido atrasado", "pos_entrega": "pos-entrega",
+                 "pne": "pedido nao entregue", "cnl": "cnl", "preparo": "preparo", "pagamento": "pagamentos",
+                 "clube": "clube"}
 KB_SEGMENTOS = {"platinum": "platinum", "gold": "gold", "silver": "silver", "bronze": "bronze", "priority": "priority",
                 "potential": "potencial", "disengaged": "disengaged", "off_target": "off target"}
 
@@ -8795,6 +8813,17 @@ def _kb_context(query: str, extra: str = "", it: dict[str, Any] | None = None) -
         pol = ""
     if pol:  # a regra exata do caso já veio: os outros pedaços da mesma matriz (outros segmentos/etapas) só confundem
         hits = [h for h in hits if not _norm_text(h["aba"]).startswith("segmentacoes")]
+    try:  # ficha do motivo de contato da etapa (Visão Holística): contexto do processo, camadas, código, ferramentas
+        cat = KB_CATEGORIAS.get(str(it.get("jornada") or ""))
+        if cat:
+            do_motivo = [d for d in _kb_ready() if _norm_text(d["aba"]).startswith("visao holistica")
+                         and cat in _norm_text(d["texto"].split("|")[0])]
+            if do_motivo:
+                ordem = {id(d): i for i, d in enumerate(_kb_search(f"{extra} {query}", k=400))}
+                top = sorted(do_motivo, key=lambda d: ordem.get(id(d), 10 ** 6))[:2]
+                hits = top + [h for h in hits if all(h is not t for t in top)]
+    except Exception:
+        logger.warning("KB motivo lookup failed", exc_info=True)
     if not hits and not pol:
         return ""
     out, total = ([f"[Segmentações & Políticas — regra do caso]\n{pol}"], len(pol)) if pol else ([], 0)
@@ -9063,12 +9092,25 @@ KNOWLEDGE_INSTRUCTION = (
     "respostas do time) — a 'regra do caso' da matriz Segmentações & Políticas, quando vier, é a regra exata daquele "
     "segmento naquela etapa. Se os trechos cobrem a dúvida, responda com eles e NÃO chame subagente. Se não cobrirem, "
     "chame a *Lyra Conhecimento* com `Pedido: <a pergunta, completa, com o caso>`.\n"
+    "Responda a pergunta que foi feita, do ponto de vista de quem pergunta: a EPS é o L3, então 'quais os cenários' ou "
+    "'o que fazer' é a conduta do analista quando o caso chega nele — o que L1/L2 (HS, Rosie, Will) já fizeram entra só "
+    "como contexto curto (o que o cliente já recebeu ou ouviu). Cada condição que a pessoa citou (ex.: 'loja aberta', "
+    "'sem nota', 'reincidente') tem que aparecer na resposta: diga o que a regra faz com ela; se a base não tiver regra "
+    "para aquela condição, diga isso em 1 frase e escale SÓ esse recorte (o resto você responde). Não troque a pergunta "
+    "por outra que a base responde melhor.\n"
     "Pergunta que descreve um CASO: aplique a regra ao caso, passo a passo — qual jornada/motivo, qual segmento, quem "
     "é o responsável (o Almir infere a responsabilidade mesmo sem foto ou nota; as evidências, o CRI e a reincidência "
     "entram nessa inferência) e, então, o desfecho e o que a operação faz. Quando o desfecho depende de algo que o caso "
     "não diz (ex.: quem o Almir apontou como responsável, pedido acima ou abaixo de R$100, Food ou Mercado), mostre os "
     "caminhos de forma curta (se X → faz A; se Y → faz B). Termine com a conduta da operação (L3) quando o caso for "
     "dela.\n"
+    "Siglas (use o sentido certo, nunca invente outro): HS = handshake com a loja (o iFood confirma com o parceiro); "
+    "1P = entrega iFood, 3P = entrega da loja; L1 autosserviço/HS, L2 automação (Rosie, Will), L3 operação humana (EPS); "
+    "CRI = risco de cancelamento do cliente; Almir = IA que infere o responsável; PNE = pedido não entregue; CNL = "
+    "cliente não localizado; Food = restaurante, Multi = mercado, farmácia, pet etc.; VIP = Super CX = fila CX Super "
+    "Cliente, que atende os clientes Platinum (dúvida de processo da VIP/Super = regra do Platinum). Sigla que não está aqui nem nos "
+    "trechos: use como está, sem expandir. Quando a regra muda entre Food e Multi e a pessoa não disse qual, responda "
+    "pelo Food e avise em 1 linha que no Multi muda.\n"
     "Proibido: citar One Hub, Matriz CX, link, aba, planilha ou 'minha base' como resposta (fale do processo, não de "
     "onde ele está); mandar a pessoa procurar outro time, área ou pessoa; completar com conhecimento geral (CDC, "
     "'geralmente', outras empresas). Responda SÓ a pergunta atual. Só quando a base realmente não tiver a regra (nem nos "
@@ -10582,13 +10624,15 @@ def _post_sections(channel: str, text: str, thread_ts: str | None = None) -> Any
 
 def _slack_md(text: str) -> str:
     """Markdown comum → Slack: **negrito** vira *negrito*, ### título vira *título* (o Slack mostra os asteriscos crus)."""
-    if not text or ("**" not in text and "#" not in text and "__" not in text):
+    if not text or ("**" not in text and "#" not in text and "__" not in text and "---" not in text):
         return text
     partes = re.split(r"(```.*?```)", text, flags=re.S)
     for i in range(0, len(partes), 2):
         t = re.sub(r"\*\*(.+?)\*\*", r"*\1*", partes[i], flags=re.S)
         t = re.sub(r"(?<![\w])__(.+?)__(?![\w])", r"_\1_", t)
         t = re.sub(r"(?m)^#{1,6}[ \t]+(.+?)[ \t]*$", r"*\1*", t)
+        t = re.sub(r"(?m)^[ \t]*(-{3,}|\*{3,}|_{3,})[ \t]*$\n?", "", t)  # "---" do markdown aparece cru no Slack
+        t = re.sub(r"\n{3,}", "\n\n", t)
         partes[i] = t
     return "".join(partes)
 
