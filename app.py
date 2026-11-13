@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.43.3"
+APP_VERSION = "5.43.4"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -5299,7 +5299,8 @@ def _render_pessoas_impacto(calc: dict[str, Any], alvo: str, label: str, d1: boo
         neg = [o for o in ops if o["imp"] < -0.005]
         linhas += ["", "🧑‍💻 *Por operador* — quem mais puxa para baixo"]
         for i, o in enumerate(neg[:PESSOAS_OPS_MAX], 1):
-            linhas.append(f"{i}. {who(o)} · {o['fila']} · *{_pp_signed(o['imp'])}* · CSAT {_bfmt(o['csat'])}% "
+            linhas.append(f"{i}. {who(o)} · {o['fila']}" + (f" · equipe de {_nice_name(o['sup'])}" if o.get("sup") else "")
+                          + f" · *{_pp_signed(o['imp'])}* · CSAT {_bfmt(o['csat'])}% "
                           f"(meta {_bfmt(o['meta'])}%) · n={_fmt_int(o['aval'])}")
         if not neg:
             linhas.append("Ninguém abaixo da meta da fila no recorte. 👏")
@@ -8469,7 +8470,8 @@ REDACAO_INSTRUCTION = (
     "5. Formato Slack: *negrito* com um asterisco, nome de fila entre crases, sem título com #, sem tabela, no máximo "
     "7 linhas.\n"
     "6. Feche com a OFERTA abaixo, do seu jeito (uma pergunta curta), se ela fizer sentido. Ofereça só isso: é o que "
-    "você tem pronto para mandar se a pessoa disser sim.\n"
+    "você tem pronto para mandar se a pessoa disser sim — não prometa análise que não está nela (ex.: motivo, turno).\n"
+    "8. Relação entre pessoas (quem é da equipe de quem) só se estiver escrita em DADOS.\n"
     "7. Não fale de app, consulta, SQL, dados internos nem que você é uma IA.\n"
     "Responda SÓ o texto da mensagem.\n\n"
 )
