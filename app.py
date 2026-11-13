@@ -543,7 +543,7 @@ slack_app = App(
     token_verification_enabled=bool(os.getenv("SLACK_BOT_TOKEN")),
 )
 slack_handler = SlackRequestHandler(slack_app)
-APP_VERSION = "5.46.3"
+APP_VERSION = "5.47.0"
 _BOOT_AT = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 flask_app = Flask(__name__)
 app = flask_app
@@ -6876,6 +6876,10 @@ def _parse_interpretacao(texto: str) -> dict[str, Any] | None:
     elif len(data["filas"]) > 1:
         data["fila"] = None
     data["publico"] = data.get("publico") if data.get("publico") in {"q4", "todos", "top"} else None
+    data["jornada"] = data.get("jornada") if data.get("jornada") in KB_JORNADAS else None
+    data["segmento"] = data.get("segmento") if data.get("segmento") in KB_SEGMENTOS else None
+    data["esteira"] = data.get("esteira") if data.get("esteira") in {"food", "multi"} else None
+    data["busca"] = str(data.get("busca") or "")[:300]
     per = data.get("periodo")
     if isinstance(per, dict):
         try:
@@ -8544,7 +8548,8 @@ KNOWLEDGE_SKIP_TABS = {"macros (case rules)", "atualizacoes repositorio", "figma
                        # informação interna do time: não entra na base de ninguém
                        "organograma do time", "matriz raci", "responsaveis por bu", "repositorio de habilidades",
                        "quem e o seu helio"}
-KB_MAX_CHARS = int(os.getenv("KB_MAX_CHARS", "7000"))
+KB_MAX_CHARS = int(os.getenv("KB_MAX_CHARS", "9000"))
+KB_CHUNK_MAX = 1800
 TEAM_ANSWERS_TITLE = "Respostas do time"
 TEAM_ANSWERS_HEADERS = ["Data", "EPS", "Pergunta", "Resposta", "Quem respondeu", "Thread", "Status"]
 _KB: dict[str, Any] = {"chunks": None, "idf": {}, "avgdl": 1.0, "team": None, "team_at": 0.0}
@@ -8557,8 +8562,11 @@ _KB_STOP = set("a o e de da do das dos em no na nos nas um uma para por com que 
 _KB_PEOPLE_COL_RE = re.compile(r"respons|suporte nas valida|\bdono\b|criado por|modificado|focal")
 
 
+KB_STEM = 6  # radical: "entregue"/"entrega", "evidências"/"evidência", "cancelamento"/"cancelar" batem entre si
+
+
 def _kb_tokens(text: str) -> list[str]:
-    return [w for w in re.findall(r"[a-z0-9]{3,}|\b[a-z][0-9]\b", _norm_text(text)) if w not in _KB_STOP]
+    return [w[:KB_STEM] for w in re.findall(r"[a-z0-9]{3,}|\b[a-z][0-9]\b", _norm_text(text)) if w not in _KB_STOP]
 
 
 def _kb_load_repo() -> list[dict[str, Any]]:
@@ -8579,13 +8587,20 @@ def _kb_load_repo() -> list[dict[str, Any]]:
             if len(short) >= 4 and len(short) > best:
                 best, h_idx = len(short), i
         header: list[str] | None = None
+        acima = ""  # 1ª coluna mesclada (ex.: "L3 Atendimento Humano" vale para as linhas de baixo até a próxima)
         for i, cells in enumerate(all_rows):
             filled = [c for c in cells if c]
             if not filled:
                 continue
             if i == h_idx:
                 header = cells
+                acima = ""
                 continue
+            if header and cells:
+                if cells[0]:
+                    acima = cells[0] if len(cells[0]) <= 200 else ""
+                elif acima and len(filled) >= 1:
+                    cells = [acima] + cells[1:]
             if _norm_text(filled[0]).startswith("responsavel"):
                 continue  # linha "Responsável: <pessoa>": informação interna do time
             if header:
@@ -8594,10 +8609,95 @@ def _kb_load_repo() -> list[dict[str, Any]]:
                          and not (i < len(header) and _KB_PEOPLE_COL_RE.search(_norm_text(header[i])))]
             else:
                 parts = filled
-            text = " | ".join(p.replace("\n", " / ") for p in parts)[:1800]
-            if len(text) >= 25:
-                chunks.append({"aba": ws.title, "texto": text, "tok": _kb_tokens(f"{ws.title} {text}")})
+            text = " | ".join(p.replace("\n", " / ") for p in parts)
+            if len(text) <= KB_CHUNK_MAX:
+                if len(text) >= 25:
+                    chunks.append({"aba": ws.title, "texto": text, "tok": _kb_tokens(f"{ws.title} {text}")})
+                continue
+            # linha larga (ex.: Platinum × cada etapa da jornada): um trecho por coluna, sempre com o rótulo da linha,
+            # para nada ficar cortado no fim e a busca achar a etapa certa daquele segmento
+            rotulo = " · ".join(c.replace("\n", " ").strip() for c in cells[:2] if c and len(c) <= 160)[:240]
+            for i, c in enumerate(cells):
+                if not c or len(c) <= 160 and c in rotulo:
+                    continue
+                col = header[i] if header and i < len(header) and header[i] else ""
+                if col and _KB_PEOPLE_COL_RE.search(_norm_text(col)):
+                    continue
+                piece = f"{rotulo} | {col + ': ' if col else ''}{c.replace(chr(10), ' / ')}"
+                for k in range(0, len(piece), KB_CHUNK_MAX):  # célula enorme: em partes, todas com o rótulo
+                    part = piece[k:k + KB_CHUNK_MAX] if not k else f"{rotulo} | {col} (cont.): " + piece[k:k + KB_CHUNK_MAX]
+                    chunks.append({"aba": ws.title, "texto": part, "tok": _kb_tokens(f"{ws.title} {part}")})
     return chunks
+
+
+# Aba "Segmentações & Políticas": matriz segmento × etapa da jornada (Food e Multi). A leitura do pedido (intérprete)
+# diz o segmento e a etapa; o app entrega a célula exata — busca por palavra não acha caso descrito em frases.
+_KB_POL: dict[str, Any] = {"linhas": None}
+KB_JORNADAS = {"confirmacao": "confirmacao", "preparo": "preparo", "atraso_1p": "atraso 1p", "atraso_3p": "atraso 3p",
+               "cnl": "cnl", "pos_entrega": "pos entrega", "pne": "pne", "pagamento": "pagamento", "clube": "pagamento"}
+KB_SEGMENTOS = {"platinum": "platinum", "gold": "gold", "silver": "silver", "bronze": "bronze", "priority": "priority",
+                "potential": "potencial", "disengaged": "disengaged", "off_target": "off target"}
+
+
+def _kb_politicas() -> list[dict[str, Any]]:
+    """[{esteira, segmento, rotulo, etapas: {etapa_norm: (cabeçalho, texto)}, cupons: {...}}]"""
+    if _KB_POL["linhas"] is not None:
+        return _KB_POL["linhas"]
+    linhas: list[dict[str, Any]] = []
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(KNOWLEDGE_XLSX, read_only=True, data_only=True)
+        ws = next((w for w in wb.worksheets if _norm_text(w.title).startswith("segmentacoes")), None)
+        header: list[str] = []
+        esteira, cupons = "", {}
+        for row in (ws.iter_rows(values_only=True) if ws else []):
+            cells = [str(c).strip() if c is not None else "" for c in row]
+            c0 = _norm_text(cells[0] if cells else "")
+            if c0.startswith("esteira"):
+                header, esteira, cupons = cells, ("Multi" if "multi" in c0 else "Food"), {}
+                continue
+            if not header:
+                continue
+            etapas = {_norm_text(re.sub(r"[^\w\s&]", " ", h)).strip(): (h, cells[i]) for i, h in enumerate(header)
+                      if i >= 2 and h and i < len(cells) and cells[i]}
+            if c0 == "cupons":
+                cupons = etapas
+                continue
+            rot = cells[1] if len(cells) > 1 else ""
+            seg = next((k for k, v in KB_SEGMENTOS.items() if _norm_text(rot).startswith(v)), None)
+            if seg:
+                linhas.append({"esteira": esteira, "segmento": seg, "rotulo": " ".join(rot.split())[:120],
+                               "etapas": etapas, "cupons": cupons})
+    except Exception:
+        logger.warning("Could not read Segmentações & Políticas", exc_info=True)
+    _KB_POL["linhas"] = linhas
+    return linhas
+
+
+def _kb_politica(segmento: str | None, jornada: str | None, esteira: str | None = None) -> str:
+    """Célula(s) da matriz segmento × etapa: o caso inteiro (segmento e etapa), a etapa para todos os segmentos, ou a
+    linha do segmento. Sem segmento e sem etapa: nada."""
+    seg = segmento if segmento in KB_SEGMENTOS else None
+    etp = KB_JORNADAS.get(str(jornada or ""))
+    if not seg and not etp:
+        return ""
+    est = {"food": "Food", "multi": "Multi"}.get(str(esteira or "").lower())
+    out = []
+    for ln in _kb_politicas():
+        if (seg and ln["segmento"] != seg) or (est and ln["esteira"] != est) or (not est and not seg and ln["esteira"] != "Food"):
+            continue
+        if etp:
+            hit = next(((h, t) for k, (h, t) in ln["etapas"].items() if k.startswith(etp)), None)
+            if not hit:
+                continue
+            cup = next((t for k, (h, t) in ln["cupons"].items() if k.startswith(etp)), "")
+            out.append(f"[{ln['esteira']} · {ln['rotulo']} · {hit[0]}] {' / '.join(hit[1].splitlines())}"
+                       + (f" | Cupons da etapa: {' / '.join(cup.splitlines())}" if cup else ""))
+        else:
+            out.append(f"[{ln['esteira']} · {ln['rotulo']}] " + " | ".join(
+                f"{h}: {' / '.join(t.splitlines())}" for h, t in ln["etapas"].values()))
+    txt = "\n".join(out)
+    return txt[:KB_MAX_CHARS]
 
 
 def _kb_team_rows() -> list[dict[str, Any]]:
@@ -8659,16 +8759,45 @@ def _kb_search(query: str, k: int = 6) -> list[dict[str, Any]]:
     return [d for sc, d in scored[:k] if sc > 0]
 
 
-def _kb_context(query: str) -> str:
-    """Trechos do Repositório de Processos CX e das respostas do time que tocam a pergunta."""
+def _kb_search_multi(query: str, extra: str = "", k: int = 8) -> list[dict[str, Any]]:
+    """Pergunta descrevendo um caso (várias frases): busca a pergunta inteira, cada frase e os termos da leitura do
+    pedido, e junta pelo score relativo — assim "cliente Platinum… entregue incorretamente… sem evidência" acha a
+    etapa de pós-entrega do Platinum, e não só o que repete "cliente" e "pedido"."""
+    consultas = [q for q in [extra, query] if q and q.strip()]
+    frases = [f for f in re.split(r"(?<=[.?!;:])\s+|\n+", query or "") if len(f.strip()) > 20]
+    if len(frases) > 1 and not extra:  # sem os termos do intérprete, cada frase do caso vira uma busca
+        consultas += frases[:8]
+    total: dict[int, float] = {}
+    docs: dict[int, dict[str, Any]] = {}
+    for i, q in enumerate(consultas):
+        hits = _kb_search(q, k=k)
+        for pos, d in enumerate(hits):
+            peso = (1.6 if (extra and i == 0) else 1.0) / (1 + pos * 0.35)
+            total[id(d)] = total.get(id(d), 0.0) + peso
+            docs[id(d)] = d
+    return [docs[i] for i, _ in sorted(total.items(), key=lambda x: -x[1])[:k]]
+
+
+def _kb_context(query: str, extra: str = "", it: dict[str, Any] | None = None) -> str:
+    """Trechos do Repositório de Processos CX e das respostas do time que tocam a pergunta. Com a leitura do pedido
+    (it), busca também pelos termos que o intérprete escreveu e traz a célula exata da matriz segmento × etapa."""
+    it = it or {}
+    extra = extra or str(it.get("busca") or "")
     try:
-        hits = _kb_search(query)
+        hits = _kb_search_multi(query, extra)
     except Exception:
         logger.warning("KB search failed", exc_info=True)
+        hits = []
+    try:
+        pol = _kb_politica(it.get("segmento"), it.get("jornada"), it.get("esteira"))
+    except Exception:
+        logger.warning("KB policy lookup failed", exc_info=True)
+        pol = ""
+    if pol:  # a regra exata do caso já veio: os outros pedaços da mesma matriz (outros segmentos/etapas) só confundem
+        hits = [h for h in hits if not _norm_text(h["aba"]).startswith("segmentacoes")]
+    if not hits and not pol:
         return ""
-    if not hits:
-        return ""
-    out, total = [], 0
+    out, total = ([f"[Segmentações & Políticas — regra do caso]\n{pol}"], len(pol)) if pol else ([], 0)
     for h in hits:
         piece = f"[{h['aba']}] {h['texto']}"
         if total + len(piece) > KB_MAX_CHARS:
@@ -8928,16 +9057,24 @@ IDENTITY_INSTRUCTION = (
 )
 
 KNOWLEDGE_INSTRUCTION = (
-    "INFORMAÇÃO INTERNA PARA A LYRA: esta é uma dúvida de processo, política ou agente de IA. Se vieram TRECHOS DA BASE "
-    "DE PROCESSOS neste contexto e eles respondem, responda com eles (são o Repositório de Processos CX oficial e "
-    "respostas do time). Senão, chame o subagente "
-    "*Lyra Conhecimento* com `Pedido: <a pergunta, completa>` (uma chamada por pergunta, se houver mais de uma) e "
-    "responda com o que ela devolver. NÃO use outra busca nem conhecimento geral (CDC, \"geralmente\", outras empresas). "
-    "Responda SÓ a pergunta atual (não repita ressalvas de perguntas anteriores da conversa). Se a base não tiver a "
-    "resposta ou faltar a condição pedida: diga em 1 frase o que a base traz e o que não traz, a referência (One Hub / "
-    "Matriz CX), SEM prometer 'vou confirmar', e termine com uma linha final `ESCALAR: experiencia: <a dúvida em 1 "
-    "linha>` (política, processo de atendimento, CSAT) ou `ESCALAR: eficiencia: <a dúvida>` (TMA, SLA, fila, "
-    "ferramentas). O app chama a pessoa certa do time.\n\n"
+    "INFORMAÇÃO INTERNA PARA A LYRA: esta é uma dúvida sobre o universo iFood (processo, política, jornada, agente de IA, "
+    "conduta num caso). Responda como uma analista sênior de processos do iFood que conhece a operação: direto, com a "
+    "conduta. Os TRECHOS DA BASE DE PROCESSOS deste contexto são a base oficial (o Repositório de Processos CX e as "
+    "respostas do time) — a 'regra do caso' da matriz Segmentações & Políticas, quando vier, é a regra exata daquele "
+    "segmento naquela etapa. Se os trechos cobrem a dúvida, responda com eles e NÃO chame subagente. Se não cobrirem, "
+    "chame a *Lyra Conhecimento* com `Pedido: <a pergunta, completa, com o caso>`.\n"
+    "Pergunta que descreve um CASO: aplique a regra ao caso, passo a passo — qual jornada/motivo, qual segmento, quem "
+    "é o responsável (o Almir infere a responsabilidade mesmo sem foto ou nota; as evidências, o CRI e a reincidência "
+    "entram nessa inferência) e, então, o desfecho e o que a operação faz. Quando o desfecho depende de algo que o caso "
+    "não diz (ex.: quem o Almir apontou como responsável, pedido acima ou abaixo de R$100, Food ou Mercado), mostre os "
+    "caminhos de forma curta (se X → faz A; se Y → faz B). Termine com a conduta da operação (L3) quando o caso for "
+    "dela.\n"
+    "Proibido: citar One Hub, Matriz CX, link, aba, planilha ou 'minha base' como resposta (fale do processo, não de "
+    "onde ele está); mandar a pessoa procurar outro time, área ou pessoa; completar com conhecimento geral (CDC, "
+    "'geralmente', outras empresas). Responda SÓ a pergunta atual. Só quando a base realmente não tiver a regra (nem nos "
+    "trechos, nem na Lyra Conhecimento): diga em 1 frase o que não está definido, sem prometer 'vou confirmar', e "
+    "termine com uma linha final `ESCALAR: experiencia: <a dúvida em 1 linha>` (política, processo de atendimento, "
+    "CSAT) ou `ESCALAR: eficiencia: <a dúvida>` (TMA, SLA, fila, ferramentas). O app chama a pessoa certa do time.\n\n"
 )
 
 
@@ -10824,9 +10961,10 @@ ANSWER_LAYOUT_INSTRUCTION = (
 
 
 def _looks_sectioned(answer: str | None) -> bool:
-    """Resposta no visual do report (título + seções): vai com divisórias."""
+    """Resposta no visual do report (emoji + *título* + seções): vai com divisórias. Conversa (mesmo com vários
+    parágrafos) vai como texto corrido — em blocos, o Slack corta cada parágrafo longo com "Ver mais"."""
     parts = [p for p in re.split(r"\n\s*\n", answer or "") if p.strip()]
-    return len(parts) >= 3 or (len(parts) >= 2 and bool(re.match(r"^\W{1,3}\s*\*", (answer or "").lstrip())))
+    return len(parts) >= 2 and bool(re.match(r"^\W{1,3}\s*\*", (answer or "").lstrip()))
 
 
 _RECENT_ANSWERS: dict[str, tuple[float, str]] = {}
@@ -12776,7 +12914,7 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                   f"{DEFAULTS_INSTRUCTION if not extra else ''}{FREE_ANALYSIS_INSTRUCTION if shape else ''}{FULL_ACCESS_INSTRUCTION if _operator_names_allowed(eps) else ''}"
                   f"{ANSWER_LAYOUT_INSTRUCTION}{_learnings_instruction(eps)}{_table_context(eps)}"
                   f"{_inject_mop_context(question, eps)}{_capa_oficial_ctx(question, event, eps)}"
-                  f"{_kb_context(question) if extra == KNOWLEDGE_INSTRUCTION else ''}"
+                  f"{_kb_context(question, it=event.get('_it')) if extra == KNOWLEDGE_INSTRUCTION else ''}"
                   f"{NOMINAL_INSTRUCTION if _NOMINAL_RE.search(_norm_text(question)) else ''}"
                   f"{SAME_SET_INSTRUCTION if event.get('thread_ts') and _SAME_SET_RE.search(_norm_text(question)) else ''}")
         is_plan = extra == PLAN_INSTRUCTION
@@ -12818,6 +12956,9 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 answer = _promessa.sub("", answer).strip() + " O time já foi chamado aqui na thread pra confirmar."
             else:  # prometeu confirmar: confirma de verdade, chamando o dono do tema
                 esc_q = ("experiencia", question[:200])
+        if (not esc_q and str(event.get("_route") or "") == "conhecimento" and answer
+                and _NAO_NA_BASE_RE.search(_norm_text(answer))):  # admitiu que a base não cobre, mas não escalou
+            esc_q = ("experiencia", question[:200])
         if esc_q:  # dúvida que a base não responde: chama o dono do tema de verdade (e aprende com a resposta)
             answer = re.split(r"`?ESCALAR\s*:", answer, maxsplit=1)[0].strip()
             answer = re.sub(r"[^.\n]*\b(vou|vamos) (confirmar|validar|checar)[^.\n]*\.?", "", answer).strip()
@@ -12861,10 +13002,16 @@ def _process_event_inner(event: dict[str, Any], say: Callable[..., Any], in_thre
                 _say(say, f"Isso quem fecha é {dono} — vou deixar a dúvida com ele. 🙂", event, in_thread=True)
                 _alert(f"❓ Dúvida sem resposta na base (DM, {dono[2:]}): _{esc_q[1]}_ "
                        f"({_permalink(ch_q, str(event.get('thread_ts') or event.get('ts') or ''))})")
-            elif not STATE.get(f"escalated:{ch_q}:{event.get('thread_ts') or event.get('ts') or ''}"):
-                _escalate(ch_q, str(event.get("thread_ts") or event.get("ts") or ""), eps, esc_q[0], esc_q[1],
-                          lambda t: _say(say, t, event, in_thread=True), shadow=bool(eps and _status_shadow(eps)),
-                          decisao=bool(answer))
+            else:
+                th_q = str(event.get("thread_ts") or event.get("ts") or "")
+                ja = STATE.get(f"escalated:{ch_q}:{th_q}")
+                try:
+                    n_ja = int(json.loads(ja).get("n") or 1) if ja else 0
+                except Exception:
+                    n_ja = 1
+                if n_ja < ESCALA_MAX_THREAD:  # dúvida nova na mesma thread também vai pro dono, em vez de sumir
+                    _escalate(ch_q, th_q, eps, esc_q[0], esc_q[1], lambda t: _say(say, t, event, in_thread=True),
+                              shadow=bool(eps and _status_shadow(eps)), decisao=bool(answer), n=n_ja + 1)
         if (_NOMINAL_RE.search(_norm_text(question)) or (event.get("thread_ts") and _SAME_SET_RE.search(_norm_text(question)))) \
                 and re.search(r"ficaram de fora|limite de exibi|nao aparecem|não aparecem|planilha|excel|lista completa",
                                                                   _norm_text(answer or "")):
@@ -13929,13 +14076,20 @@ def _parse_escalation(text: str) -> tuple[str, str] | None:
             m.group(2).strip().strip("`").strip()[:300])
 
 
+ESCALA_MAX_THREAD = int(os.getenv("ESCALA_MAX_THREAD", "3"))  # dúvidas sem resposta chamadas ao dono por thread
+_NAO_NA_BASE_RE = re.compile(r"\b(a base nao (tem|traz|cobre)|nao (esta|estao) (mapead\w*|na (minha )?base)|"
+                             r"nao tenho (isso |esse \w+ |essa \w+ )?(aqui|na (minha )?base|mapead\w*))")
+
+
 def _escalate(channel: str, thread_ts: str, eps: str | None, theme: str, duvida: str,
-              post: Callable[[str], Any], shadow: bool, decisao: bool = False) -> Any:
+              post: Callable[[str], Any], shadow: bool, decisao: bool = False, n: int = 1) -> Any:
     """Marca o dono do tema (Gustavo: experiência; Michael: eficiência) e passa a ouvir a resposta dele para aprender."""
     exp = theme == "experiencia"
     uid, nome = ((OWNER_EXPERIENCIA, OWNER_EXPERIENCIA_NOME) if exp else (OWNER_EFICIENCIA, OWNER_EFICIENCIA_NOME))
     quem = f"*{nome}* (em produção eu marco)" if shadow or not uid else f"<@{uid}>"
-    STATE.set(f"escalated:{channel}:{thread_ts}", json.dumps({"duvida": duvida, "eps": eps or "", "tema": theme}))
+    STATE.set(f"escalated:{channel}:{thread_ts}", json.dumps({"duvida": duvida, "eps": eps or "", "tema": theme, "n": n}))
+    if n > 1:  # o dono já foi chamado nessa thread: só traz a dúvida nova
+        return post(f"{quem}, mais uma pra você aqui: _{duvida.strip().rstrip('.')[:200]}_")
     if decisao:  # o feedback já foi postado: só chama o dono, curto, como uma pessoa faria
         return post(f"{quem}, consegue avaliar aqui?")
     return post(f"{quem}, consegue ajudar aqui?")
